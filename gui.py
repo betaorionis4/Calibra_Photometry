@@ -123,9 +123,9 @@ def run_config_gui():
     add_entry(lf_files, "Input Pattern:", "input_pattern", os.path.join('fitsfiles', '*.fits'), 0, vtype=str)
     
     ttk.Label(lf_files, text="Ref Catalog:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-    cat_var = tk.StringVar(value="ATLAS")
+    cat_var = tk.StringVar(value="ATLAS refcat2")
     vars_dict["reference_catalog"] = (cat_var, str)
-    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["ATLAS", "APASS", os.path.join('photometry_refstars', 'reference_stars.csv')], width=35)
+    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["ATLAS refcat2", "APASS DR9", "GAIA_DR3", os.path.join('photometry_refstars', 'reference_stars.csv')], width=35)
     cat_cb.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
     
     def browse_catalog():
@@ -142,10 +142,10 @@ def run_config_gui():
     add_dropdown(lf_filt, "Filter Mode:", "filter_mode", ["all", "xy", "radec"], "all", 0)
     
     ttk.Label(lf_filt, text="XY Bounds (Pixels)").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(10,0))
-    add_entry(lf_filt, "X Min:", "xy_x_min", 100, 2, col_offset=0, vtype=int)
-    add_entry(lf_filt, "X Max:", "xy_x_max", 500, 2, col_offset=1, vtype=int)
-    add_entry(lf_filt, "Y Min:", "xy_y_min", 100, 3, col_offset=0, vtype=int)
-    add_entry(lf_filt, "Y Max:", "xy_y_max", 500, 3, col_offset=1, vtype=int)
+    add_entry(lf_filt, "X Min:", "xy_x_min", 200, 2, col_offset=0, vtype=int)
+    add_entry(lf_filt, "X Max:", "xy_x_max", 6000, 2, col_offset=1, vtype=int)
+    add_entry(lf_filt, "Y Min:", "xy_y_min", 200, 3, col_offset=0, vtype=int)
+    add_entry(lf_filt, "Y Max:", "xy_y_max", 4000, 3, col_offset=1, vtype=int)
 
     ttk.Label(lf_filt, text="RADEC Bounds").grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(10,0))
     add_entry(lf_filt, "RA Min:", "ra_min", "10h34m00s", 5, col_offset=0, vtype=str)

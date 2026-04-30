@@ -49,6 +49,21 @@ $$\sigma_{flux}^2 = \frac{Flux}{Gain} + Area_{ap} \cdot \sigma_{bg}^2 + \frac{Ar
 - **SNR (Signal-to-Noise Ratio)**: Calculated as $Net Flux / \sigma_{flux}$. 
 - **Filtering**: Detections with $SNR < 3.0$ are automatically flagged as unreliable.
 
+### 2.4 Online Catalog Transformations
+Since catalogs like **ATLAS-RefCat2** and **Gaia DR3** do not natively use the Johnson V/B filters, Calibra applies rigorous mathematical transformations to convert their native photometry for zero-point calibration.
+
+#### ATLAS (Pan-STARRS) to Johnson V/B
+Based on **Kostov et al. (2017)**, using the specific refined coefficients currently implemented in Calibra:
+- $V = g - 0.020 - 0.498(g-r) - 0.008(g-r)^2$
+- $B = g + 0.199 + 0.540(g-r) + 0.016(g-r)^2$
+- *(Note: Alternative Jester et al. (2005) equations are preserved as comments in the source code).*
+
+#### Gaia DR3 to Johnson V/B
+Based on **Riello et al. (2021) Table C.2**, which provides coefficients for the full color range ($-0.5 < G_{BP} - G_{RP} < 5.0$):
+- $V = G - 0.02704 + 0.01424 \cdot C - 0.1604 \cdot C^2 + 0.02334 \cdot C^3$
+- $B = G + 0.2162 + 0.7303 \cdot C - 0.1518 \cdot C^2 + 0.02447 \cdot C^3$
+- *where $C = G_{BP} - G_{RP}$*
+
 ---
 
 ## 3. The Processing Pipeline (A-F)
@@ -71,7 +86,7 @@ Purges bad data. Any star with negative net flux or an $SNR < 3.0$ is discarded.
 
 ### Stage E: Calibration & Zero Points (`calibration.py`)
 Matches detected stars against a reference catalog using a spatial **KD-Tree**.
-- **Catalog Sources**: Supports local CSV files or **Automated Online Retrieval** from **ATLAS-RefCat2** or **APASS** via VizieR.
+- **Catalog Sources**: Supports local CSV files or **Automated Online Retrieval** from **ATLAS-RefCat2**, **APASS DR9**, or **Gaia DR3** via VizieR.
 - **Local Caching**: Online query results are cached locally in `photometry_refstars/cache/` to minimize network usage and allow offline repeat analysis.
 - **Filtering**: Only stars with an SNR above the user-defined threshold (default 10.0) are used to calculate the zero point.
 - **Zero Point (ZP)**: Derives a **Median Zero Point (ZP)** and applies it to all targets to find their **Calibrated Magnitudes**.
@@ -91,7 +106,7 @@ Launch the pipeline via `python main.py` to open the **Configuration GUI**.
 2.  **Camera & Detection Tab**: Input your sensor's specific **Gain** and **Read Noise**. These are mandatory for accurate error bars.
 3.  **Photometry & Calibration Tab**: 
     - Set your aperture radii (rule of thumb: $\approx 2 \times FWHM$).
-    - Select your **Ref Catalog**: Choose **ATLAS** (for ATLAS-RefCat2) or **APASS** (for APASS DR9) for online calibration, or select a local CSV.
+    - Select your **Ref Catalog**: Choose **ATLAS** (ATLAS-RefCat2), **APASS** (DR9), or **GAIA_DR3** for online calibration, or select a local CSV.
     - Set **Min SNR for Calib**: Filter out noisy stars from the zero-point calculation (default 10.0).
 4.  **Output Toggles Tab**: 
     - **Print Detailed Calibration**: Toggle the individual "Match" logs in the console. (Summary always shown).
