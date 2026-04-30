@@ -1,6 +1,7 @@
-# Python Aperture Photometry Pipeline: Comprehensive User Manual
+# Photometry with Calibra: Comprehensive User Manual
 
-Welcome to the **StarID** pipeline, an astronomical image analysis suite. This short manual provides some background on the software's architecture, mathematical principles, and operational workflow. 
+Welcome to **Calibra** (:an automated photometric analysis & calibration toolkit), a professional-grade astronomical image analysis suite. 
+This short manual provides some background on the software's architecture, mathematical principles, and operational workflow.
 
 The code can identify stars, perform PSF fitting to extract fluxes (using aperture photometry), and compares instrumental magnitudes with refernces magnitudes from catalogues available online (e.g. APASS DR9). Note that the provided fits file(s) need to have a WCS (i.e. they need to be plate solved).
 
@@ -14,7 +15,7 @@ Useful background information on the latter and lots of other useful information
 
 ## 1. Overview & Core Philosophy
 
-This pipeline utilizise standard algorithms and mathematical modeling to ensure sub-pixel accuracy and rigorous error propagation. It is designed to handle batch processing of FITS images while giving the user granular control via an interactive GUI.
+This pipeline utilizes standard algorithms and mathematical modeling to ensure sub-pixel accuracy and rigorous error propagation. It is designed to handle batch processing of FITS images while giving the user granular control via an interactive GUI.
 
 ### Key Mathematical Principles
 *   **Exact Fractional Integration**: We use the `photutils` library with `method='exact'`, which calculates the precise overlap between circular boundaries and the square pixel grid. This avoids rounding errors common in simpler "center-point" inclusion models.
@@ -50,12 +51,12 @@ $$\sigma_{flux}^2 = \frac{Flux}{Gain} + Area_{ap} \cdot \sigma_{bg}^2 + \frac{Ar
 
 ---
 
-## 3. The Processing Pipeline (6 Stages: A-F)
+## 3. The Processing Pipeline (A-F)
 
 The pipeline processes each FITS file through six sequential modules:
 
 ### Stage A: Star Detection (`star_detection.py`)
-Uses `DAOStarFinder` to scan for density peaks matching a stellar profile. It enforces morphological constraints (Sharpness and Roundness) to prevent hot pixels or satellite trails from being flagged as stars.
+Uses `DAOStarFinder` to scan for density peaks matching a stellar profile. It enforces strict morphological constraints (Sharpness and Roundness) to prevent hot pixels or satellite trails from being flagged as stars.
 
 ### Stage B: Coordinate Refinement (`psf_fitting.py`)
 Isolates every detected star and fits the 2D Gaussian. 
@@ -90,7 +91,7 @@ Launch the pipeline via `python main.py` to open the **Configuration GUI**.
 2.  **Camera & Detection Tab**: Input your sensor's specific **Gain** and **Read Noise**. These are mandatory for accurate error bars.
 3.  **Photometry & Calibration Tab**: 
     - Set your aperture radii (rule of thumb: $\approx 2 \times FWHM$).
-    - Select your **Ref Catalog**: Choose **ATLAS** or **APASS** for online calibration, or select a local CSV.
+    - Select your **Ref Catalog**: Choose **ATLAS** (for ATLAS-RefCat2) or **APASS** (for APASS DR9) for online calibration, or select a local CSV.
     - Set **Min SNR for Calib**: Filter out noisy stars from the zero-point calculation (default 10.0).
 4.  **Output Toggles Tab**: 
     - **Print Detailed Calibration**: Toggle the individual "Match" logs in the console. (Summary always shown).

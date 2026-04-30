@@ -1,10 +1,8 @@
-# StarID Astronomical Photometry Pipeline
+# Calibra: Automated Photometric Analysis & Calibration Toolkit
 
 **Version:** 1.1  
 **Description:** 
-An automated, highly robust Python pipeline for extracting scientific-grade photometry, calibrating zero points, and estimating formal CCD/CMOS errors from astronomical FITS images. The code was created with lots of help from Google Antigravity (various agents), guided by me. I have made several tests to verify the results and ensure the results are reasonable. 
-This code is far from what codes like, e.g., AIJ or Tycho Tracker can do. 
-The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ or Tycho Tracker provide as fluxes, zero points, etc, 
+An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, and estimating formal CCD/CMOS errors from astronomical FITS images. The code was created with lots of help from Google Antigravity (various agents), guided by me. I have made several tests to verify the results and ensure the results are reasonable. This code is far from what codes like, e.g., AIJ or Tycho Tracker can do. The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ or Tycho Tracker provide as fluxes, zero points, etc.
 
 ---
 
@@ -17,12 +15,12 @@ The purpose is simply to have a playground for understanding the principles of C
     ```bash
     python main.py
     ```
-    This launches the **Configuration GUI** where you can set your CCD/CMOS parameters and file paths. The pipeline now supports **Automated Online Calibration** via ATLAS RefCat2 and APASS DR9.
+    This launches the **Configuration GUI** where you can set your CCD parameters and file paths. The pipeline now supports **Automated Online Calibration** via ATLAS and APASS.
 
 ---
 
 ## Documentation
-For a dive into the mathematical principles, theoretical background, and stage-by-stage processing details, please refer to the comprehensive **User Manual**:
+For a more detailed dive into the mathematical principles, theoretical background, and stage-by-stage processing details, please refer to the comprehensive **User Manual**:
 
 👉 **[photometry_user_manual.md](file:///c:/Astro/StarID/photometry_user_manual.md)**
 
