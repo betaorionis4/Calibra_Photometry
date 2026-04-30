@@ -9,7 +9,7 @@ def run_config_gui():
     """
     root = tk.Tk()
     root.title("Calibra: Automated Photometric Analysis & Calibration Toolkit")
-    root.geometry("720x820")
+    root.geometry("720x660")
     root.resizable(False, False)
     root.configure(bg="#f0f2f5") # Light professional gray background
 
@@ -76,7 +76,7 @@ def run_config_gui():
     tab_about = ttk.Frame(notebook)
     notebook.add(tab_about, text="About")
     
-    about_container = tk.Frame(tab_about, padx=30, pady=30, bg="white")
+    about_container = tk.Frame(tab_about, padx=30, pady=10, bg="white")
     about_container.pack(fill="both", expand=True)
     
     # Try to load Logo
@@ -89,7 +89,7 @@ def run_config_gui():
         logo_img = ImageTk.PhotoImage(img)
         lbl_logo = tk.Label(about_container, image=logo_img, bg="white")
         lbl_logo.image = logo_img # Keep reference
-        lbl_logo.pack(pady=(0, 20))
+        lbl_logo.pack(pady=(0, 5))
     except Exception as e:
         # Fallback if PIL is missing or file not found
         tk.Label(about_container, text="[ CALIBRA ]", font=("Arial", 24, "bold"), bg="white", fg=primary_blue).pack(pady=(0, 20))
@@ -99,8 +99,8 @@ def run_config_gui():
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 1.1", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
-    tk.Label(info_frame, text="Latest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
+    tk.Label(info_frame, text="Version: 1.1 \tLatest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
+    #tk.Label(info_frame, text="Latest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), anchor="w", bg="white", fg=primary_blue).pack(fill="x", pady=(10, 5))
     desc_text = (
@@ -189,8 +189,8 @@ def run_config_gui():
     add_entry(lf_cal, "Match Tolerance (arcsec):", "match_tolerance_arcsec", 8.0, 0)
     add_entry(lf_cal, "Default Zero Point:", "default_zero_point", 23.399, 1)
     add_entry(lf_cal, "Min SNR for Calib:", "calib_snr_threshold", 10.0, 2)
-    add_check(lf_cal, "Run New ZP Calibration (Overwrite Default)", "run_new_calibration", False, 3)
-    add_check(lf_cal, "Run Positional Shift Analysis", "run_shift_analysis", True, 4)
+    add_check(lf_cal, "Run New ZP Calibration (Overwrite Default)", "run_new_calibration", True, 3)
+    add_check(lf_cal, "Run Positional Shift Analysis", "run_shift_analysis", False, 4)
 
     # --- TAB 4: Output & Displays ---
     tab_out = ttk.Frame(notebook)
@@ -265,7 +265,7 @@ def run_config_gui():
 
     # Action Buttons
     btn_frame = tk.Frame(root, bg="#f0f2f5")
-    btn_frame.pack(pady=20)
+    btn_frame.pack(pady=10)
     
     cancel_btn = tk.Button(btn_frame, text="Cancel", command=root.destroy, width=15, 
                            font=("Arial", 10), relief="flat", bg="#ccc")

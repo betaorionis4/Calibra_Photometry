@@ -312,6 +312,15 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
         return
         
     mag_key = 'B_mag' if 'B' in filter_name.upper() else 'V_mag'
+    
+    # Identify Source
+    source_name = ref_catalog_file
+    if ref_catalog_file.upper() in ["ATLAS", "APASS", "GAIA_DR3"]:
+        source_name = f"Online VizieR ({ref_catalog_file.upper()})"
+    else:
+        source_name = f"Local File ({os.path.basename(ref_catalog_file)})"
+    
+    print(f"Reference Catalog: {source_name}")
     print(f"Using {mag_key} from reference catalog for calibration.")
     print(f"SNR Threshold for calibration stars: {snr_threshold}")
     
@@ -358,12 +367,6 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
         
     print(f"Found {len(matched_det)} matches with reference catalog.")
     
-    # Identify Source
-    source_name = ref_catalog_file
-    if ref_catalog_file.upper() in ["ATLAS", "APASS", "GAIA_DR3"]:
-        source_name = f"Online VizieR ({ref_catalog_file.upper()})"
-    else:
-        source_name = f"Local File ({os.path.basename(ref_catalog_file)})"
 
     report_lines = []
     report_lines.append(f"# Zero Point Calibration Report")
