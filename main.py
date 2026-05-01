@@ -10,11 +10,20 @@ from photometry.psf_fitting import refine_coordinates_psf
 from photometry.aperture_phot import perform_aperture_photometry
 from photometry.calibration import match_and_calibrate
 from photometry.shift_analysis import generate_shift_report
+from photometry.image_calibration import calibrate_image
 import csv
+import sys
 
 from gui import run_config_gui
 
 def process_file(fits_filename, config):
+    # Determine Log Filename
+    os.makedirs('photometry_output/logs', exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(fits_filename))[0]
+    
+    # We'll refine the log name after reading the header for the filter
+    # For now, a temporary log name or just wait
+    
     print(f"\n=================================================================")
     print(f"PROCESSING FILE: {fits_filename}")
     print(f"=================================================================")
@@ -57,6 +66,32 @@ def process_file(fits_filename, config):
         print(f"FITS Header Check -> EXPTIME: {exptime}s | GAIN: {hdr_gain} | OFFSET: {hdr_offset}")
         if center_ra is not None:
             print(f"Center Coordinates: RA={center_ra:.4f}, Dec={center_dec:.4f}")
+
+        # Update Log file with Filter and Catalog info
+        cat_name = os.path.basename(config['reference_catalog']).split('.')[0]
+        filt = header.get('FILTER', 'NoFilt').replace('/', '_')
+        log_name = f"log_{base_name}_{filt}_{cat_name}.txt"
+        log_path = os.path.join('photometry_output', 'logs', log_name)
+        
+        if hasattr(sys.stdout, 'set_log_file'):
+            sys.stdout.set_log_file(log_path)
+            print(f"Session log initiated: {log_path}")
+
+        # NEW: FITS Calibration Step
+        cal_cfg = config.get('calibration_settings', {})
+        if cal_cfg.get('enable', False):
+            bias_path = cal_cfg.get('bias_path')
+            # Determine flat based on filter
+            filter_name = header.get('FILTER', 'V').upper()
+            if 'B' in filter_name:
+                flat_path = cal_cfg.get('flat_b_path')
+            else:
+                flat_path = cal_cfg.get('flat_v_path')
+                
+            # Save calibrated files in a 'calibrated' subfolder of the input directory
+            input_dir = os.path.dirname(fits_filename)
+            out_dir = os.path.join(input_dir, 'calibrated')
+            image_data, header = calibrate_image(image_data, header, bias_path, flat_path, out_dir=out_dir)
 
     except FileNotFoundError:
         print(f"Error: {fits_filename} not found.")
@@ -175,16 +210,10 @@ def process_file(fits_filename, config):
             print("-------------------------------------------------------\n")
 
     print("Done!\n")
+    if hasattr(sys.stdout, 'set_log_file'):
+        sys.stdout.set_log_file(None)
 
-def main():
-    print("Launching Configuration GUI...")
-    cfg = run_config_gui()
-    
-    if not cfg:
-        print("Configuration cancelled. Exiting.")
-        return
-
-    print("Configuration Received. Finding matching files...")
+def run_pipeline(cfg):
     input_pattern = cfg['input_pattern']
 
     if isinstance(input_pattern, list):
@@ -200,6 +229,10 @@ def main():
         print(f"Found {len(files_to_process)} file(s) to process.")
         for f in files_to_process:
             process_file(f, cfg)
+
+def main():
+    # run_config_gui now handles its own loop and calls run_pipeline in a thread
+    run_config_gui(run_pipeline)
 
 if __name__ == '__main__':
     main()

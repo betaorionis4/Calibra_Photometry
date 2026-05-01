@@ -1,17 +1,37 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, scrolledtext
 import os
+import sys
+import threading
 
-def run_config_gui():
+class StdoutRedirector:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.log_file = None
+
+    def set_log_file(self, file_path):
+        self.log_file = file_path
+
+    def write(self, string):
+        self.text_widget.insert(tk.END, string)
+        self.text_widget.see(tk.END)
+        if self.log_file:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(string)
+
+    def flush(self):
+        pass
+
+def run_config_gui(pipeline_callback=None):
     """
-    Launches a Tkinter GUI for pipeline configuration.
-    Returns a dictionary of settings if "Run" is clicked, or None if closed/cancelled.
+    Launches a persistent Tkinter GUI for pipeline configuration.
+    pipeline_callback: A function that takes (config) and runs the analysis.
     """
     root = tk.Tk()
     root.title("Calibra: Automated Photometric Analysis & Calibration Toolkit")
-    root.geometry("720x820")
-    root.resizable(False, False)
-    root.configure(bg="#f0f2f5") # Light professional gray background
+    root.geometry("900x750")
+    root.resizable(True, True)
+    root.configure(bg="#f0f2f5") 
 
     # --- MODERN STYLING ---
     style = ttk.Style()
@@ -40,7 +60,7 @@ def run_config_gui():
     # Variable storage
     vars_dict = {}
 
-    def add_entry(parent, label_text, var_name, default_val, row, col_offset=0, vtype=float):
+    def add_entry(parent, label_text, var_name, default_val, row, col_offset=0, vtype=float, width=15):
         ttk.Label(parent, text=label_text).grid(row=row, column=col_offset*2, sticky=tk.W, padx=10, pady=5)
         if vtype == str:
             var = tk.StringVar(value=str(default_val))
@@ -49,7 +69,7 @@ def run_config_gui():
         else:
             var = tk.DoubleVar(value=float(default_val))
         vars_dict[var_name] = (var, vtype)
-        entry = ttk.Entry(parent, textvariable=var, width=15)
+        entry = ttk.Entry(parent, textvariable=var, width=width)
         entry.grid(row=row, column=col_offset*2+1, sticky=tk.W, padx=10, pady=5)
         return var
 
@@ -60,11 +80,11 @@ def run_config_gui():
         chk.grid(row=row, column=col_offset*2, columnspan=2, sticky=tk.W, padx=10, pady=5)
         return var
 
-    def add_dropdown(parent, label_text, var_name, options, default_val, row, col_offset=0):
+    def add_dropdown(parent, label_text, var_name, options, default_val, row, col_offset=0, width=13):
         ttk.Label(parent, text=label_text).grid(row=row, column=col_offset*2, sticky=tk.W, padx=10, pady=5)
         var = tk.StringVar(value=str(default_val))
         vars_dict[var_name] = (var, str)
-        cb = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=13)
+        cb = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=width)
         cb.grid(row=row, column=col_offset*2+1, sticky=tk.W, padx=10, pady=5)
         return var
 
@@ -76,7 +96,7 @@ def run_config_gui():
     tab_about = ttk.Frame(notebook)
     notebook.add(tab_about, text="About")
     
-    about_container = tk.Frame(tab_about, padx=30, pady=30, bg="white")
+    about_container = tk.Frame(tab_about, padx=30, pady=10, bg="white")
     about_container.pack(fill="both", expand=True)
     
     # Try to load Logo
@@ -89,7 +109,7 @@ def run_config_gui():
         logo_img = ImageTk.PhotoImage(img)
         lbl_logo = tk.Label(about_container, image=logo_img, bg="white")
         lbl_logo.image = logo_img # Keep reference
-        lbl_logo.pack(pady=(0, 20))
+        lbl_logo.pack(pady=(0, 5))
     except Exception as e:
         # Fallback if PIL is missing or file not found
         tk.Label(about_container, text="[ CALIBRA ]", font=("Arial", 24, "bold"), bg="white", fg=primary_blue).pack(pady=(0, 20))
@@ -99,8 +119,8 @@ def run_config_gui():
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 1.1", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
-    tk.Label(info_frame, text="Latest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
+    tk.Label(info_frame, text="Version: 1.1 \tLatest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
+    #tk.Label(info_frame, text="Latest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), anchor="w", bg="white", fg=primary_blue).pack(fill="x", pady=(10, 5))
     desc_text = (
@@ -120,12 +140,24 @@ def run_config_gui():
     # Files
     lf_files = ttk.LabelFrame(tab_io, text="Files")
     lf_files.pack(fill="x", padx=10, pady=10)
-    add_entry(lf_files, "Input Pattern:", "input_pattern", os.path.join('fitsfiles', '*.fits'), 0, vtype=str)
+    
+    ttk.Label(lf_files, text="Input Pattern:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+    input_var = tk.StringVar(value=r"C:\Astro\Photometry_Calibra\fitsfiles\*.fits")
+    vars_dict["input_pattern"] = (input_var, str)
+    ttk.Entry(lf_files, textvariable=input_var, width=65).grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+    
+    def browse_input_dir():
+        from tkinter import filedialog
+        dirname = filedialog.askdirectory(initialdir=r"C:\Astro\Photometry_Calibra", title="Select FITS Directory")
+        if dirname:
+            input_var.set(os.path.join(dirname, "*.fits"))
+            
+    ttk.Button(lf_files, text="Browse...", command=browse_input_dir).grid(row=0, column=2, padx=5)
     
     ttk.Label(lf_files, text="Ref Catalog:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-    cat_var = tk.StringVar(value="ATLAS")
+    cat_var = tk.StringVar(value="GAIA_DR3")
     vars_dict["reference_catalog"] = (cat_var, str)
-    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["ATLAS", "APASS", os.path.join('photometry_refstars', 'reference_stars.csv')], width=35)
+    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["GAIA_DR3", "ATLAS refcat2", "APASS DR9", os.path.join('photometry_refstars', 'reference_stars.csv')], width=62)
     cat_cb.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
     
     def browse_catalog():
@@ -142,16 +174,47 @@ def run_config_gui():
     add_dropdown(lf_filt, "Filter Mode:", "filter_mode", ["all", "xy", "radec"], "all", 0)
     
     ttk.Label(lf_filt, text="XY Bounds (Pixels)").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(10,0))
-    add_entry(lf_filt, "X Min:", "xy_x_min", 100, 2, col_offset=0, vtype=int)
-    add_entry(lf_filt, "X Max:", "xy_x_max", 500, 2, col_offset=1, vtype=int)
-    add_entry(lf_filt, "Y Min:", "xy_y_min", 100, 3, col_offset=0, vtype=int)
-    add_entry(lf_filt, "Y Max:", "xy_y_max", 500, 3, col_offset=1, vtype=int)
+    add_entry(lf_filt, "X Min:", "xy_x_min", 200, 2, col_offset=0, vtype=int)
+    add_entry(lf_filt, "X Max:", "xy_x_max", 6000, 2, col_offset=1, vtype=int)
+    add_entry(lf_filt, "Y Min:", "xy_y_min", 200, 3, col_offset=0, vtype=int)
+    add_entry(lf_filt, "Y Max:", "xy_y_max", 4000, 3, col_offset=1, vtype=int)
 
     ttk.Label(lf_filt, text="RADEC Bounds").grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(10,0))
     add_entry(lf_filt, "RA Min:", "ra_min", "10h34m00s", 5, col_offset=0, vtype=str)
     add_entry(lf_filt, "RA Max:", "ra_max", "10h35m00s", 5, col_offset=1, vtype=str)
     add_entry(lf_filt, "DEC Min:", "dec_min", "+43d00m00s", 6, col_offset=0, vtype=str)
     add_entry(lf_filt, "DEC Max:", "dec_max", "+43d30m00s", 6, col_offset=1, vtype=str)
+
+    # --- TAB 1.5: Pre-processing ---
+    tab_pre = ttk.Frame(notebook)
+    notebook.add(tab_pre, text="Pre-processing")
+    
+    lf_calib = ttk.LabelFrame(tab_pre, text="FITS Calibration (Bias & Flats)")
+    lf_calib.pack(fill="x", padx=10, pady=10)
+    
+    add_check(lf_calib, "Enable Pre-processing (Apply Bias/Flats)", "enable_calibration", False, 0)
+    
+    # Plate solving reminder - positioned to avoid overlap
+    ttk.Label(lf_calib, text="* Note: Input FITS files must still be plate solved (contain WCS headers).", 
+              foreground="#a00", font=("Arial", 8, "italic")).grid(row=0, column=1, sticky=tk.W, padx=(200, 10))
+    
+    def add_file_selector(parent, label, var_name, default, row):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
+        var = tk.StringVar(value=default)
+        vars_dict[var_name] = (var, str)
+        ttk.Entry(parent, textvariable=var, width=65).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        
+        def browse():
+            from tkinter import filedialog
+            fname = filedialog.askopenfilename(initialdir="bias_and_flats", title=f"Select {label}")
+            if fname: var.set(fname)
+            
+        ttk.Button(parent, text="Browse...", command=browse).grid(row=row, column=2, padx=5)
+        return var
+
+    add_file_selector(lf_calib, "Master Bias:", "bias_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits", 1)
+    add_file_selector(lf_calib, "Master Flat (V):", "flat_v_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Vmag_1x1_gain_0.fits", 2)
+    add_file_selector(lf_calib, "Master Flat (B):", "flat_b_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Bmag_1x1_gain_0.fits", 3)
 
 
     # --- TAB 2: Camera & Detection ---
@@ -189,8 +252,8 @@ def run_config_gui():
     add_entry(lf_cal, "Match Tolerance (arcsec):", "match_tolerance_arcsec", 8.0, 0)
     add_entry(lf_cal, "Default Zero Point:", "default_zero_point", 23.399, 1)
     add_entry(lf_cal, "Min SNR for Calib:", "calib_snr_threshold", 10.0, 2)
-    add_check(lf_cal, "Run New ZP Calibration (Overwrite Default)", "run_new_calibration", False, 3)
-    add_check(lf_cal, "Run Positional Shift Analysis", "run_shift_analysis", True, 4)
+    add_check(lf_cal, "Run New ZP Calibration (Overwrite Default)", "run_new_calibration", True, 3)
+    add_check(lf_cal, "Run Positional Shift Analysis", "run_shift_analysis", False, 4)
 
     # --- TAB 4: Output & Displays ---
     tab_out = ttk.Frame(notebook)
@@ -239,49 +302,128 @@ def run_config_gui():
     )
     tk.Label(help_frame, text=dev_info, justify=tk.LEFT, font=("Arial", 9), fg="#555").pack(side=tk.BOTTOM, anchor="w")
 
+    # --- OUTPUT CONSOLE (Separate Window) ---
+    console_win = tk.Toplevel(root)
+    console_win.title("Calibra: Process Console")
+    console_win.geometry("800x500")
+    console_win.configure(bg="#f0f2f5")
+    
+    console_frame = tk.LabelFrame(console_win, text="Log Output", bg="#f0f2f5", font=("Arial", 10, "bold"))
+    console_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    console = scrolledtext.ScrolledText(console_frame, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+    console.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    # Redirect stdout and stderr
+    sys.stdout = StdoutRedirector(console)
+    sys.stderr = StdoutRedirector(console)
+
     def on_run():
-        nonlocal config
-        config = {}
+        vars_vals = {}
         try:
             for k, (var, vtype) in vars_dict.items():
-                config[k] = vtype(var.get())
+                vars_vals[k] = vtype(var.get())
             
             # Reconstruct dictionary bounds
-            config['xy_bounds'] = {
-                'x_min': config.pop('xy_x_min'),
-                'x_max': config.pop('xy_x_max'),
-                'y_min': config.pop('xy_y_min'),
-                'y_max': config.pop('xy_y_max')
+            config_run = {
+                'input_pattern': vars_vals.pop('input_pattern'),
+                'reference_catalog': vars_vals.pop('reference_catalog'),
+                'detect_sigma': vars_vals.pop('detect_sigma'),
+                'saturation_limit': vars_vals.pop('saturation_limit'),
+                'box_size': vars_vals.pop('box_size'),
+                'aperture_radius': vars_vals.pop('aperture_radius'),
+                'annulus_inner': vars_vals.pop('annulus_inner'),
+                'annulus_outer': vars_vals.pop('annulus_outer'),
+                'match_tolerance_arcsec': vars_vals.pop('match_tolerance_arcsec'),
+                'default_zero_point': vars_vals.pop('default_zero_point'),
+                'calib_snr_threshold': vars_vals.pop('calib_snr_threshold'),
+                'run_new_calibration': vars_vals.pop('run_new_calibration'),
+                'run_shift_analysis': vars_vals.pop('run_shift_analysis'),
+                'ccd_gain': vars_vals.pop('ccd_gain'),
+                'ccd_read_noise': vars_vals.pop('ccd_read_noise'),
+                'ccd_dark_current': vars_vals.pop('ccd_dark_current'),
+                'print_detailed_calibration': vars_vals.pop('print_detailed_calibration'),
+                'print_star_detection_table': vars_vals.pop('print_star_detection_table'),
+                'print_psf_fitting': vars_vals.pop('print_psf_fitting'),
+                'display_plots': vars_vals.pop('display_plots'),
+                'max_plots_to_show_per_file': vars_vals.pop('max_plots_to_show_per_file'),
+                'dao_sharplo': vars_vals.pop('dao_sharplo'),
+                'dao_sharphi': vars_vals.pop('dao_sharphi'),
+                'dao_roundlo': vars_vals.pop('dao_roundlo'),
+                'dao_roundhi': vars_vals.pop('dao_roundhi'),
+                'filter_mode': vars_vals.pop('filter_mode'),
             }
-            config['radec_bounds'] = {
-                'ra_min': config.pop('ra_min'),
-                'ra_max': config.pop('ra_max'),
-                'dec_min': config.pop('dec_min'),
-                'dec_max': config.pop('dec_max')
+            
+            config_run['xy_bounds'] = {
+                'x_min': vars_vals.pop('xy_x_min'),
+                'x_max': vars_vals.pop('xy_x_max'),
+                'y_min': vars_vals.pop('xy_y_min'),
+                'y_max': vars_vals.pop('xy_y_max')
             }
-            root.destroy()
+            config_run['radec_bounds'] = {
+                'ra_min': vars_vals.pop('ra_min'),
+                'ra_max': vars_vals.pop('ra_max'),
+                'dec_min': vars_vals.pop('dec_min'),
+                'dec_max': vars_vals.pop('dec_max')
+            }
+            config_run['calibration_settings'] = {
+                'enable': vars_vals.pop('enable_calibration'),
+                'bias_path': vars_vals.pop('bias_path'),
+                'flat_v_path': vars_vals.pop('flat_v_path'),
+                'flat_b_path': vars_vals.pop('flat_b_path')
+            }
+            
+            if pipeline_callback:
+                # Run in a separate thread to keep UI alive
+                run_btn.config(state=tk.DISABLED, text="Processing...")
+                
+                def thread_target():
+                    try:
+                        pipeline_callback(config_run)
+                    finally:
+                        run_btn.config(state=tk.NORMAL, text="Run Pipeline")
+                
+                thread = threading.Thread(target=thread_target)
+                thread.daemon = True
+                thread.start()
+            else:
+                print("No pipeline callback provided.")
+                
         except ValueError as e:
             messagebox.showerror("Input Error", "Please ensure all numerical fields contain valid numbers.")
 
     # Action Buttons
     btn_frame = tk.Frame(root, bg="#f0f2f5")
-    btn_frame.pack(pady=20)
+    btn_frame.pack(pady=10)
     
-    cancel_btn = tk.Button(btn_frame, text="Cancel", command=root.destroy, width=15, 
-                           font=("Arial", 10), relief="flat", bg="#ccc")
-    cancel_btn.pack(side=tk.LEFT, padx=10)
+    exit_btn = tk.Button(btn_frame, text="Exit Calibra", command=root.destroy, width=15, 
+                           font=("Arial", 10), relief="flat", bg="#f44336", fg="white")
+    exit_btn.pack(side=tk.LEFT, padx=10)
     
     run_btn = tk.Button(btn_frame, text="Run Pipeline", command=on_run, 
                         bg=accent_green, fg="white", font=("Arial", 10, "bold"), 
                         width=25, relief="flat", pady=8)
     run_btn.pack(side=tk.LEFT, padx=10)
 
+    # Ensure closing main window closes everything
+    def on_closing():
+        root.destroy()
+        sys.exit(0)
+        
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    console_win.protocol("WM_DELETE_WINDOW", lambda: None) # Prevent closing console individually if desired, or just let it close
+
     # Run the UI loop
     root.mainloop()
 
-    return config
-
 if __name__ == "__main__":
-    # Test the GUI
-    cfg = run_config_gui()
-    print(cfg)
+    # Test the GUI with a dummy callback
+    def dummy_pipeline(cfg):
+        import time
+        print("Starting dummy pipeline...")
+        for i in range(5):
+            print(f"Step {i+1}/5 complete...")
+            time.sleep(1)
+        print("Done!")
+
+    run_config_gui(dummy_pipeline)
