@@ -88,7 +88,10 @@ def process_file(fits_filename, config):
             else:
                 flat_path = cal_cfg.get('flat_v_path')
                 
-            image_data, header = calibrate_image(image_data, header, bias_path, flat_path)
+            # Save calibrated files in a 'calibrated' subfolder of the input directory
+            input_dir = os.path.dirname(fits_filename)
+            out_dir = os.path.join(input_dir, 'calibrated')
+            image_data, header = calibrate_image(image_data, header, bias_path, flat_path, out_dir=out_dir)
 
     except FileNotFoundError:
         print(f"Error: {fits_filename} not found.")

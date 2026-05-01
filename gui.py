@@ -60,7 +60,7 @@ def run_config_gui(pipeline_callback=None):
     # Variable storage
     vars_dict = {}
 
-    def add_entry(parent, label_text, var_name, default_val, row, col_offset=0, vtype=float):
+    def add_entry(parent, label_text, var_name, default_val, row, col_offset=0, vtype=float, width=15):
         ttk.Label(parent, text=label_text).grid(row=row, column=col_offset*2, sticky=tk.W, padx=10, pady=5)
         if vtype == str:
             var = tk.StringVar(value=str(default_val))
@@ -69,7 +69,7 @@ def run_config_gui(pipeline_callback=None):
         else:
             var = tk.DoubleVar(value=float(default_val))
         vars_dict[var_name] = (var, vtype)
-        entry = ttk.Entry(parent, textvariable=var, width=15)
+        entry = ttk.Entry(parent, textvariable=var, width=width)
         entry.grid(row=row, column=col_offset*2+1, sticky=tk.W, padx=10, pady=5)
         return var
 
@@ -80,11 +80,11 @@ def run_config_gui(pipeline_callback=None):
         chk.grid(row=row, column=col_offset*2, columnspan=2, sticky=tk.W, padx=10, pady=5)
         return var
 
-    def add_dropdown(parent, label_text, var_name, options, default_val, row, col_offset=0):
+    def add_dropdown(parent, label_text, var_name, options, default_val, row, col_offset=0, width=13):
         ttk.Label(parent, text=label_text).grid(row=row, column=col_offset*2, sticky=tk.W, padx=10, pady=5)
         var = tk.StringVar(value=str(default_val))
         vars_dict[var_name] = (var, str)
-        cb = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=13)
+        cb = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=width)
         cb.grid(row=row, column=col_offset*2+1, sticky=tk.W, padx=10, pady=5)
         return var
 
@@ -140,12 +140,24 @@ def run_config_gui(pipeline_callback=None):
     # Files
     lf_files = ttk.LabelFrame(tab_io, text="Files")
     lf_files.pack(fill="x", padx=10, pady=10)
-    add_entry(lf_files, "Input Pattern:", "input_pattern", os.path.join('fitsfiles', '*.fits'), 0, vtype=str)
+    
+    ttk.Label(lf_files, text="Input Pattern:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+    input_var = tk.StringVar(value=r"C:\Astro\Photometry_Calibra\fitsfiles\*.fits")
+    vars_dict["input_pattern"] = (input_var, str)
+    ttk.Entry(lf_files, textvariable=input_var, width=65).grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+    
+    def browse_input_dir():
+        from tkinter import filedialog
+        dirname = filedialog.askdirectory(initialdir=r"C:\Astro\Photometry_Calibra", title="Select FITS Directory")
+        if dirname:
+            input_var.set(os.path.join(dirname, "*.fits"))
+            
+    ttk.Button(lf_files, text="Browse...", command=browse_input_dir).grid(row=0, column=2, padx=5)
     
     ttk.Label(lf_files, text="Ref Catalog:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-    cat_var = tk.StringVar(value="ATLAS refcat2")
+    cat_var = tk.StringVar(value="GAIA_DR3")
     vars_dict["reference_catalog"] = (cat_var, str)
-    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["ATLAS refcat2", "APASS DR9", "GAIA_DR3", os.path.join('photometry_refstars', 'reference_stars.csv')], width=35)
+    cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["GAIA_DR3", "ATLAS refcat2", "APASS DR9", os.path.join('photometry_refstars', 'reference_stars.csv')], width=62)
     cat_cb.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
     
     def browse_catalog():
@@ -182,15 +194,15 @@ def run_config_gui(pipeline_callback=None):
     
     add_check(lf_calib, "Enable Pre-processing (Apply Bias/Flats)", "enable_calibration", False, 0)
     
-    # Plate solving reminder
+    # Plate solving reminder - positioned to avoid overlap
     ttk.Label(lf_calib, text="* Note: Input FITS files must still be plate solved (contain WCS headers).", 
-              foreground="#a00", font=("Arial", 8, "italic")).grid(row=0, column=1, sticky=tk.W, padx=10)
+              foreground="#a00", font=("Arial", 8, "italic")).grid(row=0, column=1, sticky=tk.W, padx=(200, 10))
     
     def add_file_selector(parent, label, var_name, default, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, padx=10, pady=5)
         var = tk.StringVar(value=default)
         vars_dict[var_name] = (var, str)
-        ttk.Entry(parent, textvariable=var, width=45).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Entry(parent, textvariable=var, width=65).grid(row=row, column=1, sticky=tk.W, padx=10, pady=5)
         
         def browse():
             from tkinter import filedialog
@@ -200,9 +212,9 @@ def run_config_gui(pipeline_callback=None):
         ttk.Button(parent, text="Browse...", command=browse).grid(row=row, column=2, padx=5)
         return var
 
-    add_file_selector(lf_calib, "Master Bias:", "bias_path", os.path.join("bias_and_flats", "Master_Bias_1x1_gain_0.fits"), 1)
-    add_file_selector(lf_calib, "Master Flat (V):", "flat_v_path", os.path.join("bias_and_flats", "FLAT_Vmag_1x1_gain_0.fits"), 2)
-    add_file_selector(lf_calib, "Master Flat (B):", "flat_b_path", os.path.join("bias_and_flats", "FLAT_Bmag_1x1_gain_0.fits"), 3)
+    add_file_selector(lf_calib, "Master Bias:", "bias_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits", 1)
+    add_file_selector(lf_calib, "Master Flat (V):", "flat_v_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Vmag_1x1_gain_0.fits", 2)
+    add_file_selector(lf_calib, "Master Flat (B):", "flat_b_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Bmag_1x1_gain_0.fits", 3)
 
 
     # --- TAB 2: Camera & Detection ---

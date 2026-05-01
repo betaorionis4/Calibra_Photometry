@@ -64,7 +64,7 @@ Calibra can perform basic instrumental calibration (Bias and Flat-fielding) for 
 ### 2.1 Enabling Calibration
 In the **"Pre-processing"** tab of the Configuration GUI:
 1.  Check **"Enable Pre-processing (Apply Bias/Flats)"**.
-2.  Select your **Master Bias** file.
+2.  Select your **Master Bias** file (Default: `C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits`).
 3.  Select your **Master Flat** files for both V-mag and B-mag.
 
 ### 2.2 Automatic Filter Detection
@@ -76,9 +76,10 @@ Calibra automatically reads the `FILTER` keyword from the FITS header of your ta
 When pre-processing is enabled, Calibra performs the following operation:
 `Calibrated = (Raw - Bias) / (Flat / median(Flat))`
 
-The resulting calibrated images are saved as new FITS files in the `fitsfiles/calibrated/` directory with a `cal_` prefix. These files are then used for the subsequent star detection and photometry steps.
+The resulting calibrated images are saved as new FITS files in a `calibrated/` subfolder located within your input FITS directory (e.g., `C:\Astro\Photometry_Calibra\fitsfiles\calibrated\`). These files are then used for the subsequent star detection and photometry steps.
 
 ## 2.4 Online Catalog Transformations
+Calibra defaults to **GAIA_DR3** for high-precision zero-point calibration, but also supports ATLAS-RefCat2 and APASS.
 Since catalogs like **ATLAS-RefCat2** and **Gaia DR3** do not natively use the Johnson V/B filters, Calibra applies rigorous mathematical transformations to convert their native photometry for zero-point calibration.
 
 #### ATLAS (Pan-STARRS) to Johnson V/B
