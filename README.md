@@ -1,8 +1,10 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 1.1  
+**Version:** 1.3 - 2026-05-02  
 **Description:** 
-An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, and estimating formal CCD/CMOS errors from astronomical FITS images. The code was created with lots of help from Google Antigravity (various agents), guided by me. I have made several tests to verify the results and ensure the results are reasonable. This code is far from what codes like, e.g., AIJ or Tycho Tracker can do. The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ or Tycho Tracker provide as fluxes, zero points, etc.
+An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformations coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. 
+
+The code was created with lots of help from Google Antigravity (various agents), guided, tested and debugged by me. I have made several tests to verify the results and ensure the results are reasonable. This code is far from what codes like, e.g., AIJ or Tycho Tracker can do. The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ or Tycho Tracker provide as fluxes, zero points, etc.
 
 ---
 
@@ -15,7 +17,7 @@ An automated, highly robust Python toolkit for extracting scientific-grade photo
     ```bash
     python main.py
     ```
-    This launches the **Configuration GUI** where you can set your CCD parameters and file paths. The pipeline now supports **Automated Online Calibration** via ATLAS and APASS.
+    This launches the **Configuration GUI** where you can set your CCD parameters and file paths. The pipeline now supports **Automated Color Calibration** via ATLAS refcat2, APASS DR9 and GAIA DR3.
 
 ---
 
@@ -27,7 +29,7 @@ For a more detailed dive into the mathematical principles, theoretical backgroun
 ### Key Manual Sections:
 *   **Theory of Operation**: Aperture Photometry vs. Sky Annulus math.
 *   **Mathematical Principles**: PSF Fitting, Sub-pixel Refinement, and Error Propagation.
-*   **The 6 Processing Stages**: From Star Detection to Shift Analysis.
+*   **The 7 Processing Stages**: From Star Detection to Shift Analysis and color calibration.
 *   **GUI Guide**: How to tune the pipeline for your specific sensor.
 *   **Diagnostics**: Understanding radial profiles and calibration reports.
 
