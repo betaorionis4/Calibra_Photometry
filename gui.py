@@ -119,7 +119,7 @@ def run_config_gui(pipeline_callback=None):
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 1.2 \tLatest Update: 2026-05-02", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
+    tk.Label(info_frame, text="Version: 1.3 \tLatest Update: 2026-05-02", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
     #tk.Label(info_frame, text="Latest Update: 2026-04-30", font=("Arial", 10), anchor="w", bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), anchor="w", bg="white", fg=primary_blue).pack(fill="x", pady=(10, 5))
