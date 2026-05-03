@@ -61,20 +61,21 @@ Calibra can perform basic instrumental calibration (Bias and Flat-fielding) for 
 > [!IMPORTANT]
 > **Plate Solving Required**: Even when using Calibra's pre-processing, your raw FITS files **must already be plate solved** (i.e., contain valid WCS headers like RA and DEC). Calibra uses these coordinates to match stars with online catalogs. If your file is not plate solved, automated calibration will fail.
 
-### 2.1 Enabling Calibration
+## 2.1 Enabling Calibration
 In the **"Pre-processing"** tab of the Configuration GUI:
 1.  Check **"Enable Pre-processing (Apply Bias/Flats)"**.
 2.  Select your **Master Bias** file (Default: `C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits`).
 3.  Select your **Master Flat** files for both V-mag and B-mag.
 
-### 2.2 Automatic Filter Detection
+## 2.2 Automatic Filter Detection
 Calibra automatically reads the `FILTER` keyword from the FITS header of your target image.
 - If the filter contains **"B"**, the B-mag Master Flat is used.
 - Otherwise, the V-mag Master Flat is used by default.
 
-### 2.3 Output of Calibrated Files
+## 2.3 Output of Calibrated Files
 When pre-processing is enabled, Calibra performs the following operation:
 `Calibrated = (Raw - Bias) / (Flat / median(Flat))`
+I.e. it is assumed that the flat is already corrected for bias!
 
 The resulting calibrated images are saved as new FITS files in a `calibrated/` subfolder located within your input FITS directory (e.g., `C:\Astro\Photometry_Calibra\fitsfiles\calibrated\`). These files are then used for the subsequent star detection and photometry steps.
 
@@ -95,7 +96,7 @@ Based on **Kostov et al. (2017)**, using the specific refined coefficients curre
 - *(Note: Alternative Jester et al. (2005) equations are preserved as comments in the source code).*
 
 #### Landolt Standard Star Catalogue
-Calibra automatically aggregates data from four Landolt standard fields catalogs (II/183A, J/AJ/137/4186, J/AJ/133/2502, J/AJ/146/131). 
+Calibra automatically aggregates data from four Landolt standard fields catalogs (VizieR identifiers II/183A, J/AJ/137/4186, J/AJ/133/2502, J/AJ/146/131). 
 *Note: Landolt standard stars are only present in specific celestial regions (e.g., equatorial SA fields).*
 
 #### APASS DR9
@@ -212,7 +213,6 @@ If enabled, the pipeline saves a four-panel graphic for each star showing:
 **GAIA DR3**
 Gaia Collaboration, Vallenari, A., et al. (2023), "Gaia Data Release 3. Summary of the contents and survey properties"
 https://doi.org/10.1051/0004-6361/202243940 
-See also:
 https://www.cosmos.esa.int/web/gaia/dr3
 For the transformation between G and other photometric systems:
 https://gea.esac.esa.int/archive/documentation/GDR3/Data_processing/chap_cu5pho/cu5pho_sec_photSystem/cu5pho_ssec_photRelations.html
@@ -224,13 +224,12 @@ https://cdsarc.cds.unistra.fr/viz-bin/cat/II/336
 **ATLAS-RefCat2**
 Tonry, J. L., et al. (2018), "The ATLAS All-Sky Stellar Reference Catalog"
 https://doi.org/10.3847/1538-4357/aae386
-See also:
 https://cdsarc.cds.unistra.fr/viz-bin/cat/J/ApJ/867/105
 
 **Landolt Standard Star Catalogue**
 Aggregates four primary standard field catalogs via VizieR:
 - Landolt, A. U. (1992), "UBVRI photometric standard stars in the magnitude range 11.5 < V < 16.0 around the celestial equator" (Vizier:VII/183A)
-https://ui.adsabs.harvard.edu/scan/manifest/1992AJ....104..340L  
+https://ui.adsabs.harvard.edu/scan/manifest/1992AJ....104..340L
 https://cdsarc.cds.unistra.fr/viz-bin/cat/II/183A
 - Landolt, A. U. (2009), "UBVRI photometric standard stars around the celestial equator: Updates and Additions" (Vizier:J/AJ/137/4186)
 http://dx.doi.org/10.1088/0004-6256/137/5/4186 

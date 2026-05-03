@@ -144,7 +144,8 @@ def process_file(fits_filename, config):
                         default_zp=config['default_zero_point'], run_new_calibration=config['run_new_calibration'],
                         output_report=output_report, center_ra=center_ra, center_dec=center_dec,
                         snr_threshold=config['calib_snr_threshold'],
-                        print_to_console=config['print_detailed_calibration'])
+                        print_to_console=config['print_detailed_calibration'],
+                        header=header)
 
 
     # Calculate Detection Limits

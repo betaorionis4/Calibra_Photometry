@@ -322,6 +322,90 @@ def run_config_gui(pipeline_callback=None):
     tk.Button(tab_color, text="Run Color Transformation Analysis", command=on_run_color,
               bg="#673ab7", fg="white", font=("Arial", 10, "bold"), pady=8).pack(pady=10)
 
+    # --- TAB 2.6: Differential Photometry ---
+    tab_diff = ttk.Frame(notebook)
+    notebook.add(tab_diff, text="Differential Photometry")
+    
+    lf_diff = ttk.LabelFrame(tab_diff, text="Compute B/V relative to a reference star")
+    lf_diff.pack(fill="x", padx=10, pady=10)
+    
+    add_file_selector(lf_diff, "B-Filter Results (CSV):", "diff_b_csv", "", 0)
+    add_file_selector(lf_diff, "V-Filter Results (CSV):", "diff_v_csv", "", 1)
+    
+    ttk.Label(lf_diff, text="Extinction k_B:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+    diff_kb_var = tk.DoubleVar(value=0.35)
+    vars_dict["diff_kb"] = (diff_kb_var, float)
+    ttk.Entry(lf_diff, textvariable=diff_kb_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_diff, text="Extinction k_V:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
+    diff_kv_var = tk.DoubleVar(value=0.20)
+    vars_dict["diff_kv"] = (diff_kv_var, float)
+    ttk.Entry(lf_diff, textvariable=diff_kv_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_diff, text="Color Term Tbv:").grid(row=2, column=2, sticky=tk.W, padx=10, pady=5)
+    diff_tbv_var = tk.DoubleVar(value=1.0)
+    vars_dict["diff_tbv"] = (diff_tbv_var, float)
+    ttk.Entry(lf_diff, textvariable=diff_tbv_var, width=10).grid(row=2, column=3, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_diff, text="B Correction Tb_bv:").grid(row=3, column=2, sticky=tk.W, padx=10, pady=5)
+    diff_tbbv_var = tk.DoubleVar(value=0.0)
+    vars_dict["diff_tbbv"] = (diff_tbbv_var, float)
+    ttk.Entry(lf_diff, textvariable=diff_tbbv_var, width=10).grid(row=3, column=3, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_diff, text="V Correction Tv_bv:").grid(row=4, column=2, sticky=tk.W, padx=10, pady=5)
+    diff_tvbv_var = tk.DoubleVar(value=0.0)
+    vars_dict["diff_tvbv"] = (diff_tvbv_var, float)
+    ttk.Entry(lf_diff, textvariable=diff_tvbv_var, width=10).grid(row=4, column=3, sticky=tk.W, padx=10, pady=5)
+    
+    diff_status_var = tk.StringVar(value="Load coefficients and select CSV files to begin.")
+    
+    def load_color_coefficients():
+        import json
+        json_path = os.path.join("photometry_output", "color_coefficients.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r') as f:
+                    coeffs = json.load(f)
+                diff_tbv_var.set(coeffs.get('Tbv', 1.0))
+                diff_tbbv_var.set(coeffs.get('Tb_bv', 0.0))
+                diff_tvbv_var.set(coeffs.get('Tv_bv', 0.0))
+                diff_status_var.set("Loaded coefficients from previous run.")
+            except Exception as e:
+                diff_status_var.set(f"Error loading JSON: {e}")
+        else:
+            diff_status_var.set("No previous coefficients found. Enter manually.")
+            
+    tk.Button(lf_diff, text="Load Last Coefficients", command=load_color_coefficients).grid(row=4, column=0, columnspan=2, pady=5)
+    
+    tk.Label(tab_diff, textvariable=diff_status_var, fg="#333", font=("Arial", 9, "italic")).pack(pady=5)
+    
+    def on_run_diff():
+        try:
+            b_csv = vars_dict["diff_b_csv"][0].get()
+            v_csv = vars_dict["diff_v_csv"][0].get()
+            cat_type = vars_dict["reference_catalog"][0].get()
+            
+            if not os.path.exists(b_csv) or not os.path.exists(v_csv):
+                messagebox.showerror("File Error", "Please select valid CSV result files for both filters.")
+                return
+                
+            from photometry.diff_photometry import run_differential_photometry
+            diff_status_var.set("Running differential photometry...")
+            root.update_idletasks()
+            
+            res = run_differential_photometry(
+                csv_b=b_csv, csv_v=v_csv, ref_catalog=cat_type,
+                k_b=diff_kb_var.get(), k_v=diff_kv_var.get(),
+                Tbv=diff_tbv_var.get(), Tb_bv=diff_tbbv_var.get(), Tv_bv=diff_tvbv_var.get()
+            )
+            diff_status_var.set(res)
+        except Exception as e:
+            diff_status_var.set(f"Error: {e}")
+            messagebox.showerror("Analysis Error", str(e))
+            
+    tk.Button(tab_diff, text="Execute Differential Photometry", command=on_run_diff,
+              bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), pady=8).pack(pady=10)
+
     lf_ccd = ttk.LabelFrame(tab_cam, text="CCD Settings (Error Analysis)")
     lf_ccd.pack(fill="x", padx=10, pady=10)
     add_entry(lf_ccd, "Gain (e-/ADU):", "ccd_gain", 1.27, 0)

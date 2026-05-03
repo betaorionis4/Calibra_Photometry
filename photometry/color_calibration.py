@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from scipy.stats import linregress
+import json
 
 def perform_robust_fit(x, y, sigma_clip=2.0):
     """
@@ -187,5 +188,18 @@ def derive_color_terms(results_b, results_v, catalog_stars, output_dir, airmass_
         f.write("*(Note: v_corr and b_corr are the instrumental magnitudes corrected for extinction)*\n\n")
         
         f.write("![Color Diagnostic Plots](color_plots.png)\n")
+        
+    # Save coefficients to JSON for later use in Differential Photometry
+    json_path = os.path.join(output_dir, "color_coefficients.json")
+    coeffs = {
+        "Tbv": float(res_mu.slope),
+        "Tb_bv": float(res_psi.slope),
+        "Tv_bv": float(res_eps.slope)
+    }
+    try:
+        with open(json_path, "w") as jf:
+            json.dump(coeffs, jf, indent=4)
+    except Exception as e:
+        print(f"Warning: Could not save coefficients JSON: {e}")
 
     return f"Success: Derived coefficients from {len(final_data)} stars. Report: {report_path}"

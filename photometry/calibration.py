@@ -303,7 +303,7 @@ def get_ref_stars(ref_catalog_file, center_ra=None, center_dec=None, radius_arcm
 def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec=2.0, 
                         default_zp=23.399, run_new_calibration=True, output_report=None,
                         center_ra=None, center_dec=None, snr_threshold=10.0,
-                        print_to_console=True):
+                        print_to_console=True, header=None):
     print("\n=================================================================")
     print("--- 4. Zero Point Calibration ---")
     print("=================================================================\n")
@@ -401,9 +401,10 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     report_lines.append(f"# Zero Point Calibration Report")
     report_lines.append(f"- **Source Catalogue**: {source_name}")
     report_lines.append(f"- **Calibration Filter**: {filter_name}")
-    report_lines.append(f"- **Matches Found**: {len(matched_det)}\n")
-    report_lines.append(f"| Match ID | Catalog RA/Dec (HMS/DMS) | V mag | B mag | B-V | Inst Mag | Zero Point |")
-    report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+    airmass_val = header.get('AIRMASS', 1.0) if header else 1.0
+    report_lines.append(f"- **Airmass**: {airmass_val:.3f}\n")
+    report_lines.append(f"| Match ID | Catalog RA/Dec (HMS/DMS) | V mag | B mag | B-V | Inst Mag | Airmass | Zero Point |")
+    report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
     
     zps = []
     matched_ref_stars = [ref_stars[i] for i in idx[match_mask]]
@@ -428,7 +429,7 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
         if print_to_console:
             print(f"  Match: {det_rs['id']} (SNR: {snr:.1f}) -> ZP: {zp:.3f} (Ref {mag_key}: {mag_ref:.3f}, Inst: {mag_inst:.3f})")
         
-        report_lines.append(f"| {det_rs['id']} | {coord_str} | {v_mag:.3f} | {b_mag:.3f} | {bv:+.3f} | {mag_inst:.3f} | **{zp:.3f}** |")
+        report_lines.append(f"| {det_rs['id']} | {coord_str} | {v_mag:.3f} | {b_mag:.3f} | {bv:+.3f} | {mag_inst:.3f} | {airmass_val:.3f} | **{zp:.3f}** |")
         
     zps = np.array(zps)
     mean_zp, median_zp, std_zp = sigma_clipped_stats(zps, sigma=3.0, maxiters=5)
