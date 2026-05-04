@@ -238,12 +238,12 @@ def run_config_gui(pipeline_callback=None):
     add_file_selector(lf_color, "B-Filter Results (CSV):", "color_b_csv", recent_b_csv, 0)
     add_file_selector(lf_color, "V-Filter Results (CSV):", "color_v_csv", recent_v_csv, 1)
     
-    ttk.Label(lf_color, text="Airmass B:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+    ttk.Label(lf_color, text="Airmass B*:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
     air_b_var = tk.DoubleVar(value=1.0)
     vars_dict["air_b"] = (air_b_var, float)
     ttk.Entry(lf_color, textvariable=air_b_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
     
-    ttk.Label(lf_color, text="Airmass V:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
+    ttk.Label(lf_color, text="Airmass V*:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
     air_v_var = tk.DoubleVar(value=1.0)
     vars_dict["air_v"] = (air_v_var, float)
     ttk.Entry(lf_color, textvariable=air_v_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
@@ -257,6 +257,11 @@ def run_config_gui(pipeline_callback=None):
     k_v_var = tk.DoubleVar(value=0.20)
     vars_dict["k_v"] = (k_v_var, float)
     ttk.Entry(lf_color, textvariable=k_v_var, width=10).grid(row=3, column=3, sticky=tk.W, padx=10, pady=5)
+
+    override_airmass_var = tk.BooleanVar(value=False)
+    vars_dict["override_airmass"] = (override_airmass_var, bool)
+    ttk.Label(lf_color, text="* 1.0 used if FITS values not found. To override FITS airmass values, check the box below and enter new values.", foreground="#555", font=("Arial", 8, "italic")).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
+    ttk.Checkbutton(lf_color, text="Override FITS Airmass", variable=override_airmass_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
 
     color_status_var = tk.StringVar(value="Select B and V result files to begin.")
     tk.Label(tab_color, textvariable=color_status_var, fg="#333", font=("Arial", 9, "italic")).pack(pady=5)
@@ -283,17 +288,18 @@ def run_config_gui(pipeline_callback=None):
             data_b = read_csv_to_dicts(b_csv)
             data_v = read_csv_to_dicts(v_csv)
             
-            # Auto-extract Airmass from CSV if present
-            if data_b and 'airmass' in data_b[0]:
-                try: 
-                    am_b = float(data_b[0]['airmass'])
-                    air_b_var.set(am_b)
-                except: pass
-            if data_v and 'airmass' in data_v[0]:
-                try: 
-                    am_v = float(data_v[0]['airmass'])
-                    air_v_var.set(am_v)
-                except: pass
+            # Auto-extract Airmass from CSV if present (unless overridden)
+            if not override_airmass_var.get():
+                if data_b and 'airmass' in data_b[0]:
+                    try: 
+                        am_b = float(data_b[0]['airmass'])
+                        air_b_var.set(am_b)
+                    except: pass
+                if data_v and 'airmass' in data_v[0]:
+                    try: 
+                        am_v = float(data_v[0]['airmass'])
+                        air_v_var.set(am_v)
+                    except: pass
 
             # Convert numeric fields
             for d in data_b:
@@ -374,37 +380,81 @@ def run_config_gui(pipeline_callback=None):
     
     ref_mode_var = tk.StringVar(value="auto")
     ttk.Radiobutton(lf_ref, text="Automatic (Brightest star with 0.4 <= B-V <= 0.8)", variable=ref_mode_var, value="auto").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
-    ttk.Radiobutton(lf_ref, text="Manual Coordinates", variable=ref_mode_var, value="manual").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    ttk.Radiobutton(lf_ref, text="Resolve Star by Name (via Simbad)", variable=ref_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_ref, text="Star Name:").grid(row=2, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    star_name_var = tk.StringVar(value="AE UMa")
+    star_name_entry = ttk.Entry(lf_ref, textvariable=star_name_var, width=20)
+    star_name_entry.grid(row=2, column=1, sticky=tk.W, padx=2)
+    
+    name_resolve_status_var = tk.StringVar(value="")
+    ttk.Label(lf_ref, textvariable=name_resolve_status_var, font=("Arial", 8, "italic"), foreground="#555").grid(row=2, column=3, columnspan=4, sticky=tk.W, padx=5)
+
+    def check_star_name(*args):
+        if ref_mode_var.get() != "name": return
+        star_name = star_name_var.get().strip()
+        if not star_name:
+            name_resolve_status_var.set("Please enter a name.")
+            return
+        name_resolve_status_var.set("Resolving...")
+        root.update_idletasks()
+        
+        def resolve_thread():
+            from astropy.coordinates import SkyCoord
+            from astropy.coordinates.name_resolve import NameResolveError
+            try:
+                c = SkyCoord.from_name(star_name)
+                ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
+                dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
+                root.after(0, lambda: name_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
+            except NameResolveError:
+                root.after(0, lambda: name_resolve_status_var.set("Not found in Simbad."))
+            except Exception:
+                root.after(0, lambda: name_resolve_status_var.set("Error connecting."))
+        
+        import threading
+        threading.Thread(target=resolve_thread, daemon=True).start()
+
+    check_name_btn = ttk.Button(lf_ref, text="Check", command=check_star_name, width=8)
+    check_name_btn.grid(row=2, column=2, sticky=tk.W, padx=2)
+    star_name_entry.bind('<Return>', check_star_name)
+
+    ttk.Radiobutton(lf_ref, text="Manual Coordinates", variable=ref_mode_var, value="manual").grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
     
     # RA boxes
-    ttk.Label(lf_ref, text="RA:").grid(row=2, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    ttk.Label(lf_ref, text="RA:").grid(row=4, column=0, sticky=tk.E, padx=(10, 2), pady=5)
     ra_h_var = tk.StringVar(value="14")
-    ttk.Entry(lf_ref, textvariable=ra_h_var, width=4).grid(row=2, column=1, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="h").grid(row=2, column=2, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=ra_h_var, width=4).grid(row=4, column=1, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="h").grid(row=4, column=2, sticky=tk.W, padx=0)
     ra_m_var = tk.StringVar(value="34")
-    ttk.Entry(lf_ref, textvariable=ra_m_var, width=4).grid(row=2, column=3, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="m").grid(row=2, column=4, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=ra_m_var, width=4).grid(row=4, column=3, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="m").grid(row=4, column=4, sticky=tk.W, padx=0)
     ra_s_var = tk.StringVar(value="00.00")
-    ttk.Entry(lf_ref, textvariable=ra_s_var, width=6).grid(row=2, column=5, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="s").grid(row=2, column=6, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=ra_s_var, width=6).grid(row=4, column=5, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="s").grid(row=4, column=6, sticky=tk.W, padx=0)
     
     # Dec boxes
-    ttk.Label(lf_ref, text="Dec:").grid(row=3, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    ttk.Label(lf_ref, text="Dec:").grid(row=5, column=0, sticky=tk.E, padx=(10, 2), pady=5)
     dec_d_var = tk.StringVar(value="+43")
-    ttk.Entry(lf_ref, textvariable=dec_d_var, width=4).grid(row=3, column=1, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="d").grid(row=3, column=2, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=dec_d_var, width=4).grid(row=5, column=1, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="d").grid(row=5, column=2, sticky=tk.W, padx=0)
     dec_m_var = tk.StringVar(value="30")
-    ttk.Entry(lf_ref, textvariable=dec_m_var, width=4).grid(row=3, column=3, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="m").grid(row=3, column=4, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=dec_m_var, width=4).grid(row=5, column=3, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="m").grid(row=5, column=4, sticky=tk.W, padx=0)
     dec_s_var = tk.StringVar(value="00.0")
-    ttk.Entry(lf_ref, textvariable=dec_s_var, width=6).grid(row=3, column=5, sticky=tk.W, padx=2)
-    ttk.Label(lf_ref, text="s").grid(row=3, column=6, sticky=tk.W, padx=0)
+    ttk.Entry(lf_ref, textvariable=dec_s_var, width=6).grid(row=5, column=5, sticky=tk.W, padx=2)
+    ttk.Label(lf_ref, text="s").grid(row=5, column=6, sticky=tk.W, padx=0)
     
     def toggle_ref_entries(*args):
-        state = tk.NORMAL if ref_mode_var.get() == "manual" else tk.DISABLED
+        mode = ref_mode_var.get()
+        name_state = tk.NORMAL if mode == "name" else tk.DISABLED
+        manual_state = tk.NORMAL if mode == "manual" else tk.DISABLED
+        
+        star_name_entry.config(state=name_state)
+        check_name_btn.config(state=name_state)
         for child in lf_ref.winfo_children():
-            if isinstance(child, ttk.Entry):
-                child.config(state=state)
+            if isinstance(child, ttk.Entry) and child != star_name_entry:
+                child.config(state=manual_state)
     
     ref_mode_var.trace("w", toggle_ref_entries)
     toggle_ref_entries()
@@ -454,6 +504,28 @@ def run_config_gui(pipeline_callback=None):
                 except Exception as e:
                     messagebox.showerror("Coordinate Error", f"Invalid manual coordinates format.\n{e}")
                     diff_status_var.set("Error: Invalid manual coordinates.")
+                    return
+            elif ref_mode_var.get() == "name":
+                star_name = star_name_var.get().strip()
+                if not star_name:
+                    messagebox.showerror("Name Error", "Please enter a star name.")
+                    diff_status_var.set("Error: Empty star name.")
+                    return
+                from astropy.coordinates import SkyCoord
+                from astropy.coordinates.name_resolve import NameResolveError
+                diff_status_var.set(f"Resolving '{star_name}' via Simbad...")
+                root.update_idletasks()
+                try:
+                    c = SkyCoord.from_name(star_name)
+                    manual_coord = (c.ra.deg, c.dec.deg)
+                    print(f"Resolved '{star_name}' to RA: {c.ra.deg:.5f}, Dec: {c.dec.deg:.5f}")
+                except NameResolveError as e:
+                    messagebox.showerror("Resolution Error", f"Could not resolve name '{star_name}' via Simbad.\n\nNote: AAVSO AUIDs (like 000-BJS-555) are often not recognized. Try a common catalog name (e.g., TYC, HD, or variable star name) or use Manual Coordinates.")
+                    diff_status_var.set(f"Error: Could not resolve '{star_name}'.")
+                    return
+                except Exception as e:
+                    messagebox.showerror("Resolution Error", f"Error looking up '{star_name}':\n{e}")
+                    diff_status_var.set("Error during name resolution.")
                     return
             
             res = run_differential_photometry(

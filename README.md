@@ -30,7 +30,7 @@ For a more detailed dive into the mathematical principles, theoretical backgroun
 *   **Theory of Operation**: Aperture Photometry vs. Sky Annulus math.
 *   **Mathematical Principles**: PSF Fitting, Sub-pixel Refinement, and Error Propagation.
 *   **The 7 Processing Stages**: From Star Detection to Shift Analysis and color calibration.
-*   **Differential Photometry**: Computing formal AAVSO-ready magnitudes ($B$, $V$, $B-V$) using reference stars. Supports both automated and manual reference star selection.
+*   **Differential Photometry**: Computing formal AAVSO-ready magnitudes ($B$, $V$, $B-V$) using reference stars. Supports automated, manual (coordinate-based), and name-based (SIMBAD resolution) reference star selection.
 *   **Accuracy Evaluation**: Statistical fitting and plotting of deviations against catalog magnitudes.
 *   **GUI Guide**: How to tune the pipeline for your specific sensor.
 *   **Diagnostics**: Understanding radial profiles and calibration reports.
