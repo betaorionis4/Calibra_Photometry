@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, scrolledtext
 import os
 import sys
 import threading
+import csv
 
 class StdoutRedirector:
     def __init__(self, text_widget):
@@ -597,7 +598,174 @@ def run_config_gui(pipeline_callback=None):
     tk.Button(lf_diff, text="Load Last Coefficients", command=load_color_coefficients).grid(row=4, column=0, columnspan=2, pady=5)
     
     tk.Label(tab_diff, textvariable=diff_status_var, fg="#333", font=("Arial", 9, "italic")).pack(pady=5)
+
+    # --- TAB 6: Time Series (Light Curve) ---
+    tab_ts = ttk.Frame(notebook)
+    notebook.add(tab_ts, text="Time Series")
     
+    ts_scroll = ScrollableFrame(tab_ts)
+    ts_scroll.pack(fill="both", expand=True)
+    ts_container = ts_scroll.scrollable_frame
+    
+    lf_ts_io = ttk.LabelFrame(ts_container, text="FITS Sequence Selection")
+    lf_ts_io.pack(fill="x", padx=10, pady=10)
+    
+    ttk.Label(lf_ts_io, text="FITS File Pattern:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_pattern_var = tk.StringVar(value="fitsfiles/*.fits")
+    vars_dict["ts_pattern"] = (ts_pattern_var, str)
+    ttk.Entry(lf_ts_io, textvariable=ts_pattern_var, width=50).grid(row=0, column=1, columnspan=3, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_ts_io, text="Filter:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_filter_var = tk.StringVar(value="V")
+    vars_dict["ts_filter"] = (ts_filter_var, str)
+    ttk.Combobox(lf_ts_io, textvariable=ts_filter_var, values=["V", "B"], state="readonly", width=5).grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
+
+    # Reference Star
+    lf_ts_ref = ttk.LabelFrame(ts_container, text="Reference Star (Anchor)")
+    lf_ts_ref.pack(fill="x", padx=10, pady=5)
+    
+    ts_ref_mode_var = tk.StringVar(value="name")
+    ttk.Radiobutton(lf_ts_ref, text="Resolve Name", variable=ts_ref_mode_var, value="name").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_ref_name_var = tk.StringVar(value="TYC 3031-137-1")
+    ttk.Entry(lf_ts_ref, textvariable=ts_ref_name_var, width=20).grid(row=0, column=1, sticky=tk.W, padx=2)
+    
+    ttk.Radiobutton(lf_ts_ref, text="Manual RA/Dec", variable=ts_ref_mode_var, value="manual").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_ref_ra_var = tk.StringVar(value="14:34:00")
+    ts_ref_dec_var = tk.StringVar(value="+43:30:00")
+    ttk.Entry(lf_ts_ref, textvariable=ts_ref_ra_var, width=12).grid(row=1, column=1, sticky=tk.W, padx=2)
+    ttk.Entry(lf_ts_ref, textvariable=ts_ref_dec_var, width=12).grid(row=1, column=2, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_ref, text="Catalog Mag (Std):").grid(row=2, column=0, sticky=tk.W, padx=10, pady=2)
+    ts_ref_mag_var = tk.DoubleVar(value=10.0)
+    vars_dict["ts_ref_mag"] = (ts_ref_mag_var, float)
+    ttk.Entry(lf_ts_ref, textvariable=ts_ref_mag_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_ref, text="Reference (B-V):").grid(row=2, column=2, sticky=tk.W, padx=10, pady=2)
+    ts_ref_bv_var = tk.DoubleVar(value=0.5)
+    vars_dict["ts_ref_bv"] = (ts_ref_bv_var, float)
+    ttk.Entry(lf_ts_ref, textvariable=ts_ref_bv_var, width=8).grid(row=2, column=3, sticky=tk.W, padx=2)
+
+    # Target Star
+    lf_ts_target = ttk.LabelFrame(ts_container, text="Target Star (Variable)")
+    lf_ts_target.pack(fill="x", padx=10, pady=5)
+    
+    ts_target_mode_var = tk.StringVar(value="name")
+    ttk.Radiobutton(lf_ts_target, text="Resolve Name", variable=ts_target_mode_var, value="name").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_target_name_var = tk.StringVar(value="AE UMa")
+    ttk.Entry(lf_ts_target, textvariable=ts_target_name_var, width=20).grid(row=0, column=1, sticky=tk.W, padx=2)
+    
+    ttk.Radiobutton(lf_ts_target, text="Manual RA/Dec", variable=ts_target_mode_var, value="manual").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+    ts_target_ra_var = tk.StringVar(value="14:34:00")
+    ts_target_dec_var = tk.StringVar(value="+43:30:00")
+    ttk.Entry(lf_ts_target, textvariable=ts_target_ra_var, width=12).grid(row=1, column=1, sticky=tk.W, padx=2)
+    ttk.Entry(lf_ts_target, textvariable=ts_target_dec_var, width=12).grid(row=1, column=2, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_target, text="Target (B-V) [assumed]:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=2)
+    ts_target_bv_var = tk.DoubleVar(value=0.5)
+    vars_dict["ts_target_bv"] = (ts_target_bv_var, float)
+    ttk.Entry(lf_ts_target, textvariable=ts_target_bv_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
+
+    # Coefficients
+    lf_ts_coeff = ttk.LabelFrame(ts_container, text="Coefficients & Metadata")
+    lf_ts_coeff.pack(fill="x", padx=10, pady=5)
+    
+    ttk.Label(lf_ts_coeff, text="Color Term (e.g. Tv_bv):").grid(row=0, column=0, sticky=tk.W, padx=10, pady=2)
+    ts_coeff_var = tk.DoubleVar(value=0.0)
+    vars_dict["ts_coeff"] = (ts_coeff_var, float)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_coeff_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_coeff, text="Extinction (k):").grid(row=0, column=2, sticky=tk.W, padx=10, pady=2)
+    ts_k_var = tk.DoubleVar(value=0.15)
+    vars_dict["ts_k"] = (ts_k_var, float)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_k_var, width=10).grid(row=0, column=3, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_coeff, text="AAVSO Observer Code:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=2)
+    ts_obs_var = tk.StringVar(value="XXXX")
+    vars_dict["ts_obs_code"] = (ts_obs_var, str)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_obs_var, width=10).grid(row=1, column=1, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_coeff, text="Site Lat:").grid(row=1, column=2, sticky=tk.W, padx=10, pady=2)
+    ts_lat_var = tk.DoubleVar(value=0.0)
+    vars_dict["ts_lat"] = (ts_lat_var, float)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_lat_var, width=10).grid(row=1, column=3, sticky=tk.W, padx=2)
+    
+    ttk.Label(lf_ts_coeff, text="Site Long:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=2)
+    ts_lon_var = tk.DoubleVar(value=0.0)
+    vars_dict["ts_lon"] = (ts_lon_var, float)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_lon_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=2)
+
+    ts_status_var = tk.StringVar(value="Ready to process sequence.")
+    ttk.Label(ts_container, textvariable=ts_status_var, font=("Arial", 9, "italic")).pack(pady=5)
+    
+    def on_run_ts():
+        import glob
+        pattern = ts_pattern_var.get()
+        files = glob.glob(pattern)
+        if not files:
+            messagebox.showerror("Error", f"No files found matching: {pattern}")
+            return
+        
+        ts_status_var.set("Resolving coordinates...")
+        root.update_idletasks()
+        
+        from astropy.coordinates import SkyCoord
+        def get_coords(mode, name, ra_s, dec_s):
+            if mode == "name":
+                return SkyCoord.from_name(name)
+            else:
+                return SkyCoord(f"{ra_s} {dec_s}", unit=(u.hourangle, u.deg))
+
+        import astropy.units as u
+        try:
+            ref_c = get_coords(ts_ref_mode_var.get(), ts_ref_name_var.get(), ts_ref_ra_var.get(), ts_ref_dec_var.get())
+            tar_c = get_coords(ts_target_mode_var.get(), ts_target_name_var.get(), ts_target_ra_var.get(), ts_target_dec_var.get())
+        except Exception as e:
+            messagebox.showerror("Coord Error", f"Coordinate resolution failed: {e}")
+            return
+
+        def ts_thread():
+            from photometry.time_series import run_time_series_photometry, save_aavso_report, plot_light_curve
+            ts_status_var.set(f"Processing {len(files)} files...")
+            
+            results, msg = run_time_series_photometry(
+                files, tar_c.ra.deg, tar_c.dec.deg, ref_c.ra.deg, ref_c.dec.deg,
+                ts_ref_mag_var.get(), ts_ref_bv_var.get(), ts_target_bv_var.get(),
+                ts_coeff_var.get(), 0.0, # epsilon not used yet
+                vars_dict["aperture_radius"][0].get(),
+                vars_dict["annulus_inner"][0].get(),
+                vars_dict["annulus_outer"][0].get(),
+                gain=vars_dict["ccd_gain"][0].get(),
+                k_coeff=ts_k_var.get(),
+                filter_name=ts_filter_var.get(),
+                site_lat=ts_lat_var.get(),
+                site_long=ts_lon_var.get()
+            )
+            
+            if results:
+                out_csv = os.path.join("photometry_output", f"light_curve_{ts_target_name_var.get().replace(' ','_')}.csv")
+                out_aavso = os.path.join("photometry_output", f"aavso_{ts_target_name_var.get().replace(' ','_')}.txt")
+                out_plot = os.path.join("photometry_output", f"plot_{ts_target_name_var.get().replace(' ','_')}.png")
+                
+                # Save CSV
+                with open(out_csv, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                    writer.writeheader()
+                    writer.writerows(results)
+                
+                save_aavso_report(results, out_aavso, ts_target_name_var.get(), ts_filter_var.get(), ts_obs_var.get())
+                plot_light_curve(results, ts_target_name_var.get(), out_plot)
+                
+                ts_status_var.set(f"Complete! Results saved to {out_csv}")
+                messagebox.showinfo("Success", f"Light curve generated!\nSaved to: {out_csv}\nPlot: {out_plot}")
+            else:
+                ts_status_var.set(f"Failed: {msg}")
+
+        threading.Thread(target=ts_thread, daemon=True).start()
+
+    ttk.Button(ts_container, text="Generate Light Curve", command=on_run_ts).pack(pady=10)
+
+    # --- END TAB 6 ---
+
     def on_run_diff():
         try:
             b_csv = vars_dict["diff_b_csv"][0].get()
