@@ -275,9 +275,112 @@ def get_ref_stars(ref_catalog_file, center_ra=None, center_dec=None, radius_arcm
             ref_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
             if ref_stars:
                 save_to_cache(ref_stars, center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
+        
+        # Mark variables in the returned set
+        mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=verbose)
     else:
         ref_stars = read_reference_catalog(ref_catalog_file)
     return ref_stars
+
+def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
+    if verbose:
+        print(f"Fetching VSX catalog from VizieR for RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
+    
+    from astropy.utils.data import Conf
+    Conf.remote_timeout.set(60)
+    
+    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', 'RAJ2000', 'DEJ2000'], row_limit=-1)
+    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
+    
+    try:
+        result = v.query_region(coord, radius=radius_arcmin * u.arcmin)
+    except Exception as e:
+        print(f"Error querying VSX: {e}")
+        return []
+        
+    if not result or len(result) == 0:
+        if verbose:
+            print("No VSX variables found in this region.")
+        return []
+        
+    table = result[0]
+    vsx_stars = []
+    for row in table:
+        try:
+            vsx_stars.append({
+                'id': str(row['Name']),
+                'ra_deg': float(row['RAJ2000']),
+                'dec_deg': float(row['DEJ2000'])
+            })
+        except:
+            continue
+            
+    if verbose:
+        print(f"Successfully retrieved {len(vsx_stars)} variable stars from VSX.")
+    return vsx_stars
+
+def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refstars/cache", verbose=True):
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+        
+    cache_file = os.path.join(cache_dir, f"VSX_{ra_deg:.3f}_{dec_deg:.3f}_{radius_arcmin}.csv")
+    
+    vsx_stars = []
+    if os.path.exists(cache_file):
+        if verbose:
+            print(f"Loading cached VSX catalog from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                vsx_stars.append({
+                    'id': row['id'],
+                    'ra_deg': float(row['ra_deg']),
+                    'dec_deg': float(row['dec_deg'])
+                })
+        return vsx_stars
+        
+    vsx_stars = fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin, verbose)
+    
+    if vsx_stars:
+        with open(cache_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['id', 'ra_deg', 'dec_deg'])
+            writer.writeheader()
+            for s in vsx_stars:
+                writer.writerow(s)
+    return vsx_stars
+
+def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose=True):
+    """
+    Cross-matches a list of stars against the VSX catalog and adds 'is_variable' flag.
+    """
+    if not star_list: return star_list
+    
+    vsx_stars = get_vsx_stars(center_ra, center_dec, radius_arcmin, verbose=verbose)
+    if not vsx_stars:
+        for s in star_list: s['is_variable'] = False
+        return star_list
+        
+    vsx_coords = SkyCoord(ra=[s['ra_deg'] for s in vsx_stars]*u.deg, dec=[s['dec_deg'] for s in vsx_stars]*u.deg)
+    
+    # Handle different RA/Dec key formats (ra_deg vs RA_ICRS etc)
+    ra_keys = ['ra_deg', 'RA_ICRS', '_RAJ2000', 'RAJ2000']
+    dec_keys = ['dec_deg', 'DE_ICRS', '_DEJ2000', 'DEJ2000']
+    
+    ra_key = next((k for k in ra_keys if k in star_list[0]), 'ra_deg')
+    dec_key = next((k for k in dec_keys if k in star_list[0]), 'dec_deg')
+    
+    try:
+        star_coords = SkyCoord(ra=[float(s[ra_key]) for s in star_list]*u.deg, 
+                               dec=[float(s[dec_key]) for s in star_list]*u.deg)
+    except:
+        # Fallback if keys are missing or not floatable
+        for s in star_list: s['is_variable'] = False
+        return star_list
+        
+    idx, d2d, _ = star_coords.match_to_catalog_sky(vsx_coords)
+    for i, s in enumerate(star_list):
+        s['is_variable'] = (d2d[i].arcsec < 2.0)
+    return star_list
 
 def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec=2.0, 
                         default_zp=23.399, run_new_calibration=True, output_report=None,
@@ -318,6 +421,19 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
                 rs['mag_calibrated_err'] = np.nan
         return
         
+    # Exclude variable stars
+    if center_ra is not None and center_dec is not None:
+        mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=print_to_console)
+        mark_variable_stars(results, center_ra, center_dec, radius_arcmin, verbose=False)
+    else:
+        for s in ref_stars: s['is_variable'] = False
+        for s in results: s['is_variable'] = False
+        
+    valid_ref_stars = [s for s in ref_stars if not s.get('is_variable', False)]
+    num_vars = len(ref_stars) - len(valid_ref_stars)
+    if num_vars > 0:
+        print(f"Excluded {num_vars} known variable stars from the reference calibration set.")
+        
     mag_key = 'B_mag' if 'B' in filter_name.upper() else 'V_mag'
     
     # Identify Source
@@ -331,10 +447,10 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     print(f"Using {mag_key} from reference catalog for calibration.")
     print(f"SNR Threshold for calibration stars: {snr_threshold}")
     
-    ref_ra = [s['ra_deg'] for s in ref_stars]
-    ref_dec = [s['dec_deg'] for s in ref_stars]
+    ref_ra = [s['ra_deg'] for s in valid_ref_stars]
+    ref_dec = [s['dec_deg'] for s in valid_ref_stars]
     ref_coords = SkyCoord(ra=ref_ra*u.deg, dec=ref_dec*u.deg)
-    ref_mags = np.array([s[mag_key] for s in ref_stars])
+    ref_mags = np.array([s[mag_key] for s in valid_ref_stars])
     
     det_valid = []
     det_ra = []
@@ -384,8 +500,10 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     report_lines.append(f"| Match ID | Catalog RA/Dec (HMS/DMS) | V mag | B mag | B-V | Inst Mag | Zero Point |")
     report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
     
+    report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+    
     zps = []
-    matched_ref_stars = [ref_stars[i] for i in idx[match_mask]]
+    matched_ref_stars = [valid_ref_stars[i] for i in idx[match_mask]]
     
     for i, det_rs in enumerate(matched_det):
         mag_inst = det_rs['mag_inst']

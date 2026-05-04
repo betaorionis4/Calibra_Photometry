@@ -111,6 +111,14 @@ Based on **GAIA DR3 Documentation,Table 5.9**, which provides coefficients for V
 - $B = G - 0.01448 + 0.6874 \cdot C + 0.3604 \cdot C^2 - 0.06718 \cdot C^3 + 0.006061 \cdot C^4$
 - *where $C = G_{BP} - G_{RP}$*
 
+## 2.5 AAVSO VSX Integration (Variable Star Exclusion)
+To ensure the highest photometric rigor, Calibra automatically cross-matches all detected stars and reference catalogs against the **AAVSO International Variable Star Index (VSX)** via VizieR (`B/vsx/vsx`).
+
+- **Calibration Rigor**: Any reference star found within 2 arcseconds of a known VSX variable is automatically excluded from the Zero-Point derivation.
+- **Statistical Purity**: Known variables are excluded from the Gaussian fits in Accuracy Evaluation plots to prevent their intrinsic fluctuations from artificially inflating the reported scatter ($\sigma$).
+- **Identification**: All output CSVs and reports include an `is_variable` flag ("Yes"/"No") to help you identify known variable sources in your field at a glance.
+- **Local Caching**: VSX data is cached in `photometry_refstars/cache/` to minimize network overhead during repeat analysis.
+
 ---
 
 ## 3. The Processing Pipeline (A-G)
@@ -161,8 +169,6 @@ A specialized post-processing tool for deriving instrumental **Color Terms**.
 
 ---
 
----
-
 ## 4. Differential Photometry
 
 The Differential Photometry module is intended to compute AAVSO-ready standard magnitudes for every star in a field relative to a designated reference star. The reference star can be either automatically selected by the pipeline or manually specified by the user to focus on measuring magnitudes of variable stars using a known comparison star.
@@ -173,17 +179,23 @@ The Differential Photometry module is intended to compute AAVSO-ready standard m
 - **Reference Star Selection**:
   - **Automatic Mode**: The pipeline filters the catalog matches to automatically select the optimal reference star. It strictly chooses a star that is:
     1. Unsaturated (peak ADU below the non-linear regime).
-    2. Of moderate color (catalog $0.4 \leq (B-V) \leq 0.8$) to minimize extreme transformation residuals.
-    3. The brightest available instrumental $V$ magnitude among the remaining candidates.
+    2. Not a known variable (cross-matched against VSX).
+    3. Of moderate color (catalog $0.4 \leq (B-V) \leq 0.8$) to minimize extreme transformation residuals.
+    4. The brightest available instrumental $V$ magnitude among the remaining candidates.
   - **Search by Name Mode**: The user inputs a specific star name (e.g., "AE UMa"). The pipeline resolves the exact RA and Dec coordinates dynamically via the SIMBAD astronomical database and anchors the photometry to this object. You can instantly verify the resolved coordinates using the Check button in the GUI before executing.
   - **Manual Mode**: The user inputs specific RA and Dec coordinates ($h, m, s$ and $d, m, s$). The pipeline finds the matched detection within a 4-arcsecond tolerance of those coordinates, verifies it has catalog data, and strictly forces it to be the reference anchor.
-- **Zero Point Calculation**: Using the user-provided Color Transformation Coefficients ($T_{bv}, T_{b\_bv}, T_{v\_bv}$) and atmospheric extinction ($k_B, k_V$), the pipeline derives the instrumental zero points ($Z_{BV}, Z_B, Z_V$) relative to this reference star. The color transformation coefficients can be taken from the Color Transformation Calibration module (see Section 3.G) or manually entered by the user.
+- **Zero Point Calculation**: Using the Color Transformation Coefficients ($T_{bv}, T_{b\_bv}, T_{v\_bv}$) and atmospheric extinction ($k_B, k_V$), the pipeline derives the instrumental zero points ($Z_{BV}, Z_B, Z_V$) relative to this reference star. The color transformation coefficients can be taken from the Color Transformation Calibration module (see Section 3.G) or manually entered by the user.
 
-### 4.2 Standard Magnitude Output
-These zero points are instantly applied to all other stars in the field to get standard magnitudes ($B, V$) and color index ($B-V$). The final standard magnitudes and color index are saved in a Markdown table (`differential_photometry_results.md`) alongside a more detailed CSV file (with all the instrumental data, errors, etc).
+### 4.2 Target Selection Modes
+In the Differential Photometry tab, you can define which stars to process:
+- **Analyze All Stars (Default)**: The pipeline computes standard magnitudes for every common B/V pair in the image. This is useful for survey work or verifying field-wide accuracy.
+- **Analyze a specific Target Pair**: The pipeline isolates a single star (via Name/SIMBAD or Manual Coordinates) and computes standard magnitudes for only that object. This mode skips the population-wide Accuracy Evaluation plotting as it is not statistically valid for a single target.
 
-### 4.3 Accuracy Evaluation
-To evaluate the calibration quality, the pipeline automatically compares the internally computed standard magnitudes against the actual catalog magnitudes for all matching stars (excluding the reference anchor).
+### 4.3 Standard Magnitude Output
+These zero points are instantly applied to all other stars in the field to get standard magnitudes ($B, V$) and color index ($B-V$). The final standard magnitudes and color index are saved in a Markdown table (`differential_photometry_results.md`) alongside a more detailed CSV file (with all the instrumental data, errors, and variability flags).
+
+### 4.4 Accuracy Evaluation
+To evaluate the calibration quality, the pipeline automatically compares the internally computed standard magnitudes against the actual catalog magnitudes for all matching stars (excluding the reference anchor and any known VSX variables).
 - **Statistical Fitting**: It calculates the deviations ($\Delta B$, $\Delta V$, $\Delta(B-V)$) and fits a Gaussian distribution to determine the mean offset ($\mu$) and standard deviation/scatter ($\sigma$).
 - **Plotting**: It generates a 3-panel histogram plot with the Gaussian fits overlaid (`photometry_plots/diff_photometry_deviations.png`), allowing you to rapidly identify any systematic errors or estimate your measurement uncertainties. The statistical fits are appended to the `differential_photometry_report.md`.
 
@@ -222,6 +234,8 @@ The primary output for every image. Key columns include:
 - `net_flux`: Background-subtracted ADU counts.
 - `mag_calibrated`: The final, zero-point corrected true magnitude.
 - `mag_calibrated_err`: The ± uncertainty of the final magnitude.
+- `is_variable`: A "Yes/No" flag indicating if the star matched a record in the AAVSO VSX catalog.
+- `airmass`: The atmospheric airmass calculated from the FITS header.
 
 ### 6.2 Diagnostic Plots (`photometry_plots/`)
 If enabled, the pipeline saves a four-panel graphic for each star showing:

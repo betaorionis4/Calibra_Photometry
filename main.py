@@ -168,7 +168,7 @@ def process_file(fits_filename, config):
             'id', 'raw_x', 'raw_y', 'refined_x', 'refined_y', 
             'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
             'peak_adu', 'dao_flux', 'net_flux', 'flux_err', 'snr',
-            'mag_inst', 'mag_inst_err', 'mag_calibrated', 'mag_calibrated_err', 'airmass'
+            'mag_inst', 'mag_inst_err', 'mag_calibrated', 'mag_calibrated_err', 'airmass', 'is_variable'
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -193,7 +193,8 @@ def process_file(fits_filename, config):
                 'mag_inst_err': f"{rs.get('mag_inst_err', 0):.3f}" if 'mag_inst_err' in rs and not np.isnan(rs['mag_inst_err']) else "",
                 'mag_calibrated': f"{rs.get('mag_calibrated', 0):.3f}" if 'mag_calibrated' in rs and not np.isnan(rs['mag_calibrated']) else "",
                 'mag_calibrated_err': f"{rs.get('mag_calibrated_err', 0):.3f}" if 'mag_calibrated_err' in rs and not np.isnan(rs['mag_calibrated_err']) else "",
-                'airmass': f"{header.get('AIRMASS', 1.0):.4f}"
+                'airmass': f"{header.get('AIRMASS', 1.0):.4f}",
+                'is_variable': 'Yes' if rs.get('is_variable', False) else 'No'
             })
 
     # 6. Shift Analysis

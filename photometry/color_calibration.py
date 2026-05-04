@@ -83,6 +83,14 @@ def derive_color_terms(results_b, results_v, catalog_stars, output_dir, airmass_
             pair = matched_pairs[i]
             cat = catalog_stars[idx_cat[i]]
             
+            # Exclude variable stars from color term derivation
+            if cat.get('is_variable', False):
+                continue
+            
+            # Also check if the detected star was marked as variable in a previous step
+            if pair['b'].get('is_variable') == 'Yes' or pair['v'].get('is_variable') == 'Yes':
+                continue
+            
             # Instrumental magnitudes (raw)
             b_raw = pair['b'].get('mag_inst', np.nan)
             v_raw = pair['v'].get('mag_inst', np.nan)
@@ -97,6 +105,8 @@ def derive_color_terms(results_b, results_v, catalog_stars, output_dir, airmass_
             
             if not np.isnan([b_inst, v_inst, b_cat, v_cat]).any():
                 final_data.append({
+                    'ra_deg': pair['v']['ra_deg'],
+                    'dec_deg': pair['v']['dec_deg'],
                     'b_inst': b_inst,
                     'v_inst': v_inst,
                     'b_cat': b_cat,
@@ -108,7 +118,15 @@ def derive_color_terms(results_b, results_v, catalog_stars, output_dir, airmass_
                 })
 
     if len(final_data) < 5:
-        return f"Error: Too few stars ({len(final_data)}) matched to catalog for reliable fitting."
+        return f"Error: Too few stars ({len(final_data)}) matched to catalog (after excluding variables) for reliable fitting."
+
+    # Save matched data to CSV for transparency
+    matched_csv = os.path.join(output_dir, "color_matched_stars.csv")
+    import csv
+    with open(matched_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=final_data[0].keys())
+        writer.writeheader()
+        writer.writerows(final_data)
 
     # 3. Perform Robust Fits (with 2-sigma clipping)
     c_cat = np.array([d['color_cat'] for d in final_data])

@@ -22,6 +22,37 @@ class StdoutRedirector:
     def flush(self):
         pass
 
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg="#f0f2f5")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
+        self.canvas.bind("<Enter>", lambda _: self.canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        self.canvas.bind("<Leave>", lambda _: self.canvas.unbind_all("<MouseWheel>"))
+
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
+        
+    def on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
 def run_config_gui(pipeline_callback=None):
     """
     Launches a persistent Tkinter GUI for pipeline configuration.
@@ -339,8 +370,12 @@ def run_config_gui(pipeline_callback=None):
               bg="#673ab7", fg="white", font=("Arial", 10, "bold"), pady=8).pack(pady=10)
 
     # --- TAB 2.6: Differential Photometry ---
-    tab_diff = ttk.Frame(notebook)
-    notebook.add(tab_diff, text="Differential Photometry")
+    tab_diff_outer = ttk.Frame(notebook)
+    notebook.add(tab_diff_outer, text="Differential Photometry")
+    
+    diff_scroll = ScrollableFrame(tab_diff_outer)
+    diff_scroll.pack(fill="both", expand=True)
+    tab_diff = diff_scroll.scrollable_frame
     
     lf_diff = ttk.LabelFrame(tab_diff, text="Compute B/V relative to a reference star")
     lf_diff.pack(fill="x", padx=10, pady=10)
@@ -458,6 +493,91 @@ def run_config_gui(pipeline_callback=None):
     
     ref_mode_var.trace("w", toggle_ref_entries)
     toggle_ref_entries()
+
+    lf_target = ttk.LabelFrame(tab_diff, text="Target Star Selection")
+    lf_target.pack(fill="x", padx=10, pady=10)
+    
+    target_mode_var = tk.StringVar(value="all")
+    ttk.Radiobutton(lf_target, text="Analyze all stars", variable=target_mode_var, value="all").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    ttk.Radiobutton(lf_target, text="Resolve Target by Name (via Simbad)", variable=target_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    
+    ttk.Label(lf_target, text="Star Name:").grid(row=2, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    target_name_var = tk.StringVar(value="")
+    target_name_entry = ttk.Entry(lf_target, textvariable=target_name_var, width=20)
+    target_name_entry.grid(row=2, column=1, sticky=tk.W, padx=2)
+    
+    target_resolve_status_var = tk.StringVar(value="")
+    ttk.Label(lf_target, textvariable=target_resolve_status_var, font=("Arial", 8, "italic"), foreground="#555").grid(row=2, column=3, columnspan=4, sticky=tk.W, padx=5)
+
+    def check_target_name(*args):
+        if target_mode_var.get() != "name": return
+        star_name = target_name_var.get().strip()
+        if not star_name:
+            target_resolve_status_var.set("Please enter a name.")
+            return
+        target_resolve_status_var.set("Resolving...")
+        root.update_idletasks()
+        
+        def resolve_thread():
+            from astropy.coordinates import SkyCoord
+            from astropy.coordinates.name_resolve import NameResolveError
+            try:
+                c = SkyCoord.from_name(star_name)
+                ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
+                dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
+                root.after(0, lambda: target_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
+            except NameResolveError:
+                root.after(0, lambda: target_resolve_status_var.set("Not found in Simbad."))
+            except Exception:
+                root.after(0, lambda: target_resolve_status_var.set("Error connecting."))
+        
+        import threading
+        threading.Thread(target=resolve_thread, daemon=True).start()
+
+    check_target_btn = ttk.Button(lf_target, text="Check", command=check_target_name, width=8)
+    check_target_btn.grid(row=2, column=2, sticky=tk.W, padx=2)
+    target_name_entry.bind('<Return>', check_target_name)
+
+    ttk.Radiobutton(lf_target, text="Manual Coordinates", variable=target_mode_var, value="manual").grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    
+    # RA boxes
+    ttk.Label(lf_target, text="RA:").grid(row=4, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    target_ra_h_var = tk.StringVar(value="14")
+    ttk.Entry(lf_target, textvariable=target_ra_h_var, width=4).grid(row=4, column=1, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="h").grid(row=4, column=2, sticky=tk.W, padx=0)
+    target_ra_m_var = tk.StringVar(value="34")
+    ttk.Entry(lf_target, textvariable=target_ra_m_var, width=4).grid(row=4, column=3, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="m").grid(row=4, column=4, sticky=tk.W, padx=0)
+    target_ra_s_var = tk.StringVar(value="00.00")
+    ttk.Entry(lf_target, textvariable=target_ra_s_var, width=6).grid(row=4, column=5, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="s").grid(row=4, column=6, sticky=tk.W, padx=0)
+    
+    # Dec boxes
+    ttk.Label(lf_target, text="Dec:").grid(row=5, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    target_dec_d_var = tk.StringVar(value="+43")
+    ttk.Entry(lf_target, textvariable=target_dec_d_var, width=4).grid(row=5, column=1, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="d").grid(row=5, column=2, sticky=tk.W, padx=0)
+    target_dec_m_var = tk.StringVar(value="30")
+    ttk.Entry(lf_target, textvariable=target_dec_m_var, width=4).grid(row=5, column=3, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="m").grid(row=5, column=4, sticky=tk.W, padx=0)
+    target_dec_s_var = tk.StringVar(value="00.0")
+    ttk.Entry(lf_target, textvariable=target_dec_s_var, width=6).grid(row=5, column=5, sticky=tk.W, padx=2)
+    ttk.Label(lf_target, text="s").grid(row=5, column=6, sticky=tk.W, padx=0)
+    
+    def toggle_target_entries(*args):
+        mode = target_mode_var.get()
+        name_state = tk.NORMAL if mode == "name" else tk.DISABLED
+        manual_state = tk.NORMAL if mode == "manual" else tk.DISABLED
+        
+        target_name_entry.config(state=name_state)
+        check_target_btn.config(state=name_state)
+        for child in lf_target.winfo_children():
+            if isinstance(child, ttk.Entry) and child != target_name_entry:
+                child.config(state=manual_state)
+    
+    target_mode_var.trace("w", toggle_target_entries)
+    toggle_target_entries()
+
     def load_color_coefficients():
         import json
         json_path = os.path.join("photometry_output", "color_coefficients.json")
@@ -528,12 +648,49 @@ def run_config_gui(pipeline_callback=None):
                     diff_status_var.set("Error during name resolution.")
                     return
             
+            manual_target_coord = None
+            target_mode = target_mode_var.get()
+            if target_mode == "manual":
+                ra_str = f"{target_ra_h_var.get()}h{target_ra_m_var.get()}m{target_ra_s_var.get()}s"
+                dec_str = f"{target_dec_d_var.get()}d{target_dec_m_var.get()}m{target_dec_s_var.get()}s"
+                try:
+                    c = SkyCoord(f"{ra_str} {dec_str}")
+                    manual_target_coord = (c.ra.deg, c.dec.deg)
+                except Exception as e:
+                    messagebox.showerror("Coordinate Error", f"Invalid manual target coordinates format.\n{e}")
+                    diff_status_var.set("Error: Invalid target coordinates.")
+                    return
+            elif target_mode == "name":
+                star_name = target_name_var.get().strip()
+                if not star_name:
+                    messagebox.showerror("Name Error", "Please enter a target star name.")
+                    diff_status_var.set("Error: Empty target star name.")
+                    return
+                from astropy.coordinates import SkyCoord
+                from astropy.coordinates.name_resolve import NameResolveError
+                diff_status_var.set(f"Resolving '{star_name}' via Simbad...")
+                root.update_idletasks()
+                try:
+                    c = SkyCoord.from_name(star_name)
+                    manual_target_coord = (c.ra.deg, c.dec.deg)
+                    print(f"Resolved target '{star_name}' to RA: {c.ra.deg:.5f}, Dec: {c.dec.deg:.5f}")
+                except NameResolveError as e:
+                    messagebox.showerror("Resolution Error", f"Could not resolve target name '{star_name}' via Simbad.\n\nNote: AAVSO AUIDs (like 000-BJS-555) are often not recognized. Try a common catalog name (e.g., TYC, HD, or variable star name) or use Manual Coordinates.")
+                    diff_status_var.set(f"Error: Could not resolve target '{star_name}'.")
+                    return
+                except Exception as e:
+                    messagebox.showerror("Resolution Error", f"Error looking up target '{star_name}':\n{e}")
+                    diff_status_var.set("Error during target name resolution.")
+                    return
+
             res = run_differential_photometry(
                 csv_b=b_csv, csv_v=v_csv, ref_catalog=cat_type,
                 k_b=diff_kb_var.get(), k_v=diff_kv_var.get(),
                 Tbv=diff_tbv_var.get(), Tb_bv=diff_tbbv_var.get(), Tv_bv=diff_tvbv_var.get(),
                 radius_arcmin=float(vars_dict["catalog_search_radius"][0].get()),
-                manual_ref_coord=manual_coord
+                manual_ref_coord=manual_coord,
+                target_mode=target_mode,
+                manual_target_coord=manual_target_coord
             )
             diff_status_var.set(res)
         except Exception as e:
@@ -726,7 +883,11 @@ def run_config_gui(pipeline_callback=None):
 
     # Action Buttons
     btn_frame = tk.Frame(root, bg="#f0f2f5")
-    btn_frame.pack(pady=10)
+    btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+    
+    # Repack notebook to ensure btn_frame is not pushed off
+    notebook.pack_forget()
+    notebook.pack(side=tk.TOP, pady=10, expand=True, fill='both')
     
     exit_btn = tk.Button(btn_frame, text="Exit Calibra", command=root.destroy, width=15, 
                            font=("Arial", 10), relief="flat", bg="#f44336", fg="white")

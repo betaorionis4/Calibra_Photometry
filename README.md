@@ -1,8 +1,8 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 1.4 - 2026-05-03 
+**Version:** 1.5 - 2026-05-04
 **Description:** 
-An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformations coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. The toolkit also features a **Differential Photometry** module for computing standard magnitudes relative to reference stars.
+An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformations coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. The toolkit features a **Differential Photometry** module for computing standard magnitudes and integrates **AAVSO VSX** cross-matching to automatically exclude known variable stars from calibration sets.
 
 The code was created with lots of help from Google Antigravity (various agents), guided, tested and debugged by me. I have made several tests to verify the results and ensure the results are reasonable. This code is far from what codes like, e.g., AIJ or Tycho Tracker can do. The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ or Tycho Tracker provide as fluxes, zero points, etc.
 
