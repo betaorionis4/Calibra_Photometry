@@ -1,4 +1,4 @@
-# Photometry with Calibra: Comprehensive User Manual - Updated 2026-05-02
+# Photometry with Calibra: Comprehensive User Manual
 
 Welcome to **Calibra** (an automated photometric analysis & calibration toolkit), a professional-grade astronomical image analysis suite. 
 This short manual provides some background on the software's architecture, mathematical principles, and operational workflow.
@@ -61,38 +61,63 @@ Calibra can perform basic instrumental calibration (Bias and Flat-fielding) for 
 > [!IMPORTANT]
 > **Plate Solving Required**: Even when using Calibra's pre-processing, your raw FITS files **must already be plate solved** (i.e., contain valid WCS headers like RA and DEC). Calibra uses these coordinates to match stars with online catalogs. If your file is not plate solved, automated calibration will fail.
 
-### 2.1 Enabling Calibration
+## 2.1 Enabling Calibration
 In the **"Pre-processing"** tab of the Configuration GUI:
 1.  Check **"Enable Pre-processing (Apply Bias/Flats)"**.
 2.  Select your **Master Bias** file (Default: `C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits`).
 3.  Select your **Master Flat** files for both V-mag and B-mag.
 
-### 2.2 Automatic Filter Detection
+## 2.2 Automatic Filter Detection
 Calibra automatically reads the `FILTER` keyword from the FITS header of your target image.
 - If the filter contains **"B"**, the B-mag Master Flat is used.
 - Otherwise, the V-mag Master Flat is used by default.
 
-### 2.3 Output of Calibrated Files
+## 2.3 Output of Calibrated Files
 When pre-processing is enabled, Calibra performs the following operation:
 `Calibrated = (Raw - Bias) / (Flat / median(Flat))`
+I.e. it is assumed that the flat is already corrected for bias!
 
 The resulting calibrated images are saved as new FITS files in a `calibrated/` subfolder located within your input FITS directory (e.g., `C:\Astro\Photometry_Calibra\fitsfiles\calibrated\`). These files are then used for the subsequent star detection and photometry steps.
 
 ## 2.4 Online Catalog Transformations
-Calibra defaults to **GAIA_DR3** for high-precision zero-point calibration, but also supports ATLAS-RefCat2 and APASS.
-Since catalogs like **ATLAS-RefCat2** and **Gaia DR3** do not natively use the Johnson V/B filters, Calibra applies rigorous mathematical transformations to convert their native photometry for zero-point calibration.
+Calibra defaults to **ATLAS-RefCat2** for high-precision zero-point calibration, but also supports **APASS DR9**, **GAIA_DR3**, and the **Landolt Standard Star Catalogue**.
 
-#### ATLAS (Pan-STARRS) to Johnson V/B
+Since **ATLAS-RefCat2** and **GAIA_DR3** do not natively use the Johnson V/B filters, Calibra applies rigorous mathematical transformations to convert their native photometry for zero-point calibration. 
+
+**APASS DR9** and **Landolt Standard Star Catalogue** provide native Johnson V/B measurements natively.
+
+#### ATLAS-RefCat2 
+ATLAS-RefCat2 provides high-quality, all-sky photometry in g, r, i, z, and y bands. The catalog is derived from the Legacy Survey of Space and Time (LSST) Pre-Operations Color Camera (POC) and is widely used for photometric calibration due to its high precision and comprehensive sky coverage.
+
+Transformations to Johnson V/B:
 Based on **Kostov et al. (2017)**, using the specific refined coefficients currently implemented in Calibra:
 - $V = g - 0.020 - 0.498(g-r) - 0.008(g-r)^2$
 - $B = g + 0.199 + 0.540(g-r) + 0.016(g-r)^2$
 - *(Note: Alternative Jester et al. (2005) equations are preserved as comments in the source code).*
 
-#### Gaia DR3 to Johnson V/B
+#### Landolt Standard Star Catalogue
+Calibra automatically aggregates data from four Landolt standard fields catalogs (VizieR identifiers II/183A, J/AJ/137/4186, J/AJ/133/2502, J/AJ/146/131). 
+*Note: Landolt standard stars are only present in specific celestial regions (e.g., equatorial SA fields).*
+
+#### APASS DR9
+APASS provides high-quality, Johnson-band calibrated magnitudes for the entire visible sky, derived from the AAVSO Photometric All-Sky Survey.
+
+#### Gaia DR3
+Gaia is a space observatory mission led by the European Space Agency (ESA), providing astrometric, photometric, and spectrophotometric data for celestial objects. 
+
+Transformations to Johnson V/B:
 Based on **GAIA DR3 Documentation,Table 5.9**, which provides coefficients for V in the color range ($-0.5 < G_{BP} - G_{RP} < 5.0$) and for B in the color range ($-0.5 < G_{BP} - G_{RP} < 4.0$):
 - $V = G + 0.02704 - 0.01424 \cdot C + 0.2156 \cdot C^2 - 0.01426 \cdot C^3$
 - $B = G - 0.01448 + 0.6874 \cdot C + 0.3604 \cdot C^2 - 0.06718 \cdot C^3 + 0.006061 \cdot C^4$
 - *where $C = G_{BP} - G_{RP}$*
+
+## 2.5 AAVSO VSX Integration (Variable Star Exclusion)
+To ensure the highest photometric rigor, Calibra automatically cross-matches all detected stars and reference catalogs against the **AAVSO International Variable Star Index (VSX)** via VizieR (`B/vsx/vsx`).
+
+- **Calibration Rigor**: Any reference star found within 2 arcseconds of a known VSX variable is automatically excluded from the Zero-Point derivation.
+- **Statistical Purity**: Known variables are excluded from the Gaussian fits in Accuracy Evaluation plots to prevent their intrinsic fluctuations from artificially inflating the reported scatter ($\sigma$).
+- **Identification**: All output CSVs and reports include an `is_variable` flag ("Yes"/"No") to help you identify known variable sources in your field at a glance.
+- **Local Caching**: VSX data is cached in `photometry_refstars/cache/` to minimize network overhead during repeat analysis.
 
 ---
 
@@ -144,7 +169,39 @@ A specialized post-processing tool for deriving instrumental **Color Terms**.
 
 ---
 
-## 4. Running the Pipeline: The Configuration GUI
+## 4. Differential Photometry
+
+The Differential Photometry module is intended to compute AAVSO-ready standard magnitudes for every star in a field relative to a designated reference star. The reference star can be either automatically selected by the pipeline or manually specified by the user to focus on measuring magnitudes of variable stars using a known comparison star.
+
+### 4.1 Methodology
+- **Target Matching**: The module automatically cross-matches stars from your B-filter and V-filter results (using a 2-arcsecond search radius) to form reliable $(b-v)$ pairs.
+- **Reference Catalog Query**: The matched coordinates are queried against your chosen standard catalog (e.g., ATLAS, APASS, Landolt). The catalog search covers a field of view that is defined by the "Catalog Search Radius" in the GUI.
+- **Reference Star Selection**:
+  - **Automatic Mode**: The pipeline filters the catalog matches to automatically select the optimal reference star. It strictly chooses a star that is:
+    1. Unsaturated (peak ADU below the non-linear regime).
+    2. Not a known variable (cross-matched against VSX).
+    3. Of moderate color (catalog $0.4 \leq (B-V) \leq 0.8$) to minimize extreme transformation residuals.
+    4. The brightest available instrumental $V$ magnitude among the remaining candidates.
+  - **Search by Name Mode**: The user inputs a specific star name (e.g., "AE UMa"). The pipeline resolves the exact RA and Dec coordinates dynamically via the SIMBAD astronomical database and anchors the photometry to this object. You can instantly verify the resolved coordinates using the Check button in the GUI before executing.
+  - **Manual Mode**: The user inputs specific RA and Dec coordinates ($h, m, s$ and $d, m, s$). The pipeline finds the matched detection within a 4-arcsecond tolerance of those coordinates, verifies it has catalog data, and strictly forces it to be the reference anchor.
+- **Zero Point Calculation**: Using the Color Transformation Coefficients ($T_{bv}, T_{b\_bv}, T_{v\_bv}$) and atmospheric extinction ($k_B, k_V$), the pipeline derives the instrumental zero points ($Z_{BV}, Z_B, Z_V$) relative to this reference star. The color transformation coefficients can be taken from the Color Transformation Calibration module (see Section 3.G) or manually entered by the user.
+
+### 4.2 Target Selection Modes
+In the Differential Photometry tab, you can define which stars to process:
+- **Analyze All Stars (Default)**: The pipeline computes standard magnitudes for every common B/V pair in the image. This is useful for survey work or verifying field-wide accuracy.
+- **Analyze a specific Target Pair**: The pipeline isolates a single star (via Name/SIMBAD or Manual Coordinates) and computes standard magnitudes for only that object. This mode skips the population-wide Accuracy Evaluation plotting as it is not statistically valid for a single target.
+
+### 4.3 Standard Magnitude Output
+These zero points are instantly applied to all other stars in the field to get standard magnitudes ($B, V$) and color index ($B-V$). The final standard magnitudes and color index are saved in a Markdown table (`differential_photometry_results.md`) alongside a more detailed CSV file (with all the instrumental data, errors, and variability flags).
+
+### 4.4 Accuracy Evaluation
+To evaluate the calibration quality, the pipeline automatically compares the internally computed standard magnitudes against the actual catalog magnitudes for all matching stars (excluding the reference anchor and any known VSX variables).
+- **Statistical Fitting**: It calculates the deviations ($\Delta B$, $\Delta V$, $\Delta(B-V)$) and fits a Gaussian distribution to determine the mean offset ($\mu$) and standard deviation/scatter ($\sigma$).
+- **Plotting**: It generates a 3-panel histogram plot with the Gaussian fits overlaid (`photometry_plots/diff_photometry_deviations.png`), allowing you to rapidly identify any systematic errors or estimate your measurement uncertainties. The statistical fits are appended to the `differential_photometry_report.md`.
+
+---
+
+## 5. Running the Pipeline: The Configuration GUI
 
 Launch the pipeline via `python main.py` to open the **Configuration GUI**.
 
@@ -153,27 +210,34 @@ Launch the pipeline via `python main.py` to open the **Configuration GUI**.
 3.  **Photometry & Calibration Tab**: 
     - Set your aperture radii (rule of thumb: $\approx 2 \times FWHM$).
     - Select your **Ref Catalog**: Choose **ATLAS** (ATLAS-RefCat2), **APASS** (DR9), or **GAIA_DR3** for online calibration, or select a local CSV.
+    - Set **Catalog Search Radius (arcmin)**: Set this to encompass your Field of View. This dictates how much catalog data is pulled from VizieR for Zero-Point and Differential operations.
     - Set **Min SNR for Calib**: Filter out noisy stars from the zero-point calculation (default 10.0).
     - **Print Detailed Calibration**: Toggle the individual "Match" logs in the console. (Summary always shown).
     - Enable/disable diagnostic plots and massive data tables.
-5.  **Color Calibration Tab**: 
+4.  **Color Calibration Tab**: 
     - **Auto-Hand-off**: After running a B and V image, these fields will auto-populate with the correct CSV paths.
     - **Extinction Correction**: Enter or verify the k-coefficients ($k_B, k_V$) and airmass.
     - Click **"Run Color Transformation Analysis"** to calculate your equipment's color terms.
+5.  **Differential Photometry Tab**:
+    - **Auto-Fill**: The pipeline automatically loads your most recent `targets_auto` CSV files and your last derived Color Coefficients.
+    - **Reference Star Selection**: Toggle between "Automatic" (picks the brightest valid star) or "Manual Coordinates" to strictly anchor your analysis to a specific star.
+    - Click **"Execute Differential Photometry"** to perform the full magnitude calculation workflow.
 
 ---
 
-## 5. Understanding the Output
+## 6. Understanding the Output
 
-### 5.1 Results CSV (`photometry_output/`)
+### 6.1 Results CSV (`photometry_output/`)
 The primary output for every image. Key columns include:
 - `refined_x` / `refined_y`: The high-precision sub-pixel coordinates.
 - `ra_hms` / `dec_dms`: Celestial coordinates from the WCS header.
 - `net_flux`: Background-subtracted ADU counts.
 - `mag_calibrated`: The final, zero-point corrected true magnitude.
 - `mag_calibrated_err`: The ± uncertainty of the final magnitude.
+- `is_variable`: A "Yes/No" flag indicating if the star matched a record in the AAVSO VSX catalog.
+- `airmass`: The atmospheric airmass calculated from the FITS header.
 
-### 5.2 Diagnostic Plots (`photometry_plots/`)
+### 6.2 Diagnostic Plots (`photometry_plots/`)
 If enabled, the pipeline saves a four-panel graphic for each star showing:
 1.  **Raw Data**: The original pixel cutout.
 2.  **Gaussian Model**: The idealized mathematical fit.
@@ -182,7 +246,7 @@ If enabled, the pipeline saves a four-panel graphic for each star showing:
 
 ---
 
-## 6. Troubleshooting & Tips
+## 7. Troubleshooting & Tips
 - **No Stars Found?** Verify your `Detection Sigma`. Lower it (e.g., to 3.0) for faint targets or increase it (e.g., to 10.0) for crowded fields.
 - **Calibration Failures?** 
     - Check if the FITS header has valid `RA`/`DEC` keywords for online queries.
@@ -196,7 +260,6 @@ If enabled, the pipeline saves a four-panel graphic for each star showing:
 **GAIA DR3**
 Gaia Collaboration, Vallenari, A., et al. (2023), "Gaia Data Release 3. Summary of the contents and survey properties"
 https://doi.org/10.1051/0004-6361/202243940 
-See also:
 https://www.cosmos.esa.int/web/gaia/dr3
 For the transformation between G and other photometric systems:
 https://gea.esac.esa.int/archive/documentation/GDR3/Data_processing/chap_cu5pho/cu5pho_sec_photSystem/cu5pho_ssec_photRelations.html
@@ -208,6 +271,19 @@ https://cdsarc.cds.unistra.fr/viz-bin/cat/II/336
 **ATLAS-RefCat2**
 Tonry, J. L., et al. (2018), "The ATLAS All-Sky Stellar Reference Catalog"
 https://doi.org/10.3847/1538-4357/aae386
-See also:
 https://cdsarc.cds.unistra.fr/viz-bin/cat/J/ApJ/867/105
 
+**Landolt Standard Star Catalogue**
+Aggregates four primary standard field catalogs via VizieR:
+- Landolt, A. U. (1992), "UBVRI photometric standard stars in the magnitude range 11.5 < V < 16.0 around the celestial equator" (Vizier:VII/183A)
+https://ui.adsabs.harvard.edu/scan/manifest/1992AJ....104..340L
+https://cdsarc.cds.unistra.fr/viz-bin/cat/II/183A
+- Landolt, A. U. (2009), "UBVRI photometric standard stars around the celestial equator: Updates and Additions" (Vizier:J/AJ/137/4186)
+http://dx.doi.org/10.1088/0004-6256/137/5/4186 
+https://cdsarc.cds.unistra.fr/viz-bin/cat/J/AJ/137/4186
+- Landolt, A. U. (2007), "UBVRI photometric standard stars around the sky at -50 deg declination" (Vizier:J/AJ/133/2502)
+https://iopscience.iop.org/article/10.1086/518000/pdf
+https://cdsarc.cds.unistra.fr/viz-bin/cat/J/AJ/133/2502
+- Landolt, A. U. (2013), "UBVRI photometric standard stars around the sky at +50 deg declination" (Vizier:J/AJ/146/131)
+https://iopscience.iop.org/article/10.1088/0004-6256/146/5/131
+https://cdsarc.cds.unistra.fr/viz-bin/cat/J/AJ/146/131

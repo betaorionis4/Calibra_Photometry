@@ -1,0 +1,95 @@
+Session log initiated: photometry_output\logs\log_AE_UMa_Bmag_April13_stacked_Bmag_ATLAS refcat2.txt
+=================================================================
+--- 1. Automated Star Retrieval (DAOStarFinder) ---
+=================================================================
+
+Global Image Stats: Median Bkg = 255.0 ADU | Noise Sigma = 7.7 ADU
+Found 1477 stars before filtering.
+
+Keeping 1477 stars after filtering.
+
+=================================================================
+--- 2. PSF Modeling & Coordinate Refinement ---
+=================================================================
+
+
+=================================================================
+--- 3. Aperture Photometry with Local Background Subtraction ---
+=================================================================
+
+Filtered out 137 questionable/faint detections (SNR < 3 or negative flux). Remaining: 1340
+
+=================================================================
+--- 4. Zero Point Calibration ---
+=================================================================
+
+VizieR returned 1 tables for ATLAS.
+Reference Catalog: Local File (ATLAS refcat2)
+Using B_mag from reference catalog for calibration.
+SNR Threshold for calibration stars: 10.0
+Found 40 matches with reference catalog.
+
+Calculated Zero Point: 23.670 ± 0.038 (Median)
+
+--- Detection Limit (Faintest Star @ SNR=3.0) ---
+Instrumental Magnitude Limit: -6.64
+Calibrated Magnitude Limit: 17.03
+------------------------------------------------------------------
+
+Saving results to photometry_output\targets_auto_AE_UMa_Bmag_April13_stacked.csv...
+Done!
+
+Session log initiated: photometry_output\logs\log_AE_UMa_Bmag_April13_stacked_Bmag_ATLAS refcat2.txt
+=================================================================
+--- 1. Automated Star Retrieval (DAOStarFinder) ---
+=================================================================
+
+Global Image Stats: Median Bkg = 255.0 ADU | Noise Sigma = 7.7 ADU
+Found 1477 stars before filtering.
+
+Keeping 1477 stars after filtering.
+
+=================================================================
+--- 2. PSF Modeling & Coordinate Refinement ---
+=================================================================
+
+
+=================================================================
+--- 3. Aperture Photometry with Local Background Subtraction ---
+=================================================================
+
+Filtered out 137 questionable/faint detections (SNR < 3 or negative flux). Remaining: 1340
+
+=================================================================
+--- 4. Zero Point Calibration ---
+=================================================================
+
+VizieR returned 1 tables for ATLAS.
+Reference Catalog: Local File (ATLAS refcat2)
+Using B_mag from reference catalog for calibration.
+SNR Threshold for calibration stars: 10.0
+Found 603 matches with reference catalog.
+
+Calculated Zero Point: 23.683 ± 0.038 (Median)
+
+--- Detection Limit (Faintest Star @ SNR=3.0) ---
+Instrumental Magnitude Limit: -6.64
+Calibrated Magnitude Limit: 17.04
+------------------------------------------------------------------
+
+Saving results to photometry_output\targets_auto_AE_UMa_Bmag_April13_stacked.csv...
+Generating shift analysis report at photometry_output\shift_analysis_AE_UMa_Bmag_April13_stacked.md...
+Fetching ATLAS REFCAT2 catalog from VizieR for RA=144.3612, Dec=44.0741...
+Querying VizieR J/ApJ/867/105...
+VizieR returned 1 tables for ATLAS.
+Successfully retrieved 143 stars from ATLAS.
+Saved catalog to cache: photometry_refstars/cache\ATLAS REFCAT2_144.361_44.074_15.csv
+
+--- Positional Shift Summary (Detected - Reference) ---
+Matched Stars: 67
+Median Shift (Pixels): dX=+0.13 | dY=-0.08
+Median Shift (Arcsec): dRA=+0.11 | dDec=+0.20
+-------------------------------------------------------
+
+Done!
+

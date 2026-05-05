@@ -25,7 +25,8 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
         "ATLAS REFCAT2": "J/ApJ/867/105",
         "APASS": "II/336",
         "APASS DR9": "II/336",
-        "GAIA_DR3": "I/355"
+        "GAIA_DR3": "I/355",
+        "LANDOLT": ["II/183A", "J/AJ/137/4186", "J/AJ/133/2502", "J/AJ/146/131"]
     }
     
     cat_upper = catalog_name.upper()
@@ -36,6 +37,7 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
         if "ATLAS" in cat_upper: catalog_id = viz_map["ATLAS"]
         elif "GAIA" in cat_upper: catalog_id = viz_map["GAIA_DR3"]
         elif "APASS" in cat_upper: catalog_id = viz_map["APASS"]
+        elif "LANDOLT" in cat_upper: catalog_id = viz_map["LANDOLT"]
         else:
             print(f"Error: Unknown catalog {catalog_name}. Defaulting to ATLAS.")
             catalog_id = viz_map["ATLAS"]
@@ -44,12 +46,13 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
     if "ATLAS" in cat_upper: catalog_name = "ATLAS"
     elif "GAIA" in cat_upper: catalog_name = "GAIA_DR3"
     elif "APASS" in cat_upper: catalog_name = "APASS"
+    elif "LANDOLT" in cat_upper: catalog_name = "LANDOLT"
 
     # Increase timeout and configure Vizier
     from astropy.utils.data import Conf
     Conf.remote_timeout.set(60) # 60 seconds timeout
     
-    v = Vizier(columns=['*'], row_limit=-1)
+    v = Vizier(columns=['*', '_RAJ2000', '_DEJ2000'], row_limit=-1)
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
     
     try:
@@ -74,89 +77,90 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
             return []
 
     table = result[0]
-    print(f"VizieR returned {len(table)} raw rows from {catalog_name}.")
+    print(f"VizieR returned {len(result)} tables for {catalog_name}.")
     ref_stars = []
     
-    # Check available columns once
-    cols = table.colnames
-    
-    for row in table:
-        try:
-            if catalog_name == "ATLAS":
-                ra = float(row['RA_ICRS'])
-                dec = float(row['DE_ICRS'])
-                g = float(row['gmag']) if 'gmag' in cols else np.nan
-                r = float(row['rmag']) if 'rmag' in cols else np.nan
-                
-                if not np.isnan(g) and not np.isnan(r):
-                    color = g - r
-                    # Jester et al. (2005) transformations (Stars, g-r < 2.1)
-                    # Often used in software like ASTAP/MuniWin as the default for ATLAS
-                    #v_mag = g - 0.011 - 0.487 * color
-                    #b_mag = g + 0.202 + 0.473 * color
-                    
-                    # Alternative: Kostov et al. (2017) - Specific for Pan-STARRS1
-                    v_mag = g - 0.020 - 0.498 * color - 0.008 * (color**2)
-                    b_mag = g + 0.199 + 0.540 * color + 0.016 * (color**2)
-                else:
-                    v_mag = g if not np.isnan(g) else np.nan
-                    b_mag = r if not np.isnan(r) else np.nan
-                
-                if 'Vmag' in cols and not np.isnan(float(row['Vmag'])): v_mag = float(row['Vmag'])
-                if 'Bmag' in cols and not np.isnan(float(row['Bmag'])): b_mag = float(row['Bmag'])
-
-            elif catalog_name == "GAIA_DR3":
-                ra = float(row['RA_ICRS'])
-                dec = float(row['DE_ICRS'])
-                
+    for table in result:
+        cols = table.colnames
+        for row in table:
+            try:
                 # Handle masked elements from VizieR to avoid UserWarnings
                 def get_val(col):
+                    if col not in cols: return np.nan
                     val = row[col]
                     if np.ma.is_masked(val): return np.nan
                     try: return float(val)
                     except: return np.nan
 
-                g = get_val('Gmag')
-                bp = get_val('BPmag')
-                rp = get_val('RPmag')
-                
-                if not np.isnan(g) and not np.isnan(bp) and not np.isnan(rp):
-                    c = bp - rp
-                    # Riello et al. (2021) Table C.2; or better Table 5.9 in
-                    # https://gea.esac.esa.int/archive/documentation/GDR3/Data_processing/chap_cu5pho/cu5pho_sec_photSystem/cu5pho_ssec_photRelations.html
-                    # G - V = -0.02704 + 0.01424 * c - 0.2156 * c^2 + 0.01426 * c^3
-                    # V = G - (G - V)
-                    v_mag = g + 0.02704 - 0.01424 * c + 0.2156 * (c**2) - 0.01426 * (c**3)
+                if catalog_name == "ATLAS":
+                    ra = float(row['RA_ICRS'])
+                    dec = float(row['DE_ICRS'])
+                    g = float(row['gmag']) if 'gmag' in cols else np.nan
+                    r = float(row['rmag']) if 'rmag' in cols else np.nan
                     
-                    # G - B = +0.01448 - 0.6874 * c - 0.3604 * c^2 + 0.06718 * c^3 - 0.006061 * c^4
-                    # B = G - (G - B)
-                    b_mag = g - 0.01448 + 0.6874 * c + 0.3604 * (c**2) - 0.06718 * (c**3) + 0.006061 * (c**4)
+                    if not np.isnan(g) and not np.isnan(r):
+                        color = g - r
+                        # Alternative: Kostov et al. (2017) - Specific for Pan-STARRS1
+                        v_mag = g - 0.020 - 0.498 * color - 0.008 * (color**2)
+                        b_mag = g + 0.199 + 0.540 * color + 0.016 * (color**2)
+                    else:
+                        v_mag = g if not np.isnan(g) else np.nan
+                        b_mag = r if not np.isnan(r) else np.nan
+                    
+                    if 'Vmag' in cols and not np.isnan(float(row['Vmag'])): v_mag = float(row['Vmag'])
+                    if 'Bmag' in cols and not np.isnan(float(row['Bmag'])): b_mag = float(row['Bmag'])
 
-                else:
-                    v_mag = np.nan
-                    b_mag = np.nan
+                elif catalog_name == "GAIA_DR3":
+                    ra = float(row['RA_ICRS'])
+                    dec = float(row['DE_ICRS'])
+                
+                    g = get_val('Gmag')
+                    bp = get_val('BPmag')
+                    rp = get_val('RPmag')
+                
+                    if not np.isnan(g) and not np.isnan(bp) and not np.isnan(rp):
+                        c = bp - rp
+                        v_mag = g + 0.02704 - 0.01424 * c + 0.2156 * (c**2) - 0.01426 * (c**3)
+                        b_mag = g - 0.01448 + 0.6874 * c + 0.3604 * (c**2) - 0.06718 * (c**3) + 0.006061 * (c**4)
+                    else:
+                        v_mag = np.nan
+                        b_mag = np.nan
 
-            else: # Default/APASS
-                ra = float(row['RAJ2000'])
-                dec = float(row['DEJ2000'])
-                v_mag = float(row['Vmag']) if 'Vmag' in cols else np.nan
-                b_mag = float(row['Bmag']) if 'Bmag' in cols else np.nan
+                elif catalog_name == "LANDOLT":
+                    ra = float(row['_RAJ2000']) if '_RAJ2000' in cols else float(row['RAJ2000'])
+                    dec = float(row['_DEJ2000']) if '_DEJ2000' in cols else float(row['DEJ2000'])
+                
+                    if 'Vmag' in cols: v_mag = get_val('Vmag')
+                    elif '<Vmag>' in cols: v_mag = get_val('<Vmag>')
+                    else: v_mag = np.nan
+                    
+                    if 'B-V' in cols: b_v = get_val('B-V')
+                    elif '<B-V>' in cols: b_v = get_val('<B-V>')
+                    else: b_v = np.nan
+                    
+                    b_mag = v_mag + b_v if not np.isnan(v_mag) and not np.isnan(b_v) else np.nan
 
-            if not np.isnan(v_mag) and v_mag < 18.0:
-                ref_stars.append({
-                    'id': f"online_{len(ref_stars)}",
-                    'ra_deg': ra,
-                    'dec_deg': dec,
-                    'V_mag': v_mag,
-                    'B_mag': b_mag,
-                    'raw_g': g if catalog_name == "ATLAS" else np.nan,
-                    'raw_r': r if catalog_name == "ATLAS" else np.nan,
-                    'raw_G': g if catalog_name == "GAIA_DR3" else np.nan,
-                    'raw_BP': bp if catalog_name == "GAIA_DR3" else np.nan,
-                    'raw_RP': rp if catalog_name == "GAIA_DR3" else np.nan
-                })
-        except:
-            continue
+                else: # Default/APASS
+                    ra = float(row['RAJ2000'])
+                    dec = float(row['DEJ2000'])
+                    v_mag = float(row['Vmag']) if 'Vmag' in cols else np.nan
+                    b_mag = float(row['Bmag']) if 'Bmag' in cols else np.nan
+
+                if not np.isnan(v_mag) and v_mag < 18.0:
+                    ref_stars.append({
+                        'id': f"online_{len(ref_stars)}",
+                        'ra_deg': ra,
+                        'dec_deg': dec,
+                        'V_mag': v_mag,
+                        'B_mag': b_mag,
+                        'raw_g': g if catalog_name == "ATLAS" else np.nan,
+                        'raw_r': r if catalog_name == "ATLAS" else np.nan,
+                        'raw_G': g if catalog_name == "GAIA_DR3" else np.nan,
+                        'raw_BP': bp if catalog_name == "GAIA_DR3" else np.nan,
+                        'raw_RP': rp if catalog_name == "GAIA_DR3" else np.nan
+                    })
+            except:
+                continue
 
     if verbose:
         print(f"Successfully retrieved {len(ref_stars)} stars from {catalog_name}.")
@@ -262,7 +266,7 @@ def get_ref_stars(ref_catalog_file, center_ra=None, center_dec=None, radius_arcm
     """
     ref_stars = []
     cat_upper = ref_catalog_file.upper()
-    is_online = any(k in cat_upper for k in ["ATLAS", "APASS", "GAIA"])
+    is_online = any(k in cat_upper for k in ["ATLAS", "APASS", "GAIA", "LANDOLT"])
 
     if is_online and center_ra is not None and center_dec is not None:
         cat_name = cat_upper # Normalized inside fetch_online_catalog
@@ -271,14 +275,117 @@ def get_ref_stars(ref_catalog_file, center_ra=None, center_dec=None, radius_arcm
             ref_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
             if ref_stars:
                 save_to_cache(ref_stars, center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
+        
+        # Mark variables in the returned set
+        mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=verbose)
     else:
         ref_stars = read_reference_catalog(ref_catalog_file)
     return ref_stars
 
+def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
+    if verbose:
+        print(f"Fetching VSX catalog from VizieR for RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
+    
+    from astropy.utils.data import Conf
+    Conf.remote_timeout.set(60)
+    
+    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', 'RAJ2000', 'DEJ2000'], row_limit=-1)
+    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
+    
+    try:
+        result = v.query_region(coord, radius=radius_arcmin * u.arcmin)
+    except Exception as e:
+        print(f"Error querying VSX: {e}")
+        return []
+        
+    if not result or len(result) == 0:
+        if verbose:
+            print("No VSX variables found in this region.")
+        return []
+        
+    table = result[0]
+    vsx_stars = []
+    for row in table:
+        try:
+            vsx_stars.append({
+                'id': str(row['Name']),
+                'ra_deg': float(row['RAJ2000']),
+                'dec_deg': float(row['DEJ2000'])
+            })
+        except:
+            continue
+            
+    if verbose:
+        print(f"Successfully retrieved {len(vsx_stars)} variable stars from VSX.")
+    return vsx_stars
+
+def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refstars/cache", verbose=True):
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+        
+    cache_file = os.path.join(cache_dir, f"VSX_{ra_deg:.3f}_{dec_deg:.3f}_{radius_arcmin}.csv")
+    
+    vsx_stars = []
+    if os.path.exists(cache_file):
+        if verbose:
+            print(f"Loading cached VSX catalog from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                vsx_stars.append({
+                    'id': row['id'],
+                    'ra_deg': float(row['ra_deg']),
+                    'dec_deg': float(row['dec_deg'])
+                })
+        return vsx_stars
+        
+    vsx_stars = fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin, verbose)
+    
+    if vsx_stars:
+        with open(cache_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['id', 'ra_deg', 'dec_deg'])
+            writer.writeheader()
+            for s in vsx_stars:
+                writer.writerow(s)
+    return vsx_stars
+
+def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose=True):
+    """
+    Cross-matches a list of stars against the VSX catalog and adds 'is_variable' flag.
+    """
+    if not star_list: return star_list
+    
+    vsx_stars = get_vsx_stars(center_ra, center_dec, radius_arcmin, verbose=verbose)
+    if not vsx_stars:
+        for s in star_list: s['is_variable'] = False
+        return star_list
+        
+    vsx_coords = SkyCoord(ra=[s['ra_deg'] for s in vsx_stars]*u.deg, dec=[s['dec_deg'] for s in vsx_stars]*u.deg)
+    
+    # Handle different RA/Dec key formats (ra_deg vs RA_ICRS etc)
+    ra_keys = ['ra_deg', 'RA_ICRS', '_RAJ2000', 'RAJ2000']
+    dec_keys = ['dec_deg', 'DE_ICRS', '_DEJ2000', 'DEJ2000']
+    
+    ra_key = next((k for k in ra_keys if k in star_list[0]), 'ra_deg')
+    dec_key = next((k for k in dec_keys if k in star_list[0]), 'dec_deg')
+    
+    try:
+        star_coords = SkyCoord(ra=[float(s[ra_key]) for s in star_list]*u.deg, 
+                               dec=[float(s[dec_key]) for s in star_list]*u.deg)
+    except:
+        # Fallback if keys are missing or not floatable
+        for s in star_list: s['is_variable'] = False
+        return star_list
+        
+    idx, d2d, _ = star_coords.match_to_catalog_sky(vsx_coords)
+    for i, s in enumerate(star_list):
+        s['is_variable'] = (d2d[i].arcsec < 2.0)
+    return star_list
+
 def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec=2.0, 
                         default_zp=23.399, run_new_calibration=True, output_report=None,
                         center_ra=None, center_dec=None, snr_threshold=10.0,
-                        print_to_console=True):
+                        print_to_console=True, header=None, radius_arcmin=15.0):
     print("\n=================================================================")
     print("--- 4. Zero Point Calibration ---")
     print("=================================================================\n")
@@ -301,8 +408,7 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
                 rs['mag_calibrated'] = np.nan
                 rs['mag_calibrated_err'] = np.nan
         return
-        
-    ref_stars = get_ref_stars(ref_catalog_file, center_ra, center_dec, verbose=print_to_console)
+    ref_stars = get_ref_stars(ref_catalog_file, center_ra, center_dec, radius_arcmin=radius_arcmin, verbose=print_to_console)
 
     if not ref_stars:
         print(f"WARNING: No reference stars loaded. Applying default Zero Point: {default_zp:.3f}")
@@ -315,11 +421,24 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
                 rs['mag_calibrated_err'] = np.nan
         return
         
+    # Exclude variable stars
+    if center_ra is not None and center_dec is not None:
+        mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=print_to_console)
+        mark_variable_stars(results, center_ra, center_dec, radius_arcmin, verbose=False)
+    else:
+        for s in ref_stars: s['is_variable'] = False
+        for s in results: s['is_variable'] = False
+        
+    valid_ref_stars = [s for s in ref_stars if not s.get('is_variable', False)]
+    num_vars = len(ref_stars) - len(valid_ref_stars)
+    if num_vars > 0:
+        print(f"Excluded {num_vars} known variable stars from the reference calibration set.")
+        
     mag_key = 'B_mag' if 'B' in filter_name.upper() else 'V_mag'
     
     # Identify Source
     source_name = ref_catalog_file
-    if ref_catalog_file.upper() in ["ATLAS", "APASS", "GAIA_DR3"]:
+    if ref_catalog_file.upper() in ["ATLAS", "APASS", "GAIA_DR3", "LANDOLT STANDARD STAR CATALOGUE"]:
         source_name = f"Online VizieR ({ref_catalog_file.upper()})"
     else:
         source_name = f"Local File ({os.path.basename(ref_catalog_file)})"
@@ -328,10 +447,10 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     print(f"Using {mag_key} from reference catalog for calibration.")
     print(f"SNR Threshold for calibration stars: {snr_threshold}")
     
-    ref_ra = [s['ra_deg'] for s in ref_stars]
-    ref_dec = [s['dec_deg'] for s in ref_stars]
+    ref_ra = [s['ra_deg'] for s in valid_ref_stars]
+    ref_dec = [s['dec_deg'] for s in valid_ref_stars]
     ref_coords = SkyCoord(ra=ref_ra*u.deg, dec=ref_dec*u.deg)
-    ref_mags = np.array([s[mag_key] for s in ref_stars])
+    ref_mags = np.array([s[mag_key] for s in valid_ref_stars])
     
     det_valid = []
     det_ra = []
@@ -376,12 +495,15 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     report_lines.append(f"# Zero Point Calibration Report")
     report_lines.append(f"- **Source Catalogue**: {source_name}")
     report_lines.append(f"- **Calibration Filter**: {filter_name}")
-    report_lines.append(f"- **Matches Found**: {len(matched_det)}\n")
+    airmass_val = header.get('AIRMASS', 1.0) if header else 1.0
+    report_lines.append(f"- **Airmass**: {airmass_val:.3f}\n")
     report_lines.append(f"| Match ID | Catalog RA/Dec (HMS/DMS) | V mag | B mag | B-V | Inst Mag | Zero Point |")
     report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
     
+    report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+    
     zps = []
-    matched_ref_stars = [ref_stars[i] for i in idx[match_mask]]
+    matched_ref_stars = [valid_ref_stars[i] for i in idx[match_mask]]
     
     for i, det_rs in enumerate(matched_det):
         mag_inst = det_rs['mag_inst']
