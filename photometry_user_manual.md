@@ -278,13 +278,13 @@ The FITS Viewer is a powerful, integrated inspection and configuration tool. It 
 
 2.  **Real-Time Radial Profile**: Every click also generates a **radial profile plot** showing physical pixel intensities (scatter points) against the Gaussian fit curve. Vertical lines mark the current **aperture radius** (red dashed) and **inner annulus** (green dotted), letting you visually verify whether the aperture captures the full stellar flux and whether the annulus samples clean sky.
 
-3.  **Role-Based Star Marking (Right-Click)**: Right-click a star to open a context menu with options:
-    - **Mark as Variable Star** (Red): Designates the target variable. Only one variable star can be active at a time.
-    - **Mark as Check Star** (Blue): Designates a check/validation star. Only one check star can be active.
-    - **Mark as Reference Star** (Green): Adds the star to the reference ensemble (up to 5).
-    - **Remove Star**: Removes any existing role assignment.
+3.  **Role-Based Star Marking (Right-Click & Hotkeys)**: Right-click a star to open a context menu, or hover the mouse cursor over a star and press a single-key hotkey to instantly assign roles:
+    - **Mark as Variable Star** (Red) [Hotkey: `V`]: Designates the target variable. Only one variable star can be active at a time.
+    - **Mark as Check Star** (Blue) [Hotkey: `C`]: Designates a check/validation star. Only one check star can be active.
+    - **Mark as Reference Star** (Green) [Hotkey: `R`]: Adds the star to the reference ensemble (up to 5).
+    - **Remove Star** [Hotkey: `Delete` or `Backspace`]: Removes any existing role assignment.
 
-    Marked stars display persistent aperture and annulus overlays in their role color. Roles are mutually exclusive: reassigning a star to a different role automatically removes it from the previous one.
+    Marked stars display persistent aperture and annulus overlays in their role color. Roles are mutually exclusive: reassigning a star to a different role automatically removes it from the previous one. Keyboard shortcuts completely bypass context menus, enabling fast comp sequence marking.
 
 4.  **In-Viewer Aperture Controls**: The "Aperture Settings" panel (bottom-right) shows editable fields for **Aperture Radius**, **Annulus Inner**, and **Annulus Outer**. When "Flexible Aperture" is enabled in Settings, these fields auto-update based on the FWHM of each newly marked star. You can also manually edit these values; subsequent markings will use the updated radii.
 
