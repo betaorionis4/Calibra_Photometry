@@ -143,8 +143,8 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
                 else: # Default/APASS
                     ra = float(row['RAJ2000'])
                     dec = float(row['DEJ2000'])
-                    v_mag = float(row['Vmag']) if 'Vmag' in cols else np.nan
-                    b_mag = float(row['Bmag']) if 'Bmag' in cols else np.nan
+                    v_mag = get_val('Vmag')
+                    b_mag = get_val('Bmag')
 
                 if not np.isnan(v_mag) and v_mag < 18.0:
                     # Capture a natural identifier for the star
@@ -302,7 +302,7 @@ def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
     from astropy.utils.data import Conf
     Conf.remote_timeout.set(60)
     
-    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', 'RAJ2000', 'DEJ2000', 'Type'], row_limit=-1)
+    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', '_RAJ2000', '_DEJ2000', 'Type'], row_limit=-1)
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
     
     try:
@@ -322,8 +322,8 @@ def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
         try:
             vsx_stars.append({
                 'id': str(row['Name']),
-                'ra_deg': float(row['RAJ2000']),
-                'dec_deg': float(row['DEJ2000']),
+                'ra_deg': float(row['_RAJ2000']),
+                'dec_deg': float(row['_DEJ2000']),
                 'Type': str(row['Type']) if 'Type' in row.colnames and not np.ma.is_masked(row['Type']) else ''
             })
         except:
@@ -584,6 +584,191 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
             rs['mag_calibrated_err'] = np.nan
             
     return median_zp, std_zp
+
+
+def resolve_auid(auid, target_hint=None, verbose=True):
+    """
+    Resolves an AAVSO Unique Identifier (AUID) to coordinates.
+    Prioritizes the VSP Photometry Table if a target star name is provided.
+    """
+    if verbose:
+        print(f"Resolving AUID '{auid}' via AAVSO VSP...")
+    
+    try:
+        import urllib.request
+        import re
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        # 1. Try VSP Photometry Table if we have a target hint
+        if target_hint:
+            if verbose: print(f"  Using target star hint: {target_hint}")
+            # Clean target name for URL
+            safe_target = urllib.parse.quote(target_hint)
+            vsp_url = f"https://apps.aavso.org/vsp/photometry/?star={safe_target}&scale=D&orientation=ccd&type=photometry&fov=600&maglimit=20"
+            req = urllib.request.Request(vsp_url, headers={'User-Agent': 'Mozilla/5.0'})
+            
+            try:
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    html = response.read().decode('utf-8', errors='ignore')
+                
+                # Look for AUID followed by Coords: <td>AUID</td>\s*<td>.*?\[([\d.]+)&deg;\]</td>\s*<td>.*?\[([\d.]+)&deg;\]</td>
+                # Example: <td>000-BJS-559</td>\s*<td>09:37:11.94 [144.29974365&deg;]</td>\s*<td>43:58:20.9 [43.97247314&deg;]</td>
+                pattern = rf'<td>{re.escape(auid)}</td>\s*<td>.*?\[([\d.]+)&deg;\]</td>\s*<td>.*?\[([\d.]+)&deg;\]</td>'
+                match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+                
+                if match:
+                    ra_deg = float(match.group(1))
+                    dec_deg = float(match.group(2))
+                    
+                    # Try to find the name/TYC label in the same row
+                    # The name is usually in the last <td> before the next <tr>
+                    row_end = html.find('</tr>', match.end())
+                    row_snippet = html[match.end():row_end]
+                    name_match = re.findall(r'<td>(.*?)</td>', row_snippet)
+                    name = name_match[-1].strip() if name_match else auid
+                    
+                    if verbose:
+                        print(f"  AUID {auid} found in {target_hint} chart as {name} at RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
+                    return {'ra': ra_deg, 'dec': dec_deg, 'name': name}
+            except Exception as e:
+                if verbose: print(f"  VSP Table lookup failed: {e}")
+
+        # 2. Fallback: Try general VSX details page
+        if verbose: print("  Falling back to general VSX detail search...")
+        url = f"https://vsx.aavso.org/index.php?view=detail.top&ident={auid}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+        name_match = re.search(r'Name:</td>\s*<td class="formfield">(.*?)</td>', html)
+        name = name_match.group(1).strip() if name_match else auid
+        
+        coord_match = re.search(r'Coords \(J2000\):</td>\s*<td class="formfield">.*?\(([-\d.]+)\s+([-\d.]+)\)</td>', html, re.DOTALL)
+        if coord_match:
+            return {'ra': float(coord_match.group(1)), 'dec': float(coord_match.group(2)), 'name': name}
+        else:
+            hms_match = re.search(r'Coords \(J2000\):</td>\s*<td class="formfield">([\d\s:.+-]+)</td>', html, re.DOTALL)
+            if hms_match:
+                c = SkyCoord(hms_match.group(1).strip(), unit=(u.hourangle, u.deg))
+                return {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': name}
+                
+    except Exception as e:
+        if verbose:
+            print(f"AUID resolution failed: {e}")
+    
+    return None
+
+def fetch_aavso_chart_stars(target_name, fov_arcmin=60.0, verbose=True):
+    """
+    Fetches the full list of comparison stars for a target from AAVSO VSP.
+    Returns a list of dicts: {'auid', 'name', 'ra', 'dec', 'V_mag', 'B_mag'}
+    """
+    if verbose:
+        print(f"Fetching AAVSO comparison stars for {target_name} (FOV={fov_arcmin}')...")
+    
+    try:
+        import urllib.request
+        import re
+        import numpy as np
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        safe_target = urllib.parse.quote(target_name)
+        # Use B=on to get explicit B magnitudes and use the user-defined FOV
+        vsp_url = f"https://apps.aavso.org/vsp/photometry/?star={safe_target}&scale=D&orientation=ccd&type=photometry&fov={fov_arcmin}&maglimit=16&B=on"
+        req = urllib.request.Request(vsp_url, headers={'User-Agent': 'Mozilla/5.0'})
+        
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+        # 1. Parse Headers to find column indices
+        head_match = re.search(r'<thead>(.*?)</thead>', html, re.DOTALL)
+        col_map = {'AUID': 0, 'RA': 1, 'Dec': 2, 'Label': 3, 'V': 4, 'B': -1, 'B-V': -1}
+        if head_match:
+            ths = re.findall(r'<th>(.*?)</th>', head_match.group(1), re.DOTALL)
+            ths = [re.sub(r'<.*?>', '', t).strip() for t in ths]
+            for i, th in enumerate(ths):
+                if 'AUID' in th: col_map['AUID'] = i
+                elif 'RA' in th: col_map['RA'] = i
+                elif 'Dec' in th: col_map['Dec'] = i
+                elif th == 'V': col_map['V'] = i
+                elif th == 'B': col_map['B'] = i
+                elif 'B-V' in th: col_map['B-V'] = i
+
+        stars = []
+        rows = re.findall(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        if not rows: rows = [html] # Fallback
+        
+        row_list = re.findall(r'<tr>(.*?)</tr>', rows[0], re.DOTALL)
+        
+        for row in row_list:
+            if '000-' not in row: continue
+            
+            try:
+                # 1. Get all cell text contents
+                tds = re.findall(r'<td>(.*?)</td>', row, re.DOTALL)
+                cells = [re.sub(r'<.*?>', '', t).strip() for t in tds]
+                if len(cells) < 4: continue
+                
+                # 2. AUID and Coords
+                auid = cells[col_map['AUID']]
+                coord_matches = re.findall(r'\[([-\d.]+)&deg;\]', row)
+                if len(coord_matches) < 2: continue
+                ra = float(coord_matches[0])
+                dec = float(coord_matches[1])
+                
+                # 3. Magnitudes
+                v_mag = 0.0
+                b_mag = 0.0
+                
+                # V Mag
+                v_idx = col_map.get('V', 4)
+                if len(cells) > v_idx:
+                    v_val = cells[v_idx].split('(')[0].strip()
+                    if v_val: v_mag = float(v_val)
+                
+                # B or B-V Mag
+                b_idx = col_map.get('B', -1)
+                bv_idx = col_map.get('B-V', -1)
+                
+                if b_idx != -1 and len(cells) > b_idx and cells[b_idx]:
+                    b_val = cells[b_idx].split('(')[0].strip()
+                    if b_val: b_mag = float(b_val)
+                elif bv_idx != -1 and len(cells) > bv_idx and cells[bv_idx]:
+                    bv_val = cells[bv_idx].split('(')[0].strip()
+                    if bv_val: b_mag = v_mag + float(bv_val)
+                
+                if b_mag == 0.0: b_mag = v_mag
+                
+                # 4. Extract Name
+                name = auid
+                for c in reversed(cells):
+                    if c and not re.match(r'[\d.\-\s()]+', c) and 'deg' not in c:
+                        name = c
+                        break
+                
+                stars.append({
+                    'name': name,
+                    'auid': auid,
+                    'ra': ra,
+                    'dec': dec,
+                    'V_mag': round(v_mag, 3),
+                    'B_mag': round(b_mag, 3)
+                })
+            except:
+                continue
+        
+        if verbose:
+            print(f"  Successfully retrieved {len(stars)} comparison stars for {target_name}.")
+        return stars
+        
+    except Exception as e:
+        if verbose:
+            print(f"AAVSO Chart fetch failed: {e}")
+    
+    return []
 
 if __name__ == '__main__':
     # Test the parser

@@ -8,7 +8,7 @@ The code can identify stars, perform PSF fitting to extract fluxes (using apertu
 
 Make sure that the code uses the right filter. I use Johnson V and B filters, that are labled 'V_mag' and 'B_mag' by my imaging software - I use N.I.N.A. - in the FITS header.
 
-Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline.
+Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring perfect compatibility with AAVSO submission systems.
 
 Useful background information on the latter and lots of other useful information is provided by the AAVSO Guide to CCD/CMOS Photometry (available for free via aavso.org).
 
@@ -253,9 +253,9 @@ The module produces three files in `photometry_output/`:
 
 ---
 
-## 7. Running the Pipeline: The Configuration GUI (v3.1)
+## 7. Running the Pipeline: The Configuration GUI (v3.2)
 
-Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v3.1, the interface is split into a persistent top panel and a set of six processing tabs:
+Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v3.2, the interface is split into a persistent top panel and a set of six processing tabs:
 
 ### 7.1 FITS File Manager (Top Panel)
 Always visible at the top of the window, this centralized manager allows you to load, preview, and select your FITS files.
