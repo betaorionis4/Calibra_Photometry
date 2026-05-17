@@ -23,6 +23,10 @@ class StdoutRedirector:
         if text_widget not in self.text_widgets:
             self.text_widgets.append(text_widget)
 
+    def remove_widget(self, text_widget):
+        if text_widget in self.text_widgets:
+            self.text_widgets.remove(text_widget)
+
     def set_log_file(self, file_path):
         self.log_file = file_path
 
@@ -47,15 +51,23 @@ class ScrollableFrame(ttk.Frame):
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = ttk.Frame(self.canvas)
 
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
-            )
-        )
+        def update_scrollregion(e):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            req_height = self.scrollable_frame.winfo_reqheight()
+            canvas_height = self.canvas.winfo_height()
+            if req_height < canvas_height:
+                self.canvas.itemconfig(self.canvas_window, height=canvas_height)
+            else:
+                self.canvas.itemconfig(self.canvas_window, height=0)
+            self.reset_view_if_fits()
+
+        self.scrollable_frame.bind("<Configure>", update_scrollregion)
 
         def _on_mousewheel(event):
-            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            if self.scrollable_frame.winfo_height() > self.canvas.winfo_height():
+                self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            else:
+                self.canvas.yview_moveto(0)
             
         self.canvas.bind("<Enter>", lambda _: self.canvas.bind_all("<MouseWheel>", _on_mousewheel))
         self.canvas.bind("<Leave>", lambda _: self.canvas.unbind_all("<MouseWheel>"))
@@ -70,6 +82,17 @@ class ScrollableFrame(ttk.Frame):
         
     def on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
+        # Stretch inner frame to fill canvas height if it is smaller than the canvas viewport
+        req_height = self.scrollable_frame.winfo_reqheight()
+        if req_height < event.height:
+            self.canvas.itemconfig(self.canvas_window, height=event.height)
+        else:
+            self.canvas.itemconfig(self.canvas_window, height=0)
+        self.reset_view_if_fits()
+
+    def reset_view_if_fits(self):
+        if self.scrollable_frame.winfo_height() <= self.canvas.winfo_height():
+            self.canvas.yview_moveto(0)
 
 def run_config_gui(pipeline_callback=None):
     """
@@ -902,6 +925,12 @@ def run_config_gui(pipeline_callback=None):
                 
                 def thread_target():
                     try:
+                        pipeline_terminal.delete("1.0", tk.END)
+                        if hasattr(sys.stdout, "add_widget"):
+                            sys.stdout.add_widget(pipeline_terminal)
+                        if hasattr(sys.stderr, "add_widget"):
+                            sys.stderr.add_widget(pipeline_terminal)
+
                         results = pipeline_callback(config_run)
                         if results:
                             last_zp_v = None
@@ -958,6 +987,10 @@ def run_config_gui(pipeline_callback=None):
                             if last_zp_b is not None:
                                 root.after(0, lambda v=last_zp_b: vars_dict["default_zp_b"][0].set(round(v, 3)))
                     finally:
+                        if hasattr(sys.stdout, "remove_widget"):
+                            sys.stdout.remove_widget(pipeline_terminal)
+                        if hasattr(sys.stderr, "remove_widget"):
+                            sys.stderr.remove_widget(pipeline_terminal)
                         run_btn.config(state=tk.NORMAL, text="Run Analysis Pipeline on Selected")
                 
                 thread = threading.Thread(target=thread_target)
@@ -1383,15 +1416,16 @@ def run_config_gui(pipeline_callback=None):
 
     ttk.Button(toolbar_frame, text="Load Files...", command=on_load_files).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Load Directory...", command=on_load_dir).pack(side=tk.LEFT, padx=5)
-    
-    open_viewer_btn = tk.Button(toolbar_frame, text="🔍 Open in FITS Viewer", command=on_open_viewer_button,
-                                bg="#1a3a5f", fg="white", font=("Arial", 9, "bold"), padx=10, relief="flat")
-    open_viewer_btn.pack(side=tk.LEFT, padx=10)
     ttk.Button(toolbar_frame, text="Check All", command=on_check_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Uncheck All", command=on_uncheck_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Remove Checked/Selected", command=on_remove_selected).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Clear All", command=on_clear_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Refresh Headers", command=on_refresh_headers).pack(side=tk.LEFT, padx=5)
+
+    # Informative tip text below buttons
+    tip_label = tk.Label(file_manager_frame, text="💡 Tip: Double-click any file in the table below to open it in the interactive FITS Viewer.",
+                         font=("Arial", 9, "italic"), fg="#00796b", bg="#f0f2f5", anchor="w")
+    tip_label.pack(fill="x", padx=10, pady=(0, 5))
 
     # Treeview Table & Header Panel (Side by Side)
     tree_frame = ttk.Frame(file_manager_frame)
@@ -3056,9 +3090,6 @@ def run_config_gui(pipeline_callback=None):
             clear_session_cache()
             messagebox.showinfo("Cache Cleared", "The photometry cache has been wiped.")
 
-    ts_btn_frame = ttk.Frame(ts_container)
-    ts_btn_frame.pack(pady=10)
-
     def on_open_report():
         target_name = ts_target_name_var.get().replace(' ','_')
         report_path = os.path.abspath(os.path.join("photometry_output", f"aavso_{target_name}.txt"))
@@ -3080,13 +3111,16 @@ def run_config_gui(pipeline_callback=None):
     def on_reset_ensemble():
         if messagebox.askyesno("Reset Ensemble", "Are you sure you want to clear all selected reference stars and the check star?"):
             # Clear all TS ref vars
-            for i in range(1, 11):
+            for i in range(5):
                 vars_dict[f"ts_ref_{i}_use"][0].set(False)
                 vars_dict[f"ts_ref_{i}_name"][0].set("")
                 vars_dict[f"ts_ref_{i}_mag"][0].set(0.0)
                 vars_dict[f"ts_ref_{i}_bv"][0].set(0.0)
                 vars_dict[f"ts_ref_{i}_ra"][0].set(0.0)
                 vars_dict[f"ts_ref_{i}_dec"][0].set(0.0)
+                vars_dict[f"ts_ref_{i}_has_manual"][0].set(False)
+                if f"ts_ref_{i}_coord_label" in vars_dict:
+                    vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
             
             # Clear check star
             vars_dict["ts_check_use"][0].set(False)
@@ -3095,33 +3129,43 @@ def run_config_gui(pipeline_callback=None):
             vars_dict["ts_check_bv"][0].set(0.0)
             vars_dict["ts_check_ra"][0].set(0.0)
             vars_dict["ts_check_dec"][0].set(0.0)
+            ts_check_star_idx_var.set(-1)
             
             # Reset target defaults if needed
             ts_target_name_var.set("Target")
             
             messagebox.showinfo("Reset Complete", "Ensemble and check star configuration has been cleared.")
 
-    run_ts_btn = tk.Button(ts_btn_frame, text="Generate Light Curve", command=on_run_ts,
+    ts_btn_container = ttk.Frame(ts_container)
+    ts_btn_container.pack(pady=10)
+
+    ts_btn_row1 = ttk.Frame(ts_btn_container)
+    ts_btn_row1.pack(pady=5)
+
+    ts_btn_row2 = ttk.Frame(ts_btn_container)
+    ts_btn_row2.pack(pady=5)
+
+    run_ts_btn = tk.Button(ts_btn_row1, text="Generate Light Curve", command=on_run_ts,
                            bg="#00796b", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
     run_ts_btn.pack(side=tk.LEFT, padx=10)
 
-    ts_open_viewer_btn = tk.Button(ts_btn_frame, text="🔍 Open Selected FITS in Viewer", command=on_open_viewer_button,
+    ts_open_viewer_btn = tk.Button(ts_btn_row1, text="🔍 Open Selected FITS in Viewer", command=on_open_viewer_button,
                                    bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, padx=15)
     ts_open_viewer_btn.pack(side=tk.LEFT, padx=10)
 
-    clear_cache_btn = tk.Button(ts_btn_frame, text="Clear Photometry Cache", command=on_clear_cache,
+    clear_cache_btn = tk.Button(ts_btn_row2, text="Clear Photometry Cache", command=on_clear_cache,
                                 bg="#f57c00", fg="white", font=("Arial", 9), pady=10)
     clear_cache_btn.pack(side=tk.LEFT, padx=10)
 
-    open_report_btn = tk.Button(ts_btn_frame, text="Open AAVSO Report", command=on_open_report,
+    open_report_btn = tk.Button(ts_btn_row2, text="Open AAVSO Report", command=on_open_report,
                                 bg="#43a047", fg="white", font=("Arial", 9, "bold"), pady=10)
     open_report_btn.pack(side=tk.LEFT, padx=10)
 
-    reset_ens_btn = tk.Button(ts_btn_frame, text="Reset Ensemble", command=on_reset_ensemble,
+    reset_ens_btn = tk.Button(ts_btn_row2, text="Reset Ensemble", command=on_reset_ensemble,
                               bg="#757575", fg="white", font=("Arial", 9), pady=10)
     reset_ens_btn.pack(side=tk.LEFT, padx=10)
 
-    ts_info_btn = tk.Button(ts_btn_frame, text="❓ What does this do?", command=show_lightcurve_info,
+    ts_info_btn = tk.Button(ts_btn_row2, text="❓ What does this do?", command=show_lightcurve_info,
                             bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15)
     ts_info_btn.pack(side=tk.LEFT, padx=10)
 
@@ -3336,10 +3380,6 @@ def run_config_gui(pipeline_callback=None):
     # Redirect stdout and stderr
     sys.stdout = StdoutRedirector(console)
     sys.stderr = StdoutRedirector(console)
-    
-    # Register tab-local console output to redirector
-    sys.stdout.add_widget(pipeline_terminal)
-    sys.stderr.add_widget(pipeline_terminal)
 
     # Ensure closing main window closes everything and saves session
     def on_closing():
