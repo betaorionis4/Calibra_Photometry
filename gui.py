@@ -141,9 +141,9 @@ def run_config_gui(pipeline_callback=None):
     btn_frame = tk.Frame(root, bg="#f0f2f5")
     btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
     
-    # 2. Main resizable vertical split (Takes all remaining space)
-    main_v_paned = tk.PanedWindow(root, orient=tk.VERTICAL, bg="#f0f2f5", sashwidth=4, borderwidth=0)
-    main_v_paned.pack(side=tk.TOP, fill="both", expand=True)
+    # 2. Main Notebook (Takes all remaining space)
+    notebook = ttk.Notebook(root)
+    notebook.pack(side=tk.TOP, fill="both", expand=True, padx=5, pady=5)
     
     def scan_fits_header(filepath):
         from astropy.io import fits
@@ -614,15 +614,9 @@ def run_config_gui(pipeline_callback=None):
         except Exception as e:
             print(f"Error loading session: {e}")
 
-    # --- FITS FILE MANAGER (Top Panel) ---
-    # Custom Header with a larger icon
-    # Use tk.Frame instead of ttk.Frame to avoid unwanted themed borders/stripes in labelwidget
-    file_mgr_header_frame = tk.Frame(root, bg="#f0f2f5") 
-    tk.Label(file_mgr_header_frame, text="📂", font=("Segoe UI Symbol", 16), bg="#f0f2f5", fg="#1a3a5f").pack(side=tk.LEFT)
-    tk.Label(file_mgr_header_frame, text=" FITS File Manager", font=("Arial", 10, "bold"), bg="#f0f2f5", fg="#1a3a5f").pack(side=tk.LEFT)
-    
-    file_manager_frame = tk.LabelFrame(main_v_paned, labelwidget=file_mgr_header_frame)
-    main_v_paned.add(file_manager_frame, stretch="always", height=200)
+    # --- TAB 1: File Manager ---
+    file_manager_frame = ttk.Frame(notebook)
+    notebook.add(file_manager_frame, text="📂 File Manager")
     
     # Button Toolbar
     toolbar_frame = ttk.Frame(file_manager_frame)
@@ -1030,9 +1024,7 @@ def run_config_gui(pipeline_callback=None):
     file_manager_status_label = SelectableLabel(file_manager_frame, textvariable=file_manager_status, font=("Arial", 8, "italic"))
     file_manager_status_label.pack(anchor=tk.W, padx=10, pady=2, fill="x")
 
-    # Create Notebook for Tabs
-    notebook = ttk.Notebook(main_v_paned)
-    main_v_paned.add(notebook, stretch="always")
+    # Notebook is already created and packed early
 
     # Update the table after notebook is created (for initial load_session)
     root.after(100, update_file_table)
