@@ -141,9 +141,75 @@ def run_config_gui(pipeline_callback=None):
     btn_frame = tk.Frame(root, bg="#f0f2f5")
     btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
     
-    # 2. Main Notebook (Takes all remaining space)
-    notebook = ttk.Notebook(root)
-    notebook.pack(side=tk.TOP, fill="both", expand=True, padx=5, pady=5)
+    # --- TOP BANNER FRAME ---
+    top_banner = tk.Frame(root, bg="#1a3a5f", height=45)
+    top_banner.pack(side=tk.TOP, fill=tk.X)
+    top_banner.pack_propagate(False) # Keep fixed height
+    
+    # Title in top banner with modern unicode icon and typography
+    tk.Label(top_banner, text="🌌  Calibra v3.2  -  Astro Analysis & Photometry Suite", 
+             font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack(side=tk.LEFT, padx=15, pady=10)
+             
+    # Main container frame (horizontal layout below banner)
+    main_container = tk.Frame(root, bg="#f0f2f5")
+    main_container.pack(side=tk.TOP, fill="both", expand=True)
+    
+    # Left Sidebar Frame
+    sidebar_frame = tk.Frame(main_container, bg="#132b47", width=180)
+    sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
+    sidebar_frame.pack_propagate(False)
+    
+    # Content Frame (Right side stacked container)
+    content_container = tk.Frame(main_container, bg="white")
+    content_container.pack(side=tk.RIGHT, fill="both", expand=True)
+    content_container.grid_rowconfigure(0, weight=1)
+    content_container.grid_columnconfigure(0, weight=1)
+
+    # Sidebar button dictionary and tab switching logic
+    sidebar_buttons = {}
+    
+    def switch_tab(tab_name):
+        # Raise target frame
+        if tab_name == "files":
+            tab_files_outer.tkraise()
+        elif tab_name == "pre":
+            tab_pre_outer.tkraise()
+        elif tab_name == "analysis":
+            tab_analysis_scroll.tkraise()
+        elif tab_name == "ts":
+            tab_ts_outer.tkraise()
+        elif tab_name == "settings":
+            tab_settings_outer.tkraise()
+        elif tab_name == "about":
+            tab_about_outer.tkraise()
+        elif tab_name == "help":
+            tab_help_outer.tkraise()
+            
+        # Update button highlighting
+        for name, btn in sidebar_buttons.items():
+            if name == tab_name:
+                btn.config(bg="#2e5b8a", activebackground="#2e5b8a")
+            else:
+                btn.config(bg="#132b47", activebackground="#132b47")
+
+    def create_sidebar_button(text, tab_name):
+        btn = tk.Button(sidebar_frame, text=text, font=("Segoe UI", 9, "bold"), fg="white", bg="#132b47",
+                        activeforeground="white", activebackground="#132b47", relief="flat", bd=0,
+                        padx=15, pady=12, anchor="w", command=lambda: switch_tab(tab_name))
+        btn.pack(fill=tk.X, side=tk.TOP, pady=1)
+        
+        # Add hover effects
+        def on_enter(e):
+            if sidebar_buttons[tab_name].cget("bg") != "#2e5b8a":
+                btn.config(bg="#1f446e")
+        def on_leave(e):
+            if sidebar_buttons[tab_name].cget("bg") != "#2e5b8a":
+                btn.config(bg="#132b47")
+                
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        sidebar_buttons[tab_name] = btn
+        return btn
     
     def scan_fits_header(filepath):
         from astropy.io import fits
@@ -160,25 +226,42 @@ def run_config_gui(pipeline_callback=None):
             'size': f"{os.path.getsize(filepath) / 1024:.1f} KB"
         }
         try:
+            def get_hdr_val(hdul, key, default=None):
+                for hdu in hdul:
+                    if key in hdu.header:
+                        return hdu.header[key]
+                return default
+
             with fits.open(filepath) as hdul:
-                header = hdul[0].header
-                metadata['filter'] = str(header.get('FILTER', ''))
-                xbin = header.get('XBINNING', '')
-                ybin = header.get('YBINNING', '')
+                filt_val = get_hdr_val(hdul, 'FILTER', '')
+                metadata['filter'] = str(filt_val)
+                xbin = get_hdr_val(hdul, 'XBINNING', '')
+                ybin = get_hdr_val(hdul, 'YBINNING', '')
                 if xbin and ybin:
                     metadata['binning'] = f"{xbin}x{ybin}"
                 # Rounded airmass
-                am = header.get('AIRMASS')
+                am = get_hdr_val(hdul, 'AIRMASS')
                 if am is not None:
                     try:
                         metadata['airmass'] = f"{float(am):.3f}"
                     except:
                         metadata['airmass'] = str(am)
                 
-                metadata['date_obs'] = str(header.get('DATE-OBS', ''))
-                metadata['exposure'] = str(header.get('EXPTIME', ''))
-                metadata['wcs'] = '✓' if 'CRVAL1' in header else '✗'
-                metadata['object'] = str(header.get('OBJECT', ''))
+                date_obs = get_hdr_val(hdul, 'DATE-OBS', '')
+                metadata['date_obs'] = str(date_obs)
+                exposure = get_hdr_val(hdul, 'EXPTIME', '')
+                metadata['exposure'] = str(exposure)
+                
+                # Check WCS
+                wcs_val = '✗'
+                for hdu in hdul:
+                    if 'CRVAL1' in hdu.header:
+                        wcs_val = '✓'
+                        break
+                metadata['wcs'] = wcs_val
+                
+                obj_val = get_hdr_val(hdul, 'OBJECT', '')
+                metadata['object'] = str(obj_val)
         except Exception as e:
             print(f"Error reading header for {filepath}: {e}")
         return metadata
@@ -615,8 +698,9 @@ def run_config_gui(pipeline_callback=None):
             print(f"Error loading session: {e}")
 
     # --- TAB 1: File Manager ---
-    file_manager_frame = ttk.Frame(notebook)
-    notebook.add(file_manager_frame, text="📂 File Manager")
+    tab_files_outer = ttk.Frame(content_container)
+    tab_files_outer.grid(row=0, column=0, sticky="nsew")
+    file_manager_frame = tab_files_outer
     
     # Button Toolbar
     toolbar_frame = ttk.Frame(file_manager_frame)
@@ -643,36 +727,41 @@ def run_config_gui(pipeline_callback=None):
                 file_data['object'],
                 file_data['size']
             ), tags=(tag,))
-        
-        # Update status bar
+           # Update status bar
         if "filter_v_keyword" in vars_dict:
-            v_key = vars_dict["filter_v_keyword"][0].get().upper()
+            v_key = vars_dict["filter_v_keyword"][0].get().upper().strip()
         else:
             v_key = "VMAG"
             
         if "filter_b_keyword" in vars_dict:
-            b_key = vars_dict["filter_b_keyword"][0].get().upper()
+            b_key = vars_dict["filter_b_keyword"][0].get().upper().strip()
         else:
             b_key = "BMAG"
 
-        v_count = sum(1 for f in loaded_files if v_key and v_key in str(f['filter']).upper())
-        b_count = sum(1 for f in loaded_files if b_key and b_key in str(f['filter']).upper())
+        v_count = 0
+        b_count = 0
+        for f in loaded_files:
+            filt_str = str(f.get('filter', '')).upper().strip()
+            if filt_str:
+                if v_key and (v_key in filt_str or filt_str in v_key):
+                    v_count += 1
+                elif b_key and (b_key in filt_str or filt_str in b_key):
+                    b_count += 1
+
         status_text = f"Loaded: {len(loaded_files)} files ({v_count}× V, {b_count}× B)"
         file_manager_status.set(status_text)
         
         # Update light curve filter dropdown with unique translated filters
         unique_translated = set()
-        v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
-        b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
-        
         for f in loaded_files:
-            filt_str = str(f.get('filter', '')).upper()
-            if v_key and v_key in filt_str:
-                unique_translated.add("V")
-            elif b_key and b_key in filt_str:
-                unique_translated.add("B")
-            elif filt_str:
-                unique_translated.add(filt_str)
+            filt_str = str(f.get('filter', '')).upper().strip()
+            if filt_str:
+                if v_key and (v_key in filt_str or filt_str in v_key):
+                    unique_translated.add("V")
+                elif b_key and (b_key in filt_str or filt_str in b_key):
+                    unique_translated.add("B")
+                else:
+                    unique_translated.add(filt_str)
         
         unique_filters = sorted(list(unique_translated))
         if 'filter_cb' in ts_widgets:
@@ -1029,31 +1118,31 @@ def run_config_gui(pipeline_callback=None):
     # Update the table after notebook is created (for initial load_session)
     root.after(100, update_file_table)
 
-    # --- TAB 1: Pre-processing (NEW) ---
-    tab_pre_outer = ttk.Frame(notebook)
-    notebook.add(tab_pre_outer, text="⚙ Pre-processing")
+    # --- TAB 2: Pre-processing (NEW) ---
+    tab_pre_outer = ttk.Frame(content_container)
+    tab_pre_outer.grid(row=0, column=0, sticky="nsew")
     
     pre_scroll = ScrollableFrame(tab_pre_outer)
     pre_scroll.pack(fill="both", expand=True)
     tab_pre = pre_scroll.scrollable_frame
 
-    # --- TAB 2: Analysis & Calibration (Unified) ---
-    tab_analysis_scroll = ScrollableFrame(notebook)
+    # --- TAB 3: Analysis & Calibration (Unified) ---
+    tab_analysis_scroll = ScrollableFrame(content_container)
     tab_analysis = tab_analysis_scroll.scrollable_frame
-    notebook.add(tab_analysis_scroll, text="🔍 Analysis & Calibration")
+    tab_analysis_scroll.grid(row=0, column=0, sticky="nsew")
     
 
-    # --- TAB 3: Light Curves ---
-    tab_ts_outer = ttk.Frame(notebook)
-    notebook.add(tab_ts_outer, text="📈 Light Curves")
+    # --- TAB 4: Light Curves ---
+    tab_ts_outer = ttk.Frame(content_container)
+    tab_ts_outer.grid(row=0, column=0, sticky="nsew")
     
     ts_scroll = ScrollableFrame(tab_ts_outer)
     ts_scroll.pack(fill="both", expand=True)
     tab_ts = ts_scroll.scrollable_frame
 
     # --- TAB 5: Settings ---
-    tab_settings_outer = ttk.Frame(notebook)
-    notebook.add(tab_settings_outer, text="🔧 Settings")
+    tab_settings_outer = ttk.Frame(content_container)
+    tab_settings_outer.grid(row=0, column=0, sticky="nsew")
     
     settings_scroll = ScrollableFrame(tab_settings_outer)
     settings_scroll.pack(fill="both", expand=True)
@@ -2637,8 +2726,8 @@ def run_config_gui(pipeline_callback=None):
 
 
     # --- TAB 5: About ---
-    tab_about_outer = ttk.Frame(notebook)
-    notebook.add(tab_about_outer, text="ℹ About")
+    tab_about_outer = ttk.Frame(content_container)
+    tab_about_outer.grid(row=0, column=0, sticky="nsew")
     
     about_scroll = ScrollableFrame(tab_about_outer)
     about_scroll.pack(fill="both", expand=True)
@@ -2680,8 +2769,8 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(about_container, text=desc_text, justify=tk.LEFT, font=("Arial", 10), bg="white").pack(fill="x")
 
     # --- TAB 5: Help ---
-    tab_help_outer = ttk.Frame(notebook)
-    notebook.add(tab_help_outer, text="❓ Help")
+    tab_help_outer = ttk.Frame(content_container)
+    tab_help_outer.grid(row=0, column=0, sticky="nsew")
     
     help_scroll = ScrollableFrame(tab_help_outer)
     help_scroll.pack(fill="both", expand=True)
@@ -2717,6 +2806,18 @@ def run_config_gui(pipeline_callback=None):
         "Contact: stephan.pomp@gmail.com"
     )
     tk.Label(help_frame, text=dev_info, justify=tk.LEFT, font=("Arial", 9), fg="#555").pack(side=tk.BOTTOM, anchor="w")
+
+    # Create Sidebar buttons
+    create_sidebar_button("📂  File Manager", "files")
+    create_sidebar_button("⚙  Pre-processing", "pre")
+    create_sidebar_button("🔍  Analysis & Calib", "analysis")
+    create_sidebar_button("📈  Light Curves", "ts")
+    create_sidebar_button("🔧  Settings", "settings")
+    create_sidebar_button("ℹ  About Calibra", "about")
+    create_sidebar_button("❓  User Help", "help")
+    
+    # Select first tab by default
+    switch_tab("files")
 
     # --- OUTPUT CONSOLE (Separate Window) ---
     console_win = tk.Toplevel(root)
