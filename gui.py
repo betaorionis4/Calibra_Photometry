@@ -16,15 +16,23 @@ from photometry.gui_utils import add_copy_context_menu, SelectableLabel, add_tre
 
 class StdoutRedirector:
     def __init__(self, text_widget):
-        self.text_widget = text_widget
+        self.text_widgets = [text_widget]
         self.log_file = None
+
+    def add_widget(self, text_widget):
+        if text_widget not in self.text_widgets:
+            self.text_widgets.append(text_widget)
 
     def set_log_file(self, file_path):
         self.log_file = file_path
 
     def write(self, string):
-        self.text_widget.insert(tk.END, string)
-        self.text_widget.see(tk.END)
+        for w in self.text_widgets:
+            try:
+                w.insert(tk.END, string)
+                w.see(tk.END)
+            except:
+                pass
         if self.log_file:
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(string)
@@ -68,9 +76,9 @@ def run_config_gui(pipeline_callback=None):
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "3.2"
+    APP_VERSION = "4.0"
     root = tk.Tk()
-    root.title(f"Calibra v{APP_VERSION}")
+    root.title(f"Calibra v{APP_VERSION} - Astro Analysis & Photometry Suite")
     root.geometry("1100x750")
     root.minsize(950, 650)
     root.resizable(True, True)
@@ -141,16 +149,7 @@ def run_config_gui(pipeline_callback=None):
     btn_frame = tk.Frame(root, bg="#f0f2f5")
     btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
     
-    # --- TOP BANNER FRAME ---
-    top_banner = tk.Frame(root, bg="#1a3a5f", height=45)
-    top_banner.pack(side=tk.TOP, fill=tk.X)
-    top_banner.pack_propagate(False) # Keep fixed height
-    
-    # Title in top banner with modern unicode icon and typography
-    tk.Label(top_banner, text="🌌  Calibra v3.2  -  Astro Analysis & Photometry Suite", 
-             font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack(side=tk.LEFT, padx=15, pady=10)
-             
-    # Main container frame (horizontal layout below banner)
+    # Main container frame (fills all remaining space)
     main_container = tk.Frame(root, bg="#f0f2f5")
     main_container.pack(side=tk.TOP, fill="both", expand=True)
     
@@ -158,6 +157,8 @@ def run_config_gui(pipeline_callback=None):
     sidebar_frame = tk.Frame(main_container, bg="#132b47", width=180)
     sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
     sidebar_frame.pack_propagate(False)
+    
+
     
     # Content Frame (Right side stacked container)
     content_container = tk.Frame(main_container, bg="white")
@@ -175,7 +176,7 @@ def run_config_gui(pipeline_callback=None):
         elif tab_name == "pre":
             tab_pre_outer.tkraise()
         elif tab_name == "analysis":
-            tab_analysis_scroll.tkraise()
+            tab_analysis_outer.tkraise()
         elif tab_name == "ts":
             tab_ts_outer.tkraise()
         elif tab_name == "settings":
@@ -266,6 +267,514 @@ def run_config_gui(pipeline_callback=None):
             print(f"Error reading header for {filepath}: {e}")
         return metadata
 
+    def show_pipeline_info():
+        pop = tk.Toplevel(root)
+        pop.title("About the Photometric Analysis Pipeline")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        # Center popup over root window
+        pop.update_idletasks()
+        rx = root.winfo_x()
+        ry = root.winfo_y()
+        rw = root.winfo_width()
+        rh = root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        # Header Frame
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="🌌  Photometric Analysis Pipeline", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        # Main Content Area
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        # Text box (using a premium styled readonly scrolledtext)
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT THE PIPELINE DOES:\n"
+            "------------------------\n"
+            "When you click 'Run Analysis Pipeline on Selected', Calibra processes each checked FITS file through a series of rigid, automated, consecutive steps:\n\n"
+            "1. Star Detection (DAOStarFinder):\n"
+            "   Scans the image to find stellar sources matching your detection parameters (sigma threshold, sharpness, roundness bounds).\n\n"
+            "2. PSF Coordinate Refinement:\n"
+            "   Fits a 2D Gaussian PSF (Point Spread Function) model to each star to obtain sub-pixel centroid coordinates and measures the stellar FWHM.\n\n"
+            "3. Aperture Photometry:\n"
+            "   Measures the background-subtracted flux of every star. It uses a surrounding annulus to subtract sky background and calculates instrumental magnitudes. Can use fixed or flexible apertures (set to 2x FWHM).\n\n"
+            "4. Zero-Point Calibration:\n"
+            "   Matches coordinates against your selected online catalog (ATLAS refcat2, APASS DR9, Gaia DR3, or Landolt) using WCS headers. It derives the calculated Zero Point (ZP) of the image to standardize magnitudes.\n\n"
+            "5. Positional Shift Analysis (optional):\n"
+            "   Analyzes pixel shift offsets between your image and the reference catalog.\n\n"
+            "6. Smart CSV Export:\n"
+            "   Saves coordinates, flux, SNR, and calibrated magnitudes into 'targets_auto_<filename>.csv'. These files are automatically fed into the downstream Color Transformation & Differential Photometry tools for you!\n\n"
+            "------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- FITS files loaded in the File Manager with active [X] checkboxes.\n"
+            "- FITS files MUST have valid WCS headers (plate-solved RA/Dec coordinates). If they don't, run the 'WCS Plate Solving' tool in the Pre-processing tab first.\n"
+            "- Files should ideally be bias-subtracted and flat-field corrected first using 'FITS Calibration' under Pre-processing."
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED) # Read only
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def show_color_info():
+        pop = tk.Toplevel(root)
+        pop.title("About Color Coefficient Calibration (B-V Pairs)")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="🌈  Color Coefficient Calibration (B-V Pairs)", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT COLOR CALIBRATION DOES:\n"
+            "-----------------------------\n"
+            "Stellar photometry requires converting instrumental magnitudes (derived from pixel counts) to standard system magnitudes (like the standard Johnson B and V system).\n\n"
+            "Because CCD camera sensitivities and filter transmission curves differ slightly from the standard definitions, standard transformation coefficients are needed:\n\n"
+            "- Tbv (Color Index Slope):\n"
+            "  Transforms the instrumental (b_inst - v_inst) color index into standard (B - V).\n\n"
+            "- Tb_bv & Tv_bv (Filter Coefficients):\n"
+            "  Apply a second-order standard color correction slope to standardise individual filters.\n\n"
+            "How it works:\n"
+            "1. It reads the CSV results from standard star fields taken in both B and V filters.\n"
+            "2. It matches stellar centroids between the B and V frames.\n"
+            "3. It extracts standard (B-V) colors for these stars from online catalogs.\n"
+            "4. It runs a linear regression plotting (Standard - Instrumental) magnitudes against the standard (B-V) colors, calculating the slope coefficients automatically!\n\n"
+            "-----------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- A B-Filter results CSV and a V-Filter results CSV (generated by the star detection pipeline).\n"
+            "- Airmass values (k_B, k_V) from your observations. If FITS headers contain airmass, they are loaded automatically unless the override checkbox is checked.\n\n"
+            "-----------------------------\n"
+            "OUTPUTS:\n"
+            "- Regression fit lines and residual plots shown in the preview window.\n"
+            "- Extracted slope coefficients (Tbv, Tb_bv, Tv_bv) saved in 'photometry_output/color_coefficients.json' and automatically updated inside the next tab!"
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def show_diff_info():
+        pop = tk.Toplevel(root)
+        pop.title("About Differential Photometry & Light Curves")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="📊  Differential Photometry & Light Curves", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT DIFFERENTIAL PHOTOMETRY DOES:\n"
+            "-----------------------------------\n"
+            "Differential Photometry is the standard method for obtaining extremely high precision light curves of variable stars.\n\n"
+            "Atmospheric transparency, clouds, and instrumental tracking errors vary over time. By comparing the brightness of your variable target star against stable comparison (reference) stars in the exact same image frame, these atmospheric variations cancel out completely.\n\n"
+            "How it works:\n"
+            "1. Select your target star (either by name using the Simbad resolver or by entering manual RA/Dec coordinates).\n"
+            "2. Define up to 5 comparison stars (reference stars) in the field of view.\n"
+            "3. For each loaded FITS file, it calculates the magnitude difference between the target star and the ensemble average of the comparison stars.\n"
+            "4. Applies the color transformation coefficients (Tbv, Tb_bv, Tv_bv) derived in the second tab to yield absolute, standard calibrated magnitudes.\n"
+            "5. Automatically extracts the time of observation (Julian Date or JD) from each FITS header to build a light curve.\n\n"
+            "-----------------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- A time series of B or V FITS files loaded in the File Manager with valid WCS solution.\n"
+            "- Valid coordinates for the Target star and stable Comparison stars.\n"
+            "- Color coefficients (automatically loaded from color_coefficients.json).\n\n"
+            "-----------------------------------\n"
+            "OUTPUTS:\n"
+            "- An interactive Matplotlib light curve plot.\n"
+            "- A detailed results table displaying observation dates, target instrumental magnitudes, and calibrated magnitudes.\n"
+            "- Exported photometry results saved to standard CSV and ready-to-submit AAVSO formatted files!"
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def show_calibration_info():
+        pop = tk.Toplevel(root)
+        pop.title("About FITS Calibration (Bias & Flats)")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="⚙  FITS Instrumental Calibration", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT FITS CALIBRATION DOES:\n"
+            "----------------------------\n"
+            "Raw astronomical images suffer from noise, pixel imperfections, and dust. Calibration cleans raw observations, leaving only genuine starlight:\n\n"
+            "1. Master Bias Subtraction:\n"
+            "   Removes read-out noise, fixed-pattern electronic noise, and internal offsets generated by the camera CCD sensor.\n\n"
+            "2. Master Flat-Field Division:\n"
+            "   Corrects for pixel-to-pixel sensitivity variances, dust artifacts ('dust donuts'), and optical vignetting (dark corners). Flats standardize light throughput across the frame.\n\n"
+            "How it works:\n"
+            "- You check raw FITS files in the File Manager.\n"
+            "- The engine automatically maps and applies the correct Master Flat corresponding to the filter specified inside the FITS header (e.g. standard B or V flats).\n\n"
+            "----------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- FITS files loaded and checked in the File Manager.\n"
+            "- A Master Bias FITS file.\n"
+            "- Master B-Filter and V-Filter Flats.\n\n"
+            "----------------------------\n"
+            "OUTPUTS:\n"
+            "- Cleaned, calibrated FITS copies created under 'fitsfiles/calibrated/' prefixed with 'cal_'.\n"
+            "- The File Manager table is automatically updated with these calibrated files in-place!"
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def show_plate_solve_info():
+        pop = tk.Toplevel(root)
+        pop.title("About ASTAP Plate Solving")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="🌌  ASTAP Plate Solving & WCS Alignment", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT PLATE SOLVING DOES:\n"
+            "-------------------------\n"
+            "Plate solving compares the star patterns in your FITS image against standard celestial star catalogs to calculate the precise RA/Dec coordinates, scale, and rotation of your image.\n\n"
+            "This embeds standard WCS (World Coordinate System) metadata into the FITS header, which is absolutely required to match stars automatically against online catalogs for zero-point and magnitude calibration.\n\n"
+            "How it works:\n"
+            "1. Invokes the external ASTAP astronomical command-line solver.\n"
+            "2. Detects constellations in the image, maps catalog matches, and solves the center RA/Dec coordinates.\n"
+            "3. Writes WCS coordinates directly into the new FITS header copy.\n\n"
+            "-------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- Checked FITS files in the File Manager.\n"
+            "- External ASTAP executable path installed on your computer.\n"
+            "- A rough search radius around the target field.\n\n"
+            "-------------------------\n"
+            "OUTPUTS:\n"
+            "- Solved FITS copy generated with standard suffix (e.g. '_wcs').\n"
+            "- File Manager table automatically displays WCS success checkmarks (✓) for solved files!"
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def show_lightcurve_info():
+        pop = tk.Toplevel(root)
+        pop.title("About Time-Series Photometry & Light Curves")
+        pop.geometry("620x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 620) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text="📈  Time-Series Photometry & Light Curves", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT TIME-SERIES PHOTOMETRY DOES:\n"
+            "-----------------------------------\n"
+            "Tracks the changing brightness of a variable target star over a sequence of observations. It performs differential ensemble photometry to yield high precision light curves.\n\n"
+            "How it works:\n"
+            "1. Target Setup: Enter or resolve coordinates of the target star.\n"
+            "2. Ensemble Setup: Add stable reference/comparison stars. Click 'Get AAVSO Ref Stars' to automatically query AAVSO coordinate chart magnitudes for your field.\n"
+            "3. Processing Sequence: Iterates through checked FITS files matching the chosen filter. Subtracts background sky, scales magnitude variations against comparison stars, applies standard color index adjustments, and computes precise observation times (Julian Date).\n\n"
+            "-----------------------------------\n"
+            "REQUIRED INPUTS:\n"
+            "- A sequence of B or V FITS files loaded and checked in the File Manager (bias-subtracted, flat-fielded, and plate solved).\n"
+            "- Target and Ensemble star RA/Dec coordinates.\n"
+            "- Color transformation coefficients (loaded from previous runs).\n\n"
+            "-----------------------------\n"
+            "OUTPUTS:\n"
+            "- Interactive plotted light curve preview.\n"
+            "- Scrollable results table containing Julian dates, calibrated magnitudes, SNR, and errors.\n"
+            "- Photometry results saved to standard CSV and AAVSO-format text reports ready for upload!"
+        )
+        
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+
+    def open_fits_viewer_for_item(item):
+        if not item: return
+        try:
+            from photometry.fits_viewer import FITSViewer
+            ref_cat = vars_dict["reference_catalog"][0].get() if "reference_catalog" in vars_dict else "ATLAS"
+            idx = int(item)
+            file_path = loaded_files[idx]['path']
+            filt = loaded_files[idx]['filter'].upper()
+            b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+            
+            if b_key in filt:
+                def_zp = float(vars_dict["default_zp_b"][0].get()) if "default_zp_b" in vars_dict else 23.399
+            else:
+                def_zp = float(vars_dict["default_zp_v"][0].get()) if "default_zp_v" in vars_dict else 23.399
+            
+            if os.path.exists(file_path):
+                # 1. Gather aperture/annulus configuration
+                viewer_config = {
+                    'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
+                    'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
+                    'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
+                    'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
+                    'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
+                    'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
+                    'annulus_width': float(vars_dict["annulus_width"][0].get()),
+                }
+                
+                # 2. Gather INITIAL STARS from Light Curves tab
+                initial_stars = {'variable': None, 'check': None, 'refs': []}
+                
+                # Target
+                t_mode = vars_dict["ts_target_mode"][0].get()
+                t_name = vars_dict["ts_target_name"][0].get().strip()
+                if t_mode == "name" and t_name:
+                    try:
+                        c = SkyCoord.from_name(t_name)
+                        initial_stars['variable'] = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': t_name}
+                    except: pass
+                elif t_mode == "manual":
+                    try:
+                        c = SkyCoord(vars_dict["ts_target_ra"][0].get(), vars_dict["ts_target_dec"][0].get(), unit=(u.hourangle, u.deg))
+                        initial_stars['variable'] = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': t_name or "Target"}
+                    except: pass
+                
+                # Refs & Check
+                cs_idx = ts_check_star_idx_var.get()
+                for i in range(5):
+                    name = vars_dict[f"ts_ref_{i}_name"][0].get().strip()
+                    if vars_dict[f"ts_ref_{i}_has_manual"][0].get():
+                        ra = vars_dict[f"ts_ref_{i}_ra"][0].get()
+                        dec = vars_dict[f"ts_ref_{i}_dec"][0].get()
+                        s_data = {'ra': ra, 'dec': dec, 'name': name or f"Star_{i+1}"}
+                        if i == cs_idx: initial_stars['check'] = s_data
+                        elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
+                    elif name:
+                        try:
+                            c = SkyCoord.from_name(name)
+                            s_data = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': name}
+                            if i == cs_idx: initial_stars['check'] = s_data
+                            elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
+                        except: pass
+
+                # 3. Define EXPORT Callbacks
+                def update_light_curve_stars(data):
+                    if data['variable']:
+                        v = data['variable']
+                        vars_dict["ts_target_mode"][0].set("manual")
+                        vars_dict["ts_target_name"][0].set(v['name'])
+                        c = SkyCoord(v['ra'], v['dec'], unit=u.deg)
+                        vars_dict["ts_target_ra"][0].set(c.ra.to_string(unit='hour', sep=':', precision=2))
+                        vars_dict["ts_target_dec"][0].set(c.dec.to_string(unit='degree', sep=':', precision=2, alwayssign=True))
+                        
+                        # Use exported mag/bv if available to skip re-fetch
+                        if v.get('mag') is not None: vars_dict["ts_target_mag"][0].set(v['mag'])
+                        if v.get('bv') is not None: vars_dict["ts_target_bv"][0].set(v['bv'])
+                    
+                    # Check & Refs
+                    slots_filled = 0
+                    if data['check']:
+                        c = data['check']
+                        vars_dict["ts_ref_0_name"][0].set(c['name'])
+                        vars_dict["ts_ref_0_ra"][0].set(c['ra'])
+                        vars_dict["ts_ref_0_dec"][0].set(c['dec'])
+                        vars_dict["ts_ref_0_has_manual"][0].set(True)
+                        vars_dict["ts_ref_0_use"][0].set(False)
+                        ts_check_star_idx_var.set(0)
+                        
+                        if c.get('mag') is not None: vars_dict["ts_ref_0_mag"][0].set(c['mag'])
+                        if c.get('bv') is not None: vars_dict["ts_ref_0_bv"][0].set(c['bv'])
+                        slots_filled = 1
+                    else:
+                        ts_check_star_idx_var.set(-1)
+                    
+                    current_idx = slots_filled
+                    for r in data['refs']:
+                        if current_idx >= 5: break
+                        vars_dict[f"ts_ref_{current_idx}_name"][0].set(r['name'])
+                        vars_dict[f"ts_ref_{current_idx}_ra"][0].set(r['ra'])
+                        vars_dict[f"ts_ref_{current_idx}_dec"][0].set(r['dec'])
+                        vars_dict[f"ts_ref_{current_idx}_has_manual"][0].set(True)
+                        vars_dict[f"ts_ref_{current_idx}_use"][0].set(True)
+                        
+                        if r.get('mag') is not None: vars_dict[f"ts_ref_{current_idx}_mag"][0].set(r['mag'])
+                        if r.get('bv') is not None: vars_dict[f"ts_ref_{current_idx}_bv"][0].set(r['bv'])
+                        current_idx += 1
+                    
+                    for idx in range(current_idx, 5):
+                        vars_dict[f"ts_ref_{idx}_name"][0].set("")
+                        vars_dict[f"ts_ref_{idx}_has_manual"][0].set(False)
+                        vars_dict[f"ts_ref_{idx}_use"][0].set(False)
+                        if f"ts_ref_{idx}_coord_label" in vars_dict:
+                            vars_dict[f"ts_ref_{idx}_coord_label"][0].set("")
+                    
+                    # TRIGGER AUTO-FETCH (Only if data is missing)
+                    def trigger_fetch_if_needed():
+                        # Target
+                        if data['variable'] and data['variable'].get('mag') is None:
+                            if 'ts_target_fetch_func' in vars_dict:
+                                root.after(100, vars_dict['ts_target_fetch_func'])
+                        
+                        # Refs
+                        if 'ts_ref_fetch_funcs' in vars_dict:
+                            # Check
+                            if data['check'] and data['check'].get('mag') is None:
+                                if 0 in vars_dict['ts_ref_fetch_funcs']:
+                                    root.after(200, vars_dict['ts_ref_fetch_funcs'][0])
+                            
+                            # Ensemble Refs
+                            for i in range(slots_filled, current_idx):
+                                if i in vars_dict['ts_ref_fetch_funcs'] and data['refs'][i-slots_filled].get('mag') is None:
+                                    root.after(i*300, vars_dict['ts_ref_fetch_funcs'][i])
+                                    
+                    root.after(500, trigger_fetch_if_needed)
+                    
+                    # Autosave session to disk (Fix)
+                    save_session()
+
+                def update_apertures(ap_data):
+                    vars_dict["aperture_radius"][0].set(ap_data['aperture'])
+                    vars_dict["annulus_inner"][0].set(ap_data['annulus_in'])
+                    vars_dict["annulus_outer"][0].set(ap_data['annulus_out'])
+                    ts_status_var.set("Aperture settings updated from FITS Viewer.")
+                    
+                    # Autosave session to disk (Fix)
+                    save_session()
+
+                # Pass the AAVSO cache if available
+                aavso_cache = getattr(on_get_aavso_refs, 'cache', None)
+                
+                viewer_win = tk.Toplevel(root)
+                FITSViewer(viewer_win, file_path, ref_catalog=ref_cat, default_zp=def_zp, 
+                           config=viewer_config, initial_stars=initial_stars, 
+                           aavso_stars=aavso_cache,
+                           export_callback=update_light_curve_stars,
+                           aperture_export_callback=update_apertures)
+            else:
+                messagebox.showerror("Error", f"File not found: {file_path}")
+        except Exception as e:
+            print(f"Error opening viewer: {e}")
+
+    def on_double_click(event):
+        item = tree.identify_row(event.y)
+        if not item: return
+        open_fits_viewer_for_item(item)
+
+    def on_open_viewer_button():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a FITS file in the table first.")
+            return
+        open_fits_viewer_for_item(selected[0])
+
     def add_entry(parent, label_text, var_name, default_val, row, col_offset=0, vtype=float, width=15):
         ttk.Label(parent, text=label_text).grid(row=row, column=col_offset*2, sticky=tk.W, padx=10, pady=5)
         if var_name in vars_dict:
@@ -313,8 +822,14 @@ def run_config_gui(pipeline_callback=None):
     def on_run():
         vars_vals = {}
         try:
-            for k, (var, vtype) in vars_dict.items():
-                vars_vals[k] = vtype(var.get())
+            for k, val in vars_dict.items():
+                if not isinstance(val, (tuple, list)) or len(val) < 2:
+                    continue
+                var, vtype = val[0], val[1]
+                try:
+                    vars_vals[k] = vtype(var.get())
+                except ValueError as ve:
+                    raise ValueError(f"Field '{k}' (current value: '{var.get()}') must be a valid {vtype.__name__}.") from ve
             
             selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
             if not selected_iids:
@@ -391,23 +906,51 @@ def run_config_gui(pipeline_callback=None):
                         if results:
                             last_zp_v = None
                             last_zp_b = None
-                            for res in results:
-                                # results is a list of (output_csv, filt, calc_zp)
-                                if len(res) >= 3:
-                                    csv_path, filt, zp_val = res
-                                    f_upper = str(filt).upper()
-                                    b_key = config_run.get('filter_b_keyword', 'BMAG').upper()
-                                    if b_key in f_upper:
-                                        vars_dict['color_b_csv'][0].set(csv_path)
-                                        last_zp_b = zp_val
+                            summary_lines = []
+                            for idx, res in enumerate(results):
+                                csv_path = res[0]
+                                filt = res[1]
+                                zp_val = res[2] if len(res) >= 3 else None
+                                shift_val = res[3] if len(res) >= 4 else None
+                                det_val = res[4] if len(res) >= 5 else None
+                                
+                                f_upper = str(filt).upper()
+                                b_key = config_run.get('filter_b_keyword', 'BMAG').upper()
+                                if b_key in f_upper:
+                                    vars_dict['color_b_csv'][0].set(csv_path)
+                                    last_zp_b = zp_val
+                                else:
+                                    vars_dict['color_v_csv'][0].set(csv_path)
+                                    last_zp_v = zp_val
+                                
+                                # Build summary info for this file
+                                f_name = os.path.basename(csv_path).replace("targets_auto_", "")
+                                line = f"File {idx+1}: {f_name}\n"
+                                line += f"  • Output CSV: {os.path.abspath(csv_path)}\n"
+                                if zp_val is not None:
+                                    line += f"  • Filter: {filt}  |  Calculated Zero Point: {zp_val:.4f}\n"
+                                if det_val:
+                                    det_parts = []
+                                    if det_val.get('mag_calibrated') is not None and not np.isnan(det_val['mag_calibrated']):
+                                        det_parts.append(f"Calibrated: {det_val['mag_calibrated']:.2f}")
+                                    if det_val.get('mag_inst') is not None and not np.isnan(det_val['mag_inst']):
+                                        det_parts.append(f"Instrumental: {det_val['mag_inst']:.2f}")
+                                    if det_parts:
+                                        line += f"  • Detection Limit (@SNR={det_val.get('snr', 3.0):.1f}): " + " | ".join(det_parts) + "\n"
+                                if shift_val:
+                                    line += f"  • Shift Analysis: Matched {shift_val['count']} stars\n"
+                                    line += f"    Median Shift: dX = {shift_val['med_dx']:+.2f} px, dY = {shift_val['med_dy']:+.2f} px\n"
+                                    line += f"    Arcsec Shift: dRA = {shift_val['med_dra']:+.2f}\", dDec = {shift_val['med_ddec']:+.2f}\"\n"
+                                else:
+                                    if not config_run.get('run_shift_analysis'):
+                                        line += "  • Shift Analysis: Disabled in Pipeline Configuration.\n"
                                     else:
-                                        vars_dict['color_v_csv'][0].set(csv_path)
-                                        last_zp_v = zp_val
-                                elif len(res) == 2:
-                                    csv_path, filt = res
-                                    f_upper = str(filt).upper()
-                                    if 'B' in f_upper: vars_dict['color_b_csv'][0].set(csv_path)
-                                    else: vars_dict['color_v_csv'][0].set(csv_path)
+                                        line += "  • Shift Analysis: No matching catalog stars found (verify FITS has valid WCS).\n"
+                                summary_lines.append(line)
+                            
+                            full_summary = f"Pipeline execution completed successfully on {len(results)} file(s).\n\n"
+                            full_summary += "\n".join(summary_lines)
+                            root.after(0, lambda: update_pipeline_results_display(full_summary))
                             
                             # Update GUI with latest calculated ZPs
                             if last_zp_v is not None:
@@ -424,7 +967,7 @@ def run_config_gui(pipeline_callback=None):
                 print("No pipeline callback provided.")
                 
         except ValueError as e:
-            messagebox.showerror("Input Error", "Please ensure all numerical fields contain valid numbers.")
+            messagebox.showerror("Input Error", f"Please ensure all numerical fields contain valid numbers.\n\nDetail: {e}")
 
     def on_run_color():
         bc, vc = get_checked_b_v_counts()
@@ -840,6 +1383,10 @@ def run_config_gui(pipeline_callback=None):
 
     ttk.Button(toolbar_frame, text="Load Files...", command=on_load_files).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Load Directory...", command=on_load_dir).pack(side=tk.LEFT, padx=5)
+    
+    open_viewer_btn = tk.Button(toolbar_frame, text="🔍 Open in FITS Viewer", command=on_open_viewer_button,
+                                bg="#1a3a5f", fg="white", font=("Arial", 9, "bold"), padx=10, relief="flat")
+    open_viewer_btn.pack(side=tk.LEFT, padx=10)
     ttk.Button(toolbar_frame, text="Check All", command=on_check_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Uncheck All", command=on_uncheck_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Remove Checked/Selected", command=on_remove_selected).pack(side=tk.LEFT, padx=5)
@@ -874,14 +1421,26 @@ def run_config_gui(pipeline_callback=None):
         "size": ("Size", 70)
     }
     
+    # Symmetrical grid layout in left_side to support both scrollbars
+    left_side.grid_rowconfigure(0, weight=1)
+    left_side.grid_columnconfigure(0, weight=1)
+    
     for col, (text, width) in column_configs.items():
         tree.heading(col, text=text)
-        tree.column(col, width=width, anchor=tk.CENTER)
+        tree.column(col, width=width, anchor=tk.CENTER, stretch=False)
     
+    tree.grid(row=0, column=0, sticky="nsew")
+    
+    # Vertical scrollbar
     ts_vsb = ttk.Scrollbar(left_side, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=ts_vsb.set)
-    tree.pack(side=tk.LEFT, fill="both", expand=True)
-    ts_vsb.pack(side=tk.RIGHT, fill="y")
+    ts_vsb.grid(row=0, column=1, sticky="ns")
+    
+    # Horizontal scrollbar (allows scrolling rather than squishing column widths)
+    ts_hsb = ttk.Scrollbar(left_side, orient="horizontal", command=tree.xview)
+    tree.configure(xscrollcommand=ts_hsb.set)
+    ts_hsb.grid(row=1, column=0, sticky="ew")
+    
     add_treeview_copy_menu(tree)
     
     # Right side: Header Viewer
@@ -944,169 +1503,6 @@ def run_config_gui(pipeline_callback=None):
                     tree.item(iid, values=vals)
 
     tree.bind("<ButtonRelease-1>", on_tree_click)
-    
-    def on_double_click(event):
-        item = tree.identify_row(event.y)
-        if not item: return
-        try:
-            from photometry.fits_viewer import FITSViewer
-            ref_cat = vars_dict["reference_catalog"][0].get() if "reference_catalog" in vars_dict else "ATLAS"
-            idx = int(item)
-            file_path = loaded_files[idx]['path']
-            filt = loaded_files[idx]['filter'].upper()
-            b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
-            
-            if b_key in filt:
-                def_zp = float(vars_dict["default_zp_b"][0].get()) if "default_zp_b" in vars_dict else 23.399
-            else:
-                def_zp = float(vars_dict["default_zp_v"][0].get()) if "default_zp_v" in vars_dict else 23.399
-            
-            if os.path.exists(file_path):
-                # 1. Gather aperture/annulus configuration
-                viewer_config = {
-                    'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
-                    'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
-                    'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
-                    'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
-                    'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
-                    'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
-                    'annulus_width': float(vars_dict["annulus_width"][0].get()),
-                }
-                
-                # 2. Gather INITIAL STARS from Light Curves tab
-                initial_stars = {'variable': None, 'check': None, 'refs': []}
-                
-                # Target
-                t_mode = vars_dict["ts_target_mode"][0].get()
-                t_name = vars_dict["ts_target_name"][0].get().strip()
-                if t_mode == "name" and t_name:
-                    try:
-                        c = SkyCoord.from_name(t_name)
-                        initial_stars['variable'] = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': t_name}
-                    except: pass
-                elif t_mode == "manual":
-                    try:
-                        c = SkyCoord(vars_dict["ts_target_ra"][0].get(), vars_dict["ts_target_dec"][0].get(), unit=(u.hourangle, u.deg))
-                        initial_stars['variable'] = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': t_name or "Target"}
-                    except: pass
-                
-                # Refs & Check
-                cs_idx = ts_check_star_idx_var.get()
-                for i in range(5):
-                    name = vars_dict[f"ts_ref_{i}_name"][0].get().strip()
-                    if vars_dict[f"ts_ref_{i}_has_manual"][0].get():
-                        ra = vars_dict[f"ts_ref_{i}_ra"][0].get()
-                        dec = vars_dict[f"ts_ref_{i}_dec"][0].get()
-                        s_data = {'ra': ra, 'dec': dec, 'name': name or f"Star_{i+1}"}
-                        if i == cs_idx: initial_stars['check'] = s_data
-                        elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
-                    elif name:
-                        try:
-                            c = SkyCoord.from_name(name)
-                            s_data = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': name}
-                            if i == cs_idx: initial_stars['check'] = s_data
-                            elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
-                        except: pass
-
-                # 3. Define EXPORT Callbacks
-                def update_light_curve_stars(data):
-                    # ... (existing logic)
-                    if data['variable']:
-                        v = data['variable']
-                        vars_dict["ts_target_mode"][0].set("manual")
-                        vars_dict["ts_target_name"][0].set(v['name'])
-                        c = SkyCoord(v['ra'], v['dec'], unit=u.deg)
-                        vars_dict["ts_target_ra"][0].set(c.ra.to_string(unit='hour', sep=':', precision=2))
-                        vars_dict["ts_target_dec"][0].set(c.dec.to_string(unit='degree', sep=':', precision=2, alwayssign=True))
-                        
-                        # Use exported mag/bv if available to skip re-fetch
-                        if v.get('mag') is not None: vars_dict["ts_target_mag"][0].set(v['mag'])
-                        if v.get('bv') is not None: vars_dict["ts_target_bv"][0].set(v['bv'])
-                    
-                    # Check & Refs
-                    slots_filled = 0
-                    if data['check']:
-                        c = data['check']
-                        vars_dict["ts_ref_0_name"][0].set(c['name'])
-                        vars_dict["ts_ref_0_ra"][0].set(c['ra'])
-                        vars_dict["ts_ref_0_dec"][0].set(c['dec'])
-                        vars_dict["ts_ref_0_has_manual"][0].set(True)
-                        vars_dict["ts_ref_0_use"][0].set(False)
-                        ts_check_star_idx_var.set(0)
-                        
-                        if c.get('mag') is not None: vars_dict["ts_ref_0_mag"][0].set(c['mag'])
-                        if c.get('bv') is not None: vars_dict["ts_ref_0_bv"][0].set(c['bv'])
-                        slots_filled = 1
-                    else:
-                        ts_check_star_idx_var.set(-1)
-                    
-                    current_idx = slots_filled
-                    for r in data['refs']:
-                        if current_idx >= 5: break
-                        vars_dict[f"ts_ref_{current_idx}_name"][0].set(r['name'])
-                        vars_dict[f"ts_ref_{current_idx}_ra"][0].set(r['ra'])
-                        vars_dict[f"ts_ref_{current_idx}_dec"][0].set(r['dec'])
-                        vars_dict[f"ts_ref_{current_idx}_has_manual"][0].set(True)
-                        vars_dict[f"ts_ref_{current_idx}_use"][0].set(True)
-                        
-                        if r.get('mag') is not None: vars_dict[f"ts_ref_{current_idx}_mag"][0].set(r['mag'])
-                        if r.get('bv') is not None: vars_dict[f"ts_ref_{current_idx}_bv"][0].set(r['bv'])
-                        current_idx += 1
-                    
-                    for idx in range(current_idx, 5):
-                        vars_dict[f"ts_ref_{idx}_name"][0].set("")
-                        vars_dict[f"ts_ref_{idx}_has_manual"][0].set(False)
-                        vars_dict[f"ts_ref_{idx}_use"][0].set(False)
-                        if f"ts_ref_{idx}_coord_label" in vars_dict:
-                            vars_dict[f"ts_ref_{idx}_coord_label"][0].set("")
-                    
-                    # TRIGGER AUTO-FETCH (Only if data is missing)
-                    def trigger_fetch_if_needed():
-                        # Target
-                        if data['variable'] and data['variable'].get('mag') is None:
-                            if 'ts_target_fetch_func' in vars_dict:
-                                root.after(100, vars_dict['ts_target_fetch_func'])
-                        
-                        # Refs
-                        if 'ts_ref_fetch_funcs' in vars_dict:
-                            # Check
-                            if data['check'] and data['check'].get('mag') is None:
-                                if 0 in vars_dict['ts_ref_fetch_funcs']:
-                                    root.after(200, vars_dict['ts_ref_fetch_funcs'][0])
-                            
-                            # Ensemble Refs
-                            for i in range(slots_filled, current_idx):
-                                if i in vars_dict['ts_ref_fetch_funcs'] and data['refs'][i-slots_filled].get('mag') is None:
-                                    root.after(i*300, vars_dict['ts_ref_fetch_funcs'][i])
-                                    
-                    root.after(500, trigger_fetch_if_needed)
-                    
-                    # Autosave session to disk (Fix)
-                    save_session()
-
-                def update_apertures(ap_data):
-                    vars_dict["aperture_radius"][0].set(ap_data['aperture'])
-                    vars_dict["annulus_inner"][0].set(ap_data['annulus_in'])
-                    vars_dict["annulus_outer"][0].set(ap_data['annulus_out'])
-                    ts_status_var.set("Aperture settings updated from FITS Viewer.")
-                    
-                    # Autosave session to disk (Fix)
-                    save_session()
-
-                # Pass the AAVSO cache if available
-                aavso_cache = getattr(on_get_aavso_refs, 'cache', None)
-                
-                viewer_win = tk.Toplevel(root)
-                FITSViewer(viewer_win, file_path, ref_catalog=ref_cat, default_zp=def_zp, 
-                           config=viewer_config, initial_stars=initial_stars, 
-                           aavso_stars=aavso_cache,
-                           export_callback=update_light_curve_stars,
-                           aperture_export_callback=update_apertures)
-            else:
-                messagebox.showerror("Error", f"File not found: {file_path}")
-        except Exception as e:
-            print(f"Error opening viewer: {e}")
-
     tree.bind("<Double-1>", on_double_click)
     
     file_manager_status = tk.StringVar(value="No files loaded.")
@@ -1122,14 +1518,43 @@ def run_config_gui(pipeline_callback=None):
     tab_pre_outer = ttk.Frame(content_container)
     tab_pre_outer.grid(row=0, column=0, sticky="nsew")
     
-    pre_scroll = ScrollableFrame(tab_pre_outer)
-    pre_scroll.pack(fill="both", expand=True)
-    tab_pre = pre_scroll.scrollable_frame
+    # Elegant sub-notebook for organized tab-within-tab pre-processing layout
+    pre_notebook = ttk.Notebook(tab_pre_outer)
+    pre_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    sub_calib_scroll = ScrollableFrame(pre_notebook)
+    tab_pre_left = sub_calib_scroll.scrollable_frame
+    
+    sub_solve_scroll = ScrollableFrame(pre_notebook)
+    tab_pre_right = sub_solve_scroll.scrollable_frame
+    
+    pre_notebook.add(sub_calib_scroll, text="🧪  FITS Calibration")
+    pre_notebook.add(sub_solve_scroll, text="🧭  WCS Plate Solving")
+    
+    tab_pre = tab_pre_left
 
     # --- TAB 3: Analysis & Calibration (Unified) ---
-    tab_analysis_scroll = ScrollableFrame(content_container)
-    tab_analysis = tab_analysis_scroll.scrollable_frame
-    tab_analysis_scroll.grid(row=0, column=0, sticky="nsew")
+    tab_analysis_outer = ttk.Frame(content_container)
+    tab_analysis_outer.grid(row=0, column=0, sticky="nsew")
+    
+    # Elegant sub-notebook for organized tab-within-tab analysis layout
+    analysis_notebook = ttk.Notebook(tab_analysis_outer)
+    analysis_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    sub_detect_scroll = ScrollableFrame(analysis_notebook)
+    sub_detect = sub_detect_scroll.scrollable_frame
+    
+    sub_color_scroll = ScrollableFrame(analysis_notebook)
+    sub_color = sub_color_scroll.scrollable_frame
+    
+    sub_diff_scroll = ScrollableFrame(analysis_notebook)
+    sub_diff = sub_diff_scroll.scrollable_frame
+    
+    analysis_notebook.add(sub_detect_scroll, text="🌌  1. Detection & Zero-Point")
+    analysis_notebook.add(sub_color_scroll, text="🌈  2. Color Coefficients")
+    analysis_notebook.add(sub_diff_scroll, text="📊  3. Differential Photometry")
+    
+    tab_analysis = sub_detect
     
 
     # --- TAB 4: Light Curves ---
@@ -1144,13 +1569,24 @@ def run_config_gui(pipeline_callback=None):
     tab_settings_outer = ttk.Frame(content_container)
     tab_settings_outer.grid(row=0, column=0, sticky="nsew")
     
-    settings_scroll = ScrollableFrame(tab_settings_outer)
-    settings_scroll.pack(fill="both", expand=True)
-    tab_settings = settings_scroll.scrollable_frame
+    # Elegant sub-notebook for organized tab-within-tab settings layout
+    settings_notebook = ttk.Notebook(tab_settings_outer)
+    settings_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    sub_astro_scroll = ScrollableFrame(settings_notebook)
+    sub_astro = sub_astro_scroll.scrollable_frame
+    sub_phot_scroll = ScrollableFrame(settings_notebook)
+    sub_phot = sub_phot_scroll.scrollable_frame
+    sub_ops_scroll = ScrollableFrame(settings_notebook)
+    sub_ops = sub_ops_scroll.scrollable_frame
+    
+    settings_notebook.add(sub_astro_scroll, text="🌌 Astro & Catalog")
+    settings_notebook.add(sub_phot_scroll, text="📷 Camera & Photometry")
+    settings_notebook.add(sub_ops_scroll, text="👤 Operator & Session")
     
     # --- TAB 5: Settings CONTENT ---
     # Session Management - MOVED TO TOP
-    lf_session = tk.LabelFrame(tab_settings, text="Session Management")
+    lf_session = tk.LabelFrame(sub_ops, text="Session Management")
     lf_session.pack(fill="x", padx=10, pady=10)
     
     ttk.Button(lf_session, text="Save Session", command=save_session).grid(row=0, column=0, padx=10, pady=5)
@@ -1159,7 +1595,7 @@ def run_config_gui(pipeline_callback=None):
               fg="#555", font=("Arial", 8, "italic")).grid(row=0, column=2, padx=10)
 
     # Files & Catalog (from old TAB 1) - MOVED UP
-    lf_files = tk.LabelFrame(tab_settings, text="Reference Catalog Selection")
+    lf_files = tk.LabelFrame(sub_astro, text="Reference Catalog Selection")
     lf_files.pack(fill="x", padx=10, pady=10)
     
     tk.Label(lf_files, text="Ref Catalog:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
@@ -1177,7 +1613,7 @@ def run_config_gui(pipeline_callback=None):
     ttk.Button(lf_files, text="Browse...", command=browse_catalog).grid(row=0, column=2, padx=5)
 
     # Filter Keyword Mapping
-    lf_map = tk.LabelFrame(tab_settings, text="Filter Keyword Mapping")
+    lf_map = tk.LabelFrame(sub_astro, text="Filter Keyword Mapping")
     lf_map.pack(fill="x", padx=10, pady=10)
     tk.Label(lf_map, text="Define keywords in your FITS headers that identify the B and V filters.", 
               fg="#555", font=("Arial", 8, "italic")).grid(row=0, column=0, columnspan=4, padx=10, pady=(0, 10))
@@ -1185,7 +1621,7 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_map, "V-Filter Keyword:", "filter_v_keyword", "Vmag", 1, col_offset=1, vtype=str)
 
     # Region Selection (from old TAB 1)
-    lf_filt = tk.LabelFrame(tab_settings, text="Region Selection")
+    lf_filt = tk.LabelFrame(sub_astro, text="Region Selection")
     lf_filt.pack(fill="x", padx=10, pady=10)
     add_dropdown(lf_filt, "Region:", "filter_mode", ["all", "xy", "radec"], "all", 0)
     
@@ -1284,19 +1720,24 @@ def run_config_gui(pipeline_callback=None):
 
         threading.Thread(target=cal_thread, daemon=True).start()
 
-    run_cal_btn = tk.Button(tab_pre, text="Run Calibration (Bias/Flat) on Selected", command=on_run_calibration,
+    cal_btn_frame = ttk.Frame(tab_pre)
+    cal_btn_frame.pack(pady=(10, 20))
+    
+    run_cal_btn = tk.Button(cal_btn_frame, text="Run Calibration (Bias/Flat) on Selected", command=on_run_calibration,
                             bg="#388e3c", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
-    run_cal_btn.pack(pady=(10, 20))
-
-    ttk.Separator(tab_pre, orient='horizontal').pack(fill='x', padx=20, pady=10)
+    run_cal_btn.pack(side=tk.LEFT, padx=5)
+    
+    cal_info_btn = tk.Button(cal_btn_frame, text="❓ What does this do?", command=show_calibration_info,
+                             bg="#f0f2f5", fg="#388e3c", font=("Arial", 11, "bold"), pady=10, padx=15)
+    cal_info_btn.pack(side=tk.LEFT, padx=5)
 
     # 2. Plate Solving (ASTAP)
-    lf_plate_info = tk.LabelFrame(tab_pre, text="Plate Solving (ASTAP Integration)")
+    lf_plate_info = tk.LabelFrame(tab_pre_right, text="Plate Solving (ASTAP Integration)")
     lf_plate_info.pack(fill="x", padx=10, pady=10)
     
     tk.Label(lf_plate_info, text="Automatically solve FITS coordinates using ASTAP command-line solver.\nSolved files will be updated in the File Manager with a '_wcs' suffix.", justify=tk.LEFT).pack(padx=10, pady=10)
 
-    lf_plate_settings = tk.LabelFrame(tab_pre, text="Solver Settings")
+    lf_plate_settings = tk.LabelFrame(tab_pre_right, text="Solver Settings")
     lf_plate_settings.pack(fill="x", padx=10, pady=10)
     
     add_entry(lf_plate_settings, "Output Suffix:", "plate_suffix", "wcs", 0, col_offset=0, vtype=str)
@@ -1317,7 +1758,7 @@ def run_config_gui(pipeline_callback=None):
     add_check(lf_plate_settings, "Annotate Image", "plate_annotate", False, 2)
 
     plate_status_var = tk.StringVar(value="Ready")
-    plate_status_label = SelectableLabel(tab_pre, textvariable=plate_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    plate_status_label = SelectableLabel(tab_pre_right, textvariable=plate_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
     plate_status_label.pack(pady=5, fill="x")
 
     def on_run_plate_solve():
@@ -1406,9 +1847,16 @@ def run_config_gui(pipeline_callback=None):
 
         threading.Thread(target=plate_thread, daemon=True).start()
 
-    run_plate_btn = tk.Button(tab_pre, text="Run Plate Solver on Selected", command=on_run_plate_solve,
+    plate_btn_frame = ttk.Frame(tab_pre_right)
+    plate_btn_frame.pack(pady=20)
+    
+    run_plate_btn = tk.Button(plate_btn_frame, text="Run Plate Solver on Selected", command=on_run_plate_solve,
                                bg="#0288d1", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
-    run_plate_btn.pack(pady=20)
+    run_plate_btn.pack(side=tk.LEFT, padx=5)
+    
+    plate_info_btn = tk.Button(plate_btn_frame, text="❓ What does this do?", command=show_plate_solve_info,
+                               bg="#f0f2f5", fg="#0288d1", font=("Arial", 11, "bold"), pady=10, padx=15)
+    plate_info_btn.pack(side=tk.LEFT, padx=5)
 
 
 
@@ -1422,19 +1870,48 @@ def run_config_gui(pipeline_callback=None):
     add_check(lf_pipe_cfg, "Perform Zero-Point Calibration", "run_new_calibration", True, 0, col_offset=1)
     add_check(lf_pipe_cfg, "Run Positional Shift Analysis", "run_shift_analysis", False, 1, col_offset=0)
     
-    tk.Label(lf_pipe_cfg, text="* Tip: Disable 'ZP Calibration' if using pre-calibrated magnitudes.", fg="#555", font=("Arial", 8, "italic")).grid(row=1, column=1, sticky=tk.W, padx=10)
+    tk.Label(lf_pipe_cfg, text="* Tip: Disable 'ZP Calibration' if using pre-calibrated magnitudes.", fg="#555", font=("Arial", 8, "italic")).grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(2, 5))
 
-    # Analysis & Calibration Run Button
-    run_btn = tk.Button(tab_analysis, text="Run Analysis Pipeline on Selected", command=on_run, 
+    # Analysis & Calibration Run Button with Premium Info Pop-up
+    run_btn_frame = ttk.Frame(tab_analysis)
+    run_btn_frame.pack(pady=15)
+
+    run_btn = tk.Button(run_btn_frame, text="Run Analysis Pipeline on Selected", command=on_run, 
                         bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), 
-                        width=40, relief="flat", pady=10)
-    run_btn.pack(pady=15)
+                        width=35, relief="flat", pady=10)
+    run_btn.pack(side=tk.LEFT, padx=5)
 
-    # --- Color & Differential Section ---
-    ttk.Separator(tab_analysis, orient='horizontal').pack(fill='x', padx=20, pady=15)
+    info_btn = tk.Button(run_btn_frame, text="❓ What does this do?", command=show_pipeline_info,
+                         bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
+                         relief="flat", pady=10, padx=15)
+    info_btn.pack(side=tk.LEFT, padx=5)
+
+    # 2. Pipeline Run Results Summary Panel (Multiline & Monospaced)
+    lf_pipeline_results = tk.LabelFrame(tab_analysis, text="Last Pipeline Run Results Summary")
+    lf_pipeline_results.pack(fill="x", padx=10, pady=10)
     
+    pipeline_results_text = scrolledtext.ScrolledText(lf_pipeline_results, font=("Consolas", 9), bg="#f8f9fa", fg="#1a3a5f",
+                                                      height=9, wrap=tk.WORD, relief="flat", borderwidth=0, highlightthickness=0)
+    pipeline_results_text.pack(fill="both", expand=True, padx=15, pady=10)
+    
+    def update_pipeline_results_display(text_content):
+        pipeline_results_text.config(state=tk.NORMAL)
+        pipeline_results_text.delete("1.0", tk.END)
+        pipeline_results_text.insert(tk.END, text_content)
+        pipeline_results_text.config(state=tk.DISABLED)
+        
+    update_pipeline_results_display("No analysis run yet in this session. Click 'Run Analysis Pipeline on Selected' to begin.")
+
+    # 3. Live Pipeline Console Output Panel (Premium Black Terminal Style)
+    lf_pipeline_terminal = tk.LabelFrame(tab_analysis, text="Live Pipeline Console Output")
+    lf_pipeline_terminal.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    pipeline_terminal = scrolledtext.ScrolledText(lf_pipeline_terminal, font=("Consolas", 8), bg="#1e1e1e", fg="#d4d4d4", height=16)
+    pipeline_terminal.pack(fill="both", expand=True, padx=5, pady=5)
+    add_copy_context_menu(pipeline_terminal)
+
     # 2. Color Transformation Section
-    lf_color = tk.LabelFrame(tab_analysis, text="Color Transformation Analysis (B-V Pairs)")
+    lf_color = tk.LabelFrame(sub_color, text="Color Transformation Analysis (B-V Pairs)")
     lf_color.pack(fill="x", padx=10, pady=10)
     
     import glob
@@ -1465,15 +1942,23 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(lf_color, text="* 1.0 used if FITS values not found. To override FITS airmass values, check the box below and enter new values.", fg="#555", font=("Arial", 8, "italic")).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
     ttk.Checkbutton(lf_color, text="Override FITS Airmass", variable=override_airmass_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
 
-    tk.Button(tab_analysis, text="Run Color Transformation Analysis", command=on_run_color,
-              bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(pady=5)
+    color_btn_frame = ttk.Frame(sub_color)
+    color_btn_frame.pack(pady=5)
+    
+    tk.Button(color_btn_frame, text="Run Color Transformation Analysis", command=on_run_color,
+              bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(side=tk.LEFT, padx=5)
+              
+    color_info_btn = tk.Button(color_btn_frame, text="❓ What does this do?", command=show_color_info,
+                               bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
+                               relief="flat", pady=10, padx=15)
+    color_info_btn.pack(side=tk.LEFT, padx=5)
 
     color_status_var = tk.StringVar(value="Ready")
-    color_status_label = SelectableLabel(tab_analysis, textvariable=color_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    color_status_label = SelectableLabel(sub_color, textvariable=color_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
     color_status_label.pack(pady=5, fill="x")
 
     # Preview for Color Transformation
-    lf_color_preview = tk.LabelFrame(tab_analysis, text="Color Transformation Preview")
+    lf_color_preview = tk.LabelFrame(sub_color, text="Color Transformation Preview")
     lf_color_preview.pack(fill="x", padx=10, pady=5)
     
     color_coeff_fig, color_coeff_axes = plt.subplots(1, 3, figsize=(10, 3.5))
@@ -1497,7 +1982,7 @@ def run_config_gui(pipeline_callback=None):
         return b_count, v_count
 
     # --- Differential Photometry Section ---
-    lf_diff = tk.LabelFrame(tab_analysis, text="2. Compute B/V relative to a reference star")
+    lf_diff = tk.LabelFrame(sub_diff, text="2. Compute B/V relative to a reference star")
     lf_diff.pack(fill="x", padx=10, pady=10)
     
     add_file_selector(lf_diff, "B-Filter Results (CSV):", "diff_b_csv", recent_b_csv, 0, initial_dir="photometry_output")
@@ -1522,7 +2007,7 @@ def run_config_gui(pipeline_callback=None):
     
     diff_status_var = tk.StringVar(value="Load coefficients and select CSV files to begin.")
     
-    lf_ref = tk.LabelFrame(tab_analysis, text="Reference Star Selection")
+    lf_ref = tk.LabelFrame(sub_diff, text="Reference Star Selection")
     lf_ref.pack(fill="x", padx=10, pady=10)
     
     ref_mode_var = tk.StringVar(value="auto")
@@ -1615,7 +2100,7 @@ def run_config_gui(pipeline_callback=None):
     ref_mode_var.trace("w", toggle_ref_entries)
     toggle_ref_entries()
 
-    lf_target = tk.LabelFrame(tab_analysis, text="Target Star Selection")
+    lf_target = tk.LabelFrame(sub_diff, text="Target Star Selection")
     lf_target.pack(fill="x", padx=10, pady=10)
     
     target_mode_var = tk.StringVar(value="all")
@@ -1720,14 +2205,22 @@ def run_config_gui(pipeline_callback=None):
             
     tk.Button(lf_diff, text="Load Last Coefficients", command=load_color_coefficients, bg="#f0f2f5", relief="flat").grid(row=5, column=0, columnspan=2, pady=5)
             
-    tk.Button(tab_analysis, text="Execute Differential Photometry", command=on_run_diff,
-              bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(pady=5)
+    diff_btn_frame = ttk.Frame(sub_diff)
+    diff_btn_frame.pack(pady=5)
+    
+    tk.Button(diff_btn_frame, text="Execute Differential Photometry", command=on_run_diff,
+              bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(side=tk.LEFT, padx=5)
+              
+    diff_info_btn = tk.Button(diff_btn_frame, text="❓ What does this do?", command=show_diff_info,
+                              bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
+                              relief="flat", pady=10, padx=15)
+    diff_info_btn.pack(side=tk.LEFT, padx=5)
 
-    diff_status_label = SelectableLabel(tab_analysis, textvariable=diff_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    diff_status_label = SelectableLabel(sub_diff, textvariable=diff_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
     diff_status_label.pack(pady=5, fill="x")
 
     # Preview for Accuracy
-    lf_accuracy_preview = tk.LabelFrame(tab_analysis, text="Accuracy Evaluation Preview")
+    lf_accuracy_preview = tk.LabelFrame(sub_diff, text="Accuracy Evaluation Preview")
     lf_accuracy_preview.pack(fill="x", padx=10, pady=5)
     
     accuracy_fig, accuracy_axes = plt.subplots(1, 3, figsize=(10, 3.5))
@@ -2612,6 +3105,10 @@ def run_config_gui(pipeline_callback=None):
                            bg="#00796b", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
     run_ts_btn.pack(side=tk.LEFT, padx=10)
 
+    ts_open_viewer_btn = tk.Button(ts_btn_frame, text="🔍 Open Selected FITS in Viewer", command=on_open_viewer_button,
+                                   bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, padx=15)
+    ts_open_viewer_btn.pack(side=tk.LEFT, padx=10)
+
     clear_cache_btn = tk.Button(ts_btn_frame, text="Clear Photometry Cache", command=on_clear_cache,
                                 bg="#f57c00", fg="white", font=("Arial", 9), pady=10)
     clear_cache_btn.pack(side=tk.LEFT, padx=10)
@@ -2623,6 +3120,10 @@ def run_config_gui(pipeline_callback=None):
     reset_ens_btn = tk.Button(ts_btn_frame, text="Reset Ensemble", command=on_reset_ensemble,
                               bg="#757575", fg="white", font=("Arial", 9), pady=10)
     reset_ens_btn.pack(side=tk.LEFT, padx=10)
+
+    ts_info_btn = tk.Button(ts_btn_frame, text="❓ What does this do?", command=show_lightcurve_info,
+                            bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15)
+    ts_info_btn.pack(side=tk.LEFT, padx=10)
 
     # 5. Graph
     lf_ts_plot.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2659,7 +3160,7 @@ def run_config_gui(pipeline_callback=None):
     # --- END TAB 6 ---
 
     # Camera Settings (from old TAB 2)
-    lf_ccd = tk.LabelFrame(tab_settings, text="CCD Settings (Error Analysis)")
+    lf_ccd = tk.LabelFrame(sub_phot, text="CCD Settings (Error Analysis)")
     lf_ccd.pack(fill="x", padx=10, pady=10)
     add_entry(lf_ccd, "Gain (e-/ADU):", "ccd_gain", 1.27, 0)
     add_entry(lf_ccd, "Read Noise (e-):", "ccd_read_noise", 3.3, 1)
@@ -2667,7 +3168,7 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_ccd, "Saturation Limit (ADU):", "saturation_limit", 63000, 3, vtype=int)
 
     # Detection (from old TAB 2)
-    lf_det = tk.LabelFrame(tab_settings, text="Detection (DAOStarFinder)")
+    lf_det = tk.LabelFrame(sub_phot, text="Detection (DAOStarFinder)")
     lf_det.pack(fill="x", padx=10, pady=10)
     add_entry(lf_det, "Detection Sigma:", "detect_sigma", 5.0, 0)
     add_entry(lf_det, "Sharpness Low:", "dao_sharplo", 0.2, 1, col_offset=0)
@@ -2677,7 +3178,7 @@ def run_config_gui(pipeline_callback=None):
 
 
     # Aperture Photometry (from old TAB 3)
-    lf_ap = tk.LabelFrame(tab_settings, text="Aperture Photometry")
+    lf_ap = tk.LabelFrame(sub_phot, text="Aperture Photometry")
     lf_ap.pack(fill="x", padx=10, pady=10)
     add_entry(lf_ap, "PSF Box Size (px):", "box_size", 15, 0, vtype=int)
     
@@ -2693,7 +3194,7 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_ap, "Fixed Annulus Outer (px):", "annulus_outer", 13.0, 8)
 
     # Zero Point Calibration (from old TAB 3)
-    lf_cal = tk.LabelFrame(tab_settings, text="Zero Point Calibration")
+    lf_cal = tk.LabelFrame(sub_phot, text="Zero Point Calibration")
     lf_cal.pack(fill="x", padx=10, pady=10)
     add_entry(lf_cal, "Match Tolerance (arcsec):", "match_tolerance_arcsec", 8.0, 0)
     add_entry(lf_cal, "Default Zero Point (V):", "default_zp_v", 24.0, 1, col_offset=0)
@@ -2703,20 +3204,20 @@ def run_config_gui(pipeline_callback=None):
     # Checkboxes moved to Pipeline Configuration section.
 
     # Global Extinction (Shared)
-    lf_ext = tk.LabelFrame(tab_settings, text="Atmospheric Extinction (Global)")
+    lf_ext = tk.LabelFrame(sub_astro, text="Atmospheric Extinction (Global)")
     lf_ext.pack(fill="x", padx=10, pady=10)
     add_entry(lf_ext, "k_V (Visual):", "extinction_kv", 0.20, 0)
     add_entry(lf_ext, "k_B (Blue):", "extinction_kb", 0.35, 1)
 
     # Observer Information (Global)
-    lf_obs = tk.LabelFrame(tab_settings, text="Observer Information")
+    lf_obs = tk.LabelFrame(sub_ops, text="Observer Information")
     lf_obs.pack(fill="x", padx=10, pady=10)
     add_entry(lf_obs, "AAVSO Observer Code (4 chars):", "aavso_obs_code", "XXXX", 0, vtype=str)
     add_entry(lf_obs, "Observer Name (Report Header):", "observer_name", "Calibra User", 1, vtype=str)
 
 
     # Output Toggles (from old TAB 4)
-    lf_out = tk.LabelFrame(tab_settings, text="Console & Plot Toggles")
+    lf_out = tk.LabelFrame(sub_ops, text="Console & Plot Toggles")
     lf_out.pack(fill="x", padx=10, pady=10)
     add_check(lf_out, "Print Detailed Calibration to Console", "print_detailed_calibration", False, 0)
     add_check(lf_out, "Print Massive Aperture Photometry Table", "print_star_detection_table", False, 1)
@@ -2755,7 +3256,7 @@ def run_config_gui(pipeline_callback=None):
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 3.2 \tLatest Update: 2026-05-17", font=("Arial", 10), bg="white").pack(fill="x")
+    tk.Label(info_frame, text="Version: 4.0 \tLatest Update: 2026-05-17", font=("Arial", 10), bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
     desc_text = (
@@ -2835,6 +3336,10 @@ def run_config_gui(pipeline_callback=None):
     # Redirect stdout and stderr
     sys.stdout = StdoutRedirector(console)
     sys.stderr = StdoutRedirector(console)
+    
+    # Register tab-local console output to redirector
+    sys.stdout.add_widget(pipeline_terminal)
+    sys.stderr.add_widget(pipeline_terminal)
 
     # Ensure closing main window closes everything and saves session
     def on_closing():
