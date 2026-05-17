@@ -68,7 +68,7 @@ def run_config_gui(pipeline_callback=None):
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "3.1"
+    APP_VERSION = "3.2"
     root = tk.Tk()
     root.title(f"Calibra v{APP_VERSION}")
     root.geometry("1100x750")
@@ -2412,7 +2412,7 @@ def run_config_gui(pipeline_callback=None):
                 
                 # Construct observation notes (Ensemble details)
                 ens_names = " ".join([s['name'] for s in resolved_ensemble])
-                report_notes = f"Ensemble of {len(resolved_ensemble)}: {ens_names}"
+                report_notes = f"Ensemble of {len(resolved_ensemble)}- {ens_names}"
                 
                 save_aavso_report(results, out_aavso, ts_target_name_var.get(), ts_filter_var.get(), ts_obs_var.get(),
                                   comp_name=comp_name, comp_mag=comp_mag, 
@@ -2668,15 +2668,15 @@ def run_config_gui(pipeline_callback=None):
         lbl_logo.pack(pady=(0, 5))
     except Exception as e:
         # Fallback if PIL is missing or file not found
-        tk.Label(about_container, text="[ CALIBRA ]", font=("Arial", 24, "bold"), fg=primary_blue).pack(pady=(0, 20))
+        tk.Label(about_container, text="[ CALIBRA ]", font=("Arial", 24, "bold"), fg=primary_blue, bg="white").pack(pady=(0, 20))
     
-    tk.Label(about_container, text="Calibra: An automated photometric analysis & calibration toolkit", font=("Arial", 16, "bold"), fg=primary_blue).pack(fill="x")
+    tk.Label(about_container, text="Calibra: An automated photometric analysis & calibration toolkit", font=("Arial", 16, "bold"), fg=primary_blue, bg="white").pack(fill="x")
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 3.1 \tLatest Update: 2026-05-13", font=("Arial", 10)).pack(fill="x")
+    tk.Label(info_frame, text="Version: 3.2 \tLatest Update: 2026-05-17", font=("Arial", 10), bg="white").pack(fill="x")
     
-    tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), fg=primary_blue).pack(fill="x", pady=(10, 5))
+    tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
     desc_text = (
         "Calibra uses star detection, sub-pixel PSF fitting, aperture photometry, \n"
         "zero-point calibration, and offers determination of color transformations between filters. \n"
@@ -2685,7 +2685,7 @@ def run_config_gui(pipeline_callback=None):
         "\n"
         "Finally, Calibra can produce light curves for variable stars from a series of images and create AAVSO-formatted text files.\n"
     )
-    tk.Label(about_container, text=desc_text, justify=tk.LEFT, font=("Arial", 10)).pack(fill="x")
+    tk.Label(about_container, text=desc_text, justify=tk.LEFT, font=("Arial", 10), bg="white").pack(fill="x")
 
     # --- TAB 5: Help ---
     tab_help_outer = ttk.Frame(notebook)

@@ -1,6 +1,6 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 3.1 — 2026-05-13
+**Version:** 3.2 — 2026-05-17
 **Description:** 
 An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformation coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. Calibra features **Ensemble Differential Photometry** with multiple comparison stars, **Time-Series Light Curve** generation with AAVSO-format reporting, an **Interactive FITS Viewer** with role-based star marking, real-time PSF analysis, and bidirectional synchronization with the photometry pipeline. It integrates **AAVSO VSX** cross-matching to automatically exclude known variable stars from calibration sets.
 
@@ -8,7 +8,14 @@ The code was created with lots of help from Google Antigravity (various agents),
 
 ---
 
-## What's New in v3.1
+## What's New in v3.2
+
+- **AAVSO Extended Format Compliance**: Fully standardized light curve reports meeting strict AAVSO requirements (GROUP, CHART, precision limits, and COMMENTS headers).
+- **Persistent Settings Integration**: AAVSO Observer Code and Observer Name are now persisted globally and synchronized across the software.
+- **AUID & Alias Awareness**: The Light Curve tab and viewer display official AAVSO aliases (AUID) while calculating true fluxes from the underlying catalog magnitudes.
+- **Flexible Color Transformations**: Explicit on/off switches for transformations with automatic #TRANS flag handling.
+
+### Previous: v3.1 (2026-05-13)
 
 - **Interactive FITS Viewer — Role-Based Star Marking**: Right-click any star to assign it as **Variable** (red), **Check** (blue), or **Reference** (green). Markers are persistent with aperture/annulus overlays and are listed in dedicated side panels.
 - **Real-Time Radial Profile Analysis**: Clicking any star instantly displays a PSF radial profile plot with Gaussian fit overlay, aperture boundary, and annulus boundary — enabling immediate visual verification of photometry settings.
@@ -34,7 +41,7 @@ The code was created with lots of help from Google Antigravity (various agents),
     ```
 2.  **Run**:
     ```bash
-    python main.py
+    python calibra.py
     ```
     This launches the **Configuration GUI** where you can set your CCD parameters and file paths. The pipeline supports **Automated Color Calibration**, **Differential Photometry**, and **Time-Series Light Curves** via ATLAS refcat2, APASS DR9, GAIA DR3 and Landolt standard stars.
 
@@ -51,13 +58,13 @@ For a more detailed dive into the mathematical principles, theoretical backgroun
 *   **The Processing Pipeline**: From Star Detection to Shift Analysis and color calibration.
 *   **Differential Photometry**: Computing formal AAVSO-ready magnitudes ($B$, $V$, $B-V$) using reference stars.
 *   **Time-Series & Light Curves**: Ensemble comparison star photometry with formal uncertainty propagation.
-*   **GUI Guide**: The v3.1 Interactive FITS Viewer, FITS File Manager, unified Analysis tab layout, and Plate Solving.
+*   **GUI Guide**: The v3.2 Interactive FITS Viewer, FITS File Manager, unified Analysis tab layout, and Plate Solving.
 
 ---
 
 ## Directory Structure
 - `calibra.py`: The main entry point to launch the GUI.
-- `gui.py`: The v3.1 Configuration GUI (tkinter).
+- `gui.py`: The v3.2 Configuration GUI (tkinter).
 - `photometry/fits_viewer.py`: The interactive FITS Viewer with role-based marking, radial profiles, and aperture controls.
 - `photometry/`: Python modules for photometry, calibration, color terms, differential, time series, and plate solving.
 - `photometry_refstars/`: Reference catalogs and online query cache.
