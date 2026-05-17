@@ -260,6 +260,8 @@ class FITSViewer:
         self.canvas.mpl_connect('motion_notify_event', self.on_hover)
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        self.canvas.mpl_connect('key_press_event', self.on_key)
+        self.canvas.get_tk_widget().bind("<Enter>", lambda e: self.canvas.get_tk_widget().focus_set())
         
         # Load Initial Stars if provided (delayed to ensure UI is ready)
         if self.initial_stars:
@@ -1219,3 +1221,33 @@ class FITSViewer:
         self.ax.set_xlim([event.xdata - new_width * (1 - rel_x), event.xdata + new_width * rel_x])
         self.ax.set_ylim([event.ydata - new_height * (1 - rel_y), event.ydata + new_height * rel_y])
         self.canvas.draw_idle()
+
+    def on_key(self, event):
+        """Handle key press events for fast star role assignment."""
+        if event.inaxes != self.ax:
+            return
+            
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return
+            
+        # Temporarily store the hovered coordinate as the target pos
+        self._last_click_pos = (x, y)
+        key = event.key.lower() if event.key else ""
+        
+        action_taken = False
+        if key == 'v':
+            self._add_variable_star()
+            action_taken = True
+        elif key == 'c':
+            self._add_check_star()
+            action_taken = True
+        elif key == 'r':
+            self._add_on_the_spot_ref()
+            action_taken = True
+        elif key in ['d', 'x', 'delete', 'backspace']:
+            self._remove_marker_at_click()
+            action_taken = True
+            
+        if action_taken:
+            self.canvas.draw()

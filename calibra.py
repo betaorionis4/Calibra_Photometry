@@ -173,11 +173,17 @@ def process_file(fits_filename, config):
 
 
     # Calculate Detection Limits
+    det_limit = None
     if len(results) > 0:
         snr_vals = [rs.get('snr', 0) for rs in results]
         # Find the star with the lowest SNR that is still >= 3.0
         min_snr_idx = np.argmin(snr_vals)
         faintest_star = results[min_snr_idx]
+        det_limit = {
+            'snr': faintest_star.get('snr', 0),
+            'mag_inst': faintest_star.get('mag_inst'),
+            'mag_calibrated': faintest_star.get('mag_calibrated')
+        }
         print(f"\n--- Detection Limit (Faintest Star @ SNR={faintest_star.get('snr', 0):.1f}) ---")
         if 'mag_inst' in faintest_star and not np.isnan(faintest_star['mag_inst']):
             print(f"Instrumental Magnitude Limit: {faintest_star['mag_inst']:.2f}")
@@ -222,7 +228,7 @@ def process_file(fits_filename, config):
             })
 
     # 6. Shift Analysis
-    # 6. Shift Analysis
+    shift_stats = None
     if config['run_shift_analysis']:
         output_md = os.path.join('photometry_output', f'shift_analysis_{base_name}.md')
         print(f"Generating shift analysis report at {output_md}...")
@@ -239,7 +245,7 @@ def process_file(fits_filename, config):
     print("Done!\n")
     if hasattr(sys.stdout, 'set_log_file'):
         sys.stdout.set_log_file(None)
-    return output_csv, filt, calc_zp
+    return output_csv, filt, calc_zp, shift_stats, det_limit
 
 def run_pipeline(cfg):
     input_pattern = cfg['input_pattern']

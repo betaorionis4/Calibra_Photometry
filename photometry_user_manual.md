@@ -8,9 +8,9 @@ The code can identify stars, perform PSF fitting to extract fluxes (using apertu
 
 Make sure that the code uses the right filter. I use Johnson V and B filters, that are labled 'V_mag' and 'B_mag' by my imaging software - I use N.I.N.A. - in the FITS header.
 
-Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems.
+Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems. Version 4.0 has a reworked GUI which integrates dedicated **"Open Selected FITS in Viewer"** launcher buttons, and extensive interactive quick-help educational popup panels across all processing tabs.
 
-Useful background information on the latter and lots of other useful information is provided by the AAVSO Guide to CCD/CMOS Photometry (available for free via aavso.org).
+Useful background information is provided by the AAVSO Guide to CCD/CMOS Photometry (available for free via aavso.org).
 
 ---
 
@@ -253,9 +253,9 @@ The module produces three files in `photometry_output/`:
 
 ---
 
-## 7. Running the Pipeline: The Configuration GUI (v3.2)
+## 7. Running the Pipeline: The Configuration GUI (v4.0)
 
-Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v3.2, the interface is split into a persistent top panel and a set of six processing tabs:
+Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v4.0, the interface is split into a persistent top panel and a set of six processing tabs:
 
 ### 7.1 FITS File Manager (Top Panel)
 Always visible at the top of the window, this centralized manager allows you to load, preview, and select your FITS files.
@@ -278,13 +278,13 @@ The FITS Viewer is a powerful, integrated inspection and configuration tool. It 
 
 2.  **Real-Time Radial Profile**: Every click also generates a **radial profile plot** showing physical pixel intensities (scatter points) against the Gaussian fit curve. Vertical lines mark the current **aperture radius** (red dashed) and **inner annulus** (green dotted), letting you visually verify whether the aperture captures the full stellar flux and whether the annulus samples clean sky.
 
-3.  **Role-Based Star Marking (Right-Click)**: Right-click a star to open a context menu with options:
-    - **Mark as Variable Star** (Red): Designates the target variable. Only one variable star can be active at a time.
-    - **Mark as Check Star** (Blue): Designates a check/validation star. Only one check star can be active.
-    - **Mark as Reference Star** (Green): Adds the star to the reference ensemble (up to 5).
-    - **Remove Star**: Removes any existing role assignment.
+3.  **Role-Based Star Marking (Right-Click & Hotkeys)**: Right-click a star to open a context menu, or hover the mouse cursor over a star and press a single-key hotkey to instantly assign roles:
+    - **Mark as Variable Star** (Red) [Hotkey: `V`]: Designates the target variable. Only one variable star can be active at a time.
+    - **Mark as Check Star** (Blue) [Hotkey: `C`]: Designates a check/validation star. Only one check star can be active.
+    - **Mark as Reference Star** (Green) [Hotkey: `R`]: Adds the star to the reference ensemble (up to 5).
+    - **Remove Star** [Hotkey: `Delete` or `Backspace`]: Removes any existing role assignment.
 
-    Marked stars display persistent aperture and annulus overlays in their role color. Roles are mutually exclusive: reassigning a star to a different role automatically removes it from the previous one.
+    Marked stars display persistent aperture and annulus overlays in their role color. Roles are mutually exclusive: reassigning a star to a different role automatically removes it from the previous one. Keyboard shortcuts completely bypass context menus, enabling fast comp sequence marking.
 
 4.  **In-Viewer Aperture Controls**: The "Aperture Settings" panel (bottom-right) shows editable fields for **Aperture Radius**, **Annulus Inner**, and **Annulus Outer**. When "Flexible Aperture" is enabled in Settings, these fields auto-update based on the FWHM of each newly marked star. You can also manually edit these values; subsequent markings will use the updated radii.
 
