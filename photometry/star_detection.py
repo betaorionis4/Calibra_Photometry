@@ -23,10 +23,20 @@ def detect_stars(image_data, header, detect_sigma,
     print(f"Global Image Stats: Median Bkg = {median_bg:.1f} ADU | Noise Sigma = {std_bg:.1f} ADU")
     
     # Initialize DAOStarFinder with user-defined morphology limits
-    # Updated to use sharpness_range and roundness_range to avoid DeprecationWarnings
-    daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
-                            sharpness_range=(sharplo, sharphi), 
-                            roundness_range=(roundlo, roundhi))
+    # We use the older parameter names (sharplo, sharphi, etc.) for compatibility
+    # but silence the DeprecationWarning that photutils 2.x+ generates.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=AstropyWarning, message=".*sharplo.*")
+        warnings.filterwarnings("ignore", category=AstropyWarning, message=".*roundlo.*")
+        try:
+            daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
+                                    sharpness_range=(sharplo, sharphi), 
+                                    roundness_range=(roundlo, roundhi))
+        except TypeError:
+            daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
+                                    sharplo=sharplo, sharphi=sharphi, 
+                                    roundlo=roundlo, roundhi=roundhi)
+    
     sources = daofind(image_data - median_bg)
 
     if sources is None:
@@ -53,11 +63,14 @@ def detect_stars(image_data, header, detect_sigma,
 
     results = []
 
+    # Detect column names dynamically to handle different photutils versions
+    x_col = 'x_centroid' if 'x_centroid' in sources.colnames else 'xcentroid'
+    y_col = 'y_centroid' if 'y_centroid' in sources.colnames else 'ycentroid'
+    
     valid_count = 0
     for row in sources:
-        # Using modern column names x_centroid and y_centroid
-        fits_x = row['x_centroid'] + 1.0
-        fits_y = row['y_centroid'] + 1.0
+        fits_x = row[x_col] + 1.0
+        fits_y = row[y_col] + 1.0
         peak_val = row['peak']
         flux_val = row['flux']
 

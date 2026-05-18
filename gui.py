@@ -14,6 +14,12 @@ from photometry.plate_solve import plate_solve_files, solve_with_astap
 from photometry.image_calibration import calibrate_image
 from photometry.gui_utils import add_copy_context_menu, SelectableLabel, add_treeview_copy_menu
 
+# Platform-agnostic safe icons to prevent broken emoji boxes on Linux/Ubuntu
+IS_LINUX = sys.platform.startswith("linux")
+
+def get_icon(emoji_win, fallback_linux):
+    return fallback_linux if IS_LINUX else emoji_win
+
 class StdoutRedirector:
     def __init__(self, text_widget):
         self.text_widgets = [text_widget]
@@ -311,7 +317,7 @@ def run_config_gui(pipeline_callback=None):
         # Header Frame
         header = tk.Frame(pop, bg="#1a3a5f", pady=15)
         header.pack(fill="x", side=tk.TOP)
-        tk.Label(header, text="🌌  Photometric Analysis Pipeline", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(header, text=f"{get_icon('🌌', '')}  Photometric Analysis Pipeline".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
         
         # Main Content Area
         content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
@@ -369,7 +375,7 @@ def run_config_gui(pipeline_callback=None):
         
         header = tk.Frame(pop, bg="#1a3a5f", pady=15)
         header.pack(fill="x", side=tk.TOP)
-        tk.Label(header, text="🌈  Color Coefficient Calibration (B-V Pairs)", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(header, text=f"{get_icon('🌈', '')}  Color Coefficient Calibration (B-V Pairs)".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
         
         content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
         content_frame.pack(fill="both", expand=True)
@@ -426,7 +432,7 @@ def run_config_gui(pipeline_callback=None):
         
         header = tk.Frame(pop, bg="#1a3a5f", pady=15)
         header.pack(fill="x", side=tk.TOP)
-        tk.Label(header, text="📊  Differential Photometry & Light Curves", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(header, text=f"{get_icon('📊', '')}  Differential Photometry & Light Curves".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
         
         content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
         content_frame.pack(fill="both", expand=True)
@@ -482,7 +488,7 @@ def run_config_gui(pipeline_callback=None):
         
         header = tk.Frame(pop, bg="#1a3a5f", pady=15)
         header.pack(fill="x", side=tk.TOP)
-        tk.Label(header, text="⚙  FITS Instrumental Calibration", font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(header, text=f"{get_icon('⚙', '')}  FITS Instrumental Calibration".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
         
         content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
         content_frame.pack(fill="both", expand=True)
@@ -1423,7 +1429,7 @@ def run_config_gui(pipeline_callback=None):
     ttk.Button(toolbar_frame, text="Refresh Headers", command=on_refresh_headers).pack(side=tk.LEFT, padx=5)
 
     # Informative tip text below buttons
-    tip_label = tk.Label(file_manager_frame, text="💡 Tip: Double-click any file in the table below to open it in the interactive FITS Viewer.",
+    tip_label = tk.Label(file_manager_frame, text=f"{get_icon('💡', '')} Tip: Double-click any file in the table below to open it in the interactive FITS Viewer.".strip(),
                          font=("Arial", 9, "italic"), fg="#00796b", bg="#f0f2f5", anchor="w")
     tip_label.pack(fill="x", padx=10, pady=(0, 5))
 
@@ -1478,7 +1484,7 @@ def run_config_gui(pipeline_callback=None):
     add_treeview_copy_menu(tree)
     
     # Right side: Header Viewer
-    right_side = tk.LabelFrame(paned, text="📄 FITS Header Preview")
+    right_side = tk.LabelFrame(paned, text=f"{get_icon('📄', '')} FITS Header Preview".strip())
     paned.add(right_side, width=350)
     
     header_text = tk.Text(right_side, font=("Courier", 9), wrap=tk.NONE, bg="#fdfdfe")
@@ -1562,8 +1568,8 @@ def run_config_gui(pipeline_callback=None):
     sub_solve_scroll = ScrollableFrame(pre_notebook)
     tab_pre_right = sub_solve_scroll.scrollable_frame
     
-    pre_notebook.add(sub_calib_scroll, text="🧪  FITS Calibration")
-    pre_notebook.add(sub_solve_scroll, text="🧭  WCS Plate Solving")
+    pre_notebook.add(sub_calib_scroll, text=f"{get_icon('🧪', '')}  FITS Calibration".strip())
+    pre_notebook.add(sub_solve_scroll, text=f"{get_icon('🧭', '')}  WCS Plate Solving".strip())
     
     tab_pre = tab_pre_left
 
@@ -1584,9 +1590,9 @@ def run_config_gui(pipeline_callback=None):
     sub_diff_scroll = ScrollableFrame(analysis_notebook)
     sub_diff = sub_diff_scroll.scrollable_frame
     
-    analysis_notebook.add(sub_detect_scroll, text="🌌  1. Detection & Zero-Point")
-    analysis_notebook.add(sub_color_scroll, text="🌈  2. Color Coefficients")
-    analysis_notebook.add(sub_diff_scroll, text="📊  3. Differential Photometry")
+    analysis_notebook.add(sub_detect_scroll, text=f"{get_icon('🌌', '')}  1. Detection & Zero-Point".strip())
+    analysis_notebook.add(sub_color_scroll, text=f"{get_icon('🌈', '')}  2. Color Coefficients".strip())
+    analysis_notebook.add(sub_diff_scroll, text=f"{get_icon('📊', '')}  3. Differential Photometry".strip())
     
     tab_analysis = sub_detect
     
@@ -1614,9 +1620,9 @@ def run_config_gui(pipeline_callback=None):
     sub_ops_scroll = ScrollableFrame(settings_notebook)
     sub_ops = sub_ops_scroll.scrollable_frame
     
-    settings_notebook.add(sub_astro_scroll, text="🌌 Astro & Catalog")
-    settings_notebook.add(sub_phot_scroll, text="📷 Camera & Photometry")
-    settings_notebook.add(sub_ops_scroll, text="👤 Operator & Session")
+    settings_notebook.add(sub_astro_scroll, text=f"{get_icon('🌌', '')} Astro & Catalog".strip())
+    settings_notebook.add(sub_phot_scroll, text=f"{get_icon('📷', '')} Camera & Photometry".strip())
+    settings_notebook.add(sub_ops_scroll, text=f"{get_icon('👤', '')} Operator & Session".strip())
     
     # --- TAB 5: Settings CONTENT ---
     # Session Management - MOVED TO TOP
@@ -1761,7 +1767,7 @@ def run_config_gui(pipeline_callback=None):
                             bg="#388e3c", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
     run_cal_btn.pack(side=tk.LEFT, padx=5)
     
-    cal_info_btn = tk.Button(cal_btn_frame, text="❓ What does this do?", command=show_calibration_info,
+    cal_info_btn = tk.Button(cal_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_calibration_info,
                              bg="#f0f2f5", fg="#388e3c", font=("Arial", 11, "bold"), pady=10, padx=15)
     cal_info_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1888,7 +1894,7 @@ def run_config_gui(pipeline_callback=None):
                                bg="#0288d1", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
     run_plate_btn.pack(side=tk.LEFT, padx=5)
     
-    plate_info_btn = tk.Button(plate_btn_frame, text="❓ What does this do?", command=show_plate_solve_info,
+    plate_info_btn = tk.Button(plate_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_plate_solve_info,
                                bg="#f0f2f5", fg="#0288d1", font=("Arial", 11, "bold"), pady=10, padx=15)
     plate_info_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1915,7 +1921,7 @@ def run_config_gui(pipeline_callback=None):
                         width=35, relief="flat", pady=10)
     run_btn.pack(side=tk.LEFT, padx=5)
 
-    info_btn = tk.Button(run_btn_frame, text="❓ What does this do?", command=show_pipeline_info,
+    info_btn = tk.Button(run_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_pipeline_info,
                          bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
                          relief="flat", pady=10, padx=15)
     info_btn.pack(side=tk.LEFT, padx=5)
@@ -1982,7 +1988,7 @@ def run_config_gui(pipeline_callback=None):
     tk.Button(color_btn_frame, text="Run Color Transformation Analysis", command=on_run_color,
               bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(side=tk.LEFT, padx=5)
               
-    color_info_btn = tk.Button(color_btn_frame, text="❓ What does this do?", command=show_color_info,
+    color_info_btn = tk.Button(color_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_color_info,
                                bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
                                relief="flat", pady=10, padx=15)
     color_info_btn.pack(side=tk.LEFT, padx=5)
@@ -2245,7 +2251,7 @@ def run_config_gui(pipeline_callback=None):
     tk.Button(diff_btn_frame, text="Execute Differential Photometry", command=on_run_diff,
               bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), width=35, relief="flat", pady=10).pack(side=tk.LEFT, padx=5)
               
-    diff_info_btn = tk.Button(diff_btn_frame, text="❓ What does this do?", command=show_diff_info,
+    diff_info_btn = tk.Button(diff_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_diff_info,
                               bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"),
                               relief="flat", pady=10, padx=15)
     diff_info_btn.pack(side=tk.LEFT, padx=5)
@@ -3165,7 +3171,7 @@ def run_config_gui(pipeline_callback=None):
                               bg="#757575", fg="white", font=("Arial", 9), pady=10)
     reset_ens_btn.pack(side=tk.LEFT, padx=10)
 
-    ts_info_btn = tk.Button(ts_btn_row2, text="❓ What does this do?", command=show_lightcurve_info,
+    ts_info_btn = tk.Button(ts_btn_row2, text=f"{get_icon('❓', '?')} What does this do?", command=show_lightcurve_info,
                             bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15)
     ts_info_btn.pack(side=tk.LEFT, padx=10)
 
@@ -3353,13 +3359,13 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(help_frame, text=dev_info, justify=tk.LEFT, font=("Arial", 9), fg="#555").pack(side=tk.BOTTOM, anchor="w")
 
     # Create Sidebar buttons
-    create_sidebar_button("📂  File Manager", "files")
-    create_sidebar_button("⚙  Pre-processing", "pre")
-    create_sidebar_button("🔍  Analysis & Calib", "analysis")
-    create_sidebar_button("📈  Light Curves", "ts")
-    create_sidebar_button("🔧  Settings", "settings")
-    create_sidebar_button("ℹ  About Calibra", "about")
-    create_sidebar_button("❓  User Help", "help")
+    create_sidebar_button(f"{get_icon('📂', '')}  File Manager".strip(), "files")
+    create_sidebar_button(f"{get_icon('⚙', '')}  Pre-processing".strip(), "pre")
+    create_sidebar_button(f"{get_icon('🔍', '')}  Analysis & Calib".strip(), "analysis")
+    create_sidebar_button(f"{get_icon('📈', '')}  Light Curves".strip(), "ts")
+    create_sidebar_button(f"{get_icon('🔧', '')}  Settings".strip(), "settings")
+    create_sidebar_button(f"{get_icon('ℹ', '')}  About Calibra".strip(), "about")
+    create_sidebar_button(f"{get_icon('❓', '')}  User Help".strip(), "help")
     
     # Select first tab by default
     switch_tab("files")
