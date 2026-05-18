@@ -752,8 +752,16 @@ class FITSViewer:
             coord = self.wcs.pixel_to_world(res['x'], res['y'])
             cat_star = self._query_catalog(coord.ra.deg, coord.dec.deg)
             if not cat_star:
-                messagebox.showwarning("No Catalog Match", "No matching catalog star found.")
-                return None
+                # Fallback placeholder so faint or uncataloged stars can still be selected and viewed!
+                cat_star = {
+                    'display_name': f"Uncataloged ({role})" if role != "Variable" else "Target",
+                    'id': f"Uncataloged_{role}" if role != "Variable" else "Target",
+                    'V_mag': np.nan,
+                    'B_mag': np.nan,
+                    'ra_deg': coord.ra.deg,
+                    'dec_deg': coord.dec.deg,
+                    'source': 'None'
+                }
 
         # 3. Prevent duplicate marking
         self._remove_marker_at(res['x'], res['y'], quiet=True)

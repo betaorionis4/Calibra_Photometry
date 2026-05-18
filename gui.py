@@ -208,6 +208,8 @@ def run_config_gui(pipeline_callback=None):
             tab_analysis_outer.tkraise()
         elif tab_name == "ts":
             tab_ts_outer.tkraise()
+        elif tab_name == "datamining":
+            tab_datamining_outer.tkraise()
         elif tab_name == "settings":
             tab_settings_outer.tkraise()
         elif tab_name == "about":
@@ -1605,7 +1607,15 @@ def run_config_gui(pipeline_callback=None):
     ts_scroll.pack(fill="both", expand=True)
     tab_ts = ts_scroll.scrollable_frame
 
-    # --- TAB 5: Settings ---
+    # --- TAB 5: Data Mining ---
+    tab_datamining_outer = ttk.Frame(content_container)
+    tab_datamining_outer.grid(row=0, column=0, sticky="nsew")
+    
+    dm_scroll = ScrollableFrame(tab_datamining_outer)
+    dm_scroll.pack(fill="both", expand=True)
+    tab_datamining = dm_scroll.scrollable_frame
+
+    # --- TAB 6: Settings ---
     tab_settings_outer = ttk.Frame(content_container)
     tab_settings_outer.grid(row=0, column=0, sticky="nsew")
     
@@ -3207,6 +3217,226 @@ def run_config_gui(pipeline_callback=None):
     ts_tree.pack(side=tk.LEFT, fill="both", expand=True)
     ts_vsb.pack(side=tk.RIGHT, fill="y")
 
+    # =========================================================================
+    # --- TAB 5: DATA MINING ---
+    # =========================================================================
+    dm_container = tk.Frame(tab_datamining, bg="white")
+    dm_container.pack(fill="both", expand=True, padx=20, pady=10)
+
+    tk.Label(dm_container, text=f"{get_icon('🚀', '')}  Data Mining & Variable Star Discovery", font=("Segoe UI", 16, "bold"), fg="#1a3a5f", bg="white").pack(anchor="w", pady=(0,10))
+    
+    # 1. Config Frame
+    lf_dm_config = tk.LabelFrame(dm_container, text="Data Mining Configuration", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_config.pack(fill="x", pady=5)
+    
+    add_entry(lf_dm_config, "Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0)
+    add_entry(lf_dm_config, "Saturation Limit (ADU):", "dm_saturation", 55000, 1, vtype=int)
+    add_entry(lf_dm_config, "Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, vtype=int)
+    add_entry(lf_dm_config, "Min Valid Frames Fraction (0.0 - 1.0):", "dm_min_valid_pct", 0.7, 3)
+    add_check(lf_dm_config, "Fast Test Mode (limit ensemble to top 100 stars)", "dm_fast_test", True, 4)
+    
+    dm_status_var = tk.StringVar(value="Ready to discover.")
+    tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
+    
+    # 2. Execution Button & Progress
+    dm_progress = ttk.Progressbar(dm_container, orient="horizontal", length=400, mode="determinate")
+    
+    def on_run_datamining():
+        from photometry.data_mining import detect_all_stars, track_and_measure, calibrate_and_analyze
+        import threading
+        import numpy as np
+        import os
+        
+        selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        if not selected_iids:
+            messagebox.showerror("No Files", "Please select at least one FITS file in the File Manager.")
+            return
+            
+        fits_files = [loaded_files[int(iid)]['path'] for iid in selected_iids]
+        ref_file = fits_files[0]
+        
+        detect_sig = vars_dict["dm_detect_sigma"][0].get()
+        sat_limit = vars_dict["dm_saturation"][0].get()
+        edge_buf = vars_dict["dm_edge_buffer"][0].get()
+        min_pct = vars_dict["dm_min_valid_pct"][0].get()
+        is_fast = vars_dict["dm_fast_test"][0].get()
+        
+        # Aperture settings are shared with general config
+        ap_rad = vars_dict["aperture_radius"][0].get()
+        ann_in = vars_dict["annulus_inner"][0].get()
+        ann_out = vars_dict["annulus_outer"][0].get()
+        
+        cancel_event = threading.Event()
+        
+        dm_progress.pack(pady=5)
+        dm_progress["value"] = 0
+        
+        btn_cancel = tk.Button(dm_container, text="Cancel", command=cancel_event.set, bg="#d32f2f", fg="white", font=("Arial", 9, "bold"))
+        btn_cancel.pack(pady=5)
+        
+        run_dm_btn.config(state=tk.DISABLED)
+        
+        def dm_thread():
+            try:
+                dm_status_var.set("Phase 1/3: Detecting stars in reference frame...")
+                master_cat = detect_all_stars(ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf)
+                
+                if cancel_event.is_set(): return
+                
+                if is_fast and len(master_cat) > 100:
+                    master_cat = master_cat[:100]
+                    
+                if not master_cat:
+                    dm_status_var.set("Error: No stars detected in reference frame.")
+                    return
+                    
+                dm_status_var.set(f"Phase 2/3: Tracking {len(master_cat)} stars across {len(fits_files)} frames...")
+                
+                def update_prog(val):
+                    root.after(0, lambda: dm_progress.configure(value=val))
+                    
+                track_res, warnings_lst = track_and_measure(
+                    fits_files, master_cat, 
+                    aperture_radius=ap_rad, annulus_inner=ann_in, annulus_outer=ann_out,
+                    saturation_limit=sat_limit, edge_buffer=edge_buf,
+                    cancel_event=cancel_event, progress_callback=update_prog
+                )
+                
+                if cancel_event.is_set(): return
+                if warnings_lst:
+                    warn_msg = "\n".join(warnings_lst)
+                    root.after(0, lambda: messagebox.showwarning("Data Mining Warnings", warn_msg))
+                    
+                dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
+                
+                out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
+                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct)
+                
+                if not final_stats:
+                    dm_status_var.set("Analysis complete, but no valid stars survived filters.")
+                    return
+                    
+                # Update UI
+                def update_ui():
+                    for item in dm_tree.get_children():
+                        dm_tree.delete(item)
+                    for s in final_stats:
+                        flag = "SUSPECT" if s.get('is_suspect') else ""
+                        dm_tree.insert("", tk.END, values=(
+                            s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
+                            f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}", flag
+                        ))
+                    
+                    dm_fig.clear()
+                    ax = dm_fig.add_subplot(111)
+                    
+                    mags = np.array([s['mean_mag'] for s in final_stats])
+                    rms = np.array([s['rms'] for s in final_stats])
+                    sus = np.array([s.get('is_suspect', False) for s in final_stats])
+                    
+                    ax.scatter(mags[~sus], rms[~sus], c='blue', alpha=0.5, s=10, label='Stable')
+                    ax.scatter(mags[sus], rms[sus], c='red', alpha=0.9, s=40, label='Suspect', marker='*')
+                    
+                    if exp_func:
+                        x_curve = np.linspace(np.min(mags), np.max(mags), 100)
+                        y_curve = exp_func(x_curve)
+                        ax.plot(x_curve, y_curve, c='green', lw=2, label='Expected Noise Floor')
+                        
+                    ax.set_xlabel("Mean Instrumental Mag")
+                    ax.set_ylabel("RMS (std dev)")
+                    ax.set_title("Stellar Variability Diagram")
+                    ax.legend()
+                    if not ax.xaxis_inverted():
+                        ax.invert_xaxis()
+                    dm_canvas.draw()
+                    
+                    dm_status_var.set(f"Complete! Found {np.sum(sus)} suspect(s). Saved to {out_csv}")
+                
+                root.after(0, update_ui)
+                
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                dm_status_var.set("Error occurred.")
+            finally:
+                root.after(0, lambda: dm_progress.pack_forget())
+                root.after(0, lambda: btn_cancel.pack_forget())
+                root.after(0, lambda: run_dm_btn.config(state=tk.NORMAL))
+                
+        threading.Thread(target=dm_thread, daemon=True).start()
+
+    dm_btn_frame = tk.Frame(dm_container, bg="white")
+    dm_btn_frame.pack(pady=5)
+    
+    run_dm_btn = tk.Button(dm_btn_frame, text="Run Data Mining", command=on_run_datamining,
+                           bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
+    run_dm_btn.pack(side=tk.LEFT, padx=10)
+    
+    def on_send_suspect():
+        selected = dm_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a star from the table first.")
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        ra_deg, dec_deg = float(vals[1]), float(vals[2])
+        
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg))
+        ra_hms = coord.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+        dec_dms = coord.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+        
+        vars_dict["ts_target_ra"][0].set(ra_hms)
+        vars_dict["ts_target_dec"][0].set(dec_dms)
+        vars_dict["ts_target_mode"][0].set("manual")
+        ts_target_name_var.set(f"Suspect_{vals[0]}")
+        messagebox.showinfo("Sent", f"Target {vals[0]} coordinates sent to Light Curves tab!")
+        switch_tab("ts")
+
+    send_btn = tk.Button(dm_btn_frame, text="Send Suspect to Light Curves", command=on_send_suspect,
+                           bg="#f57c00", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
+    send_btn.pack(side=tk.LEFT, padx=10)
+
+    def show_dm_help():
+        messagebox.showinfo("Data Mining Help", "This tool scans all files to find variable stars.\\nIt uses the Top 100 brightest stars to create a rock-solid calibration, then flags outliers above the expected noise floor!")
+    
+    tk.Button(dm_btn_frame, text="❓ What does this do?", command=show_dm_help, bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15).pack(side=tk.LEFT, padx=10)
+
+    # 3. Plot Frame
+    lf_dm_plot = tk.LabelFrame(dm_container, text="Variability Diagram", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_plot.pack(fill="both", expand=True, padx=10, pady=5)
+    
+    dm_fig, dm_ax = plt.subplots(figsize=(8, 4))
+    dm_canvas = FigureCanvasTkAgg(dm_fig, master=lf_dm_plot)
+    dm_canvas.get_tk_widget().pack(fill="both", expand=True)
+    dm_toolbar = NavigationToolbar2Tk(dm_canvas, lf_dm_plot)
+    dm_toolbar.update()
+    
+    # 4. Table Frame
+    lf_dm_table = tk.LabelFrame(dm_container, text="Suspects Table", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_table.pack(fill="both", expand=True, padx=10, pady=5)
+    
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Flag"), show='headings', height=8)
+    dm_tree.heading("ID", text="ID")
+    dm_tree.heading("RA", text="RA (deg)")
+    dm_tree.heading("Dec", text="Dec (deg)")
+    dm_tree.heading("Mean Mag", text="Mean Mag")
+    dm_tree.heading("RMS", text="RMS")
+    dm_tree.heading("Excess", text="Excess RMS")
+    dm_tree.heading("Flag", text="Flag")
+    
+    dm_tree.column("ID", width=70, anchor=tk.CENTER)
+    dm_tree.column("RA", width=80, anchor=tk.CENTER)
+    dm_tree.column("Dec", width=80, anchor=tk.CENTER)
+    dm_tree.column("Mean Mag", width=70, anchor=tk.CENTER)
+    dm_tree.column("RMS", width=70, anchor=tk.CENTER)
+    dm_tree.column("Excess", width=70, anchor=tk.CENTER)
+    dm_tree.column("Flag", width=70, anchor=tk.CENTER)
+    
+    dm_vsb = ttk.Scrollbar(lf_dm_table, orient="vertical", command=dm_tree.yview)
+    dm_tree.configure(yscrollcommand=dm_vsb.set)
+    dm_tree.pack(side=tk.LEFT, fill="both", expand=True)
+    dm_vsb.pack(side=tk.RIGHT, fill="y")
+
     # --- END TAB 6 ---
 
     # Camera Settings (from old TAB 2)
@@ -3363,6 +3593,7 @@ def run_config_gui(pipeline_callback=None):
     create_sidebar_button(f"{get_icon('⚙', '')}  Pre-processing".strip(), "pre")
     create_sidebar_button(f"{get_icon('🔍', '')}  Analysis & Calib".strip(), "analysis")
     create_sidebar_button(f"{get_icon('📈', '')}  Light Curves".strip(), "ts")
+    create_sidebar_button(f"{get_icon('🚀', '')}  Data Mining".strip(), "datamining")
     create_sidebar_button(f"{get_icon('🔧', '')}  Settings".strip(), "settings")
     create_sidebar_button(f"{get_icon('ℹ', '')}  About Calibra".strip(), "about")
     create_sidebar_button(f"{get_icon('❓', '')}  User Help".strip(), "help")
