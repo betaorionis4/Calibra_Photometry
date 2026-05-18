@@ -3397,7 +3397,55 @@ def run_config_gui(pipeline_callback=None):
     send_btn.pack(side=tk.LEFT, padx=10)
 
     def show_dm_help():
-        messagebox.showinfo("Data Mining Help", "This tool scans all files to find variable stars.\\nIt uses the Top 100 brightest stars to create a rock-solid calibration, then flags outliers above the expected noise floor!")
+        pop = tk.Toplevel(root)
+        pop.title("About Data Mining (Variable Star Discovery)")
+        pop.geometry("650x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 650) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text=f"{get_icon('🚀', '')}  Data Mining & Discovery".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT DATA MINING DOES:\n"
+            "----------------------------\n"
+            "This tool automatically scans your entire FITS sequence to discover unknown variable stars! It operates without requiring any prior knowledge of targets or reference stars.\n\n"
+            "HOW IT WORKS:\n"
+            "1. Star Detection:\n"
+            "   Identifies all point sources in your reference frame using DAOStarFinder.\n\n"
+            "2. Bulk Photometry:\n"
+            "   Tracks every star across every loaded frame and measures its instrumental magnitude.\n\n"
+            "3. Global Calibration:\n"
+            "   Identifies the brightest, most stable stars across your sequence and builds an automated 'Global Ensemble'. It uses this ensemble to remove atmospheric variations (clouds, airmass) from all stars.\n\n"
+            "4. Statistical Outlier Detection (Flagging):\n"
+            "   It calculates the expected photometric 'noise floor' for your specific camera system based on Poisson statistics. Any star that fluctuates significantly above this expected noise curve (and > 0.03 mag absolute) is flagged as a Suspect.\n\n"
+            "----------------------------\n"
+            "RESULTS:\n"
+            "- Variability Diagram: Stable stars are plotted as small blue dots. The green line represents the expected noise floor. Discovered Suspects are highlighted as large red stars.\n"
+            "- Send to Light Curves: Click on a suspect in the table and press the 'Send' button to instantly transfer its coordinates to the Light Curves tab for full analysis!\n"
+        )
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
     
     tk.Button(dm_btn_frame, text="❓ What does this do?", command=show_dm_help, bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15).pack(side=tk.LEFT, padx=10)
 
