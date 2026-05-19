@@ -328,7 +328,11 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     ens_rms = {}
     for sid in ensemble_ids:
         corrected_mags = valid_stars[sid]['mags'] + zp_pass1
-        _, _, rms = sigma_clipped_stats(corrected_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+        clean_mags = corrected_mags[np.isfinite(corrected_mags)]
+        if len(clean_mags) > 0:
+            _, _, rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+        else:
+            rms = np.nan
         ens_rms[sid] = rms
         
     median_ens_rms = np.median(list(ens_rms.values()))
@@ -345,7 +349,11 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     final_stats = []
     for sid, data in valid_stars.items():
         corrected_mags = data['mags'] + zp_pass2
-        final_mean, _, final_rms = sigma_clipped_stats(corrected_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+        clean_mags = corrected_mags[np.isfinite(corrected_mags)]
+        if len(clean_mags) > 0:
+            final_mean, _, final_rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+        else:
+            final_mean, final_rms = np.nan, np.nan
         n_valid = np.sum(data['valid_mask'])
         
         final_stats.append({
@@ -354,7 +362,8 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             'dec_deg': data['star_info']['dec_deg'],
             'mean_mag': final_mean,
             'rms': final_rms,
-            'n_valid': n_valid
+            'n_valid': n_valid,
+            'corrected_mags': list(corrected_mags)
         })
         
     # OUTLIER DETECTION (Noise Floor Model)

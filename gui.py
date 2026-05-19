@@ -3318,24 +3318,52 @@ def run_config_gui(pipeline_callback=None):
                     
                 # Update UI
                 def update_ui():
-                    for item in dm_tree.get_children():
-                        dm_tree.delete(item)
-                    for s in final_stats:
-                        flag = "SUSPECT" if s.get('is_suspect') else ""
-                        dm_tree.insert("", tk.END, values=(
-                            s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
-                            f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}", flag
-                        ))
+                    dm_tree.final_stats = final_stats
+                    
+                    # Reset sorting column text highlights (removing / adding arrows)
+                    col_headers = {
+                        "ID": "ID",
+                        "RA": "RA (deg)",
+                        "Dec": "Dec (deg)",
+                        "Mean Mag": "Mean Mag",
+                        "RMS": "RMS",
+                        "Excess": "Excess RMS",
+                        "Valid": "Valid",
+                        "Flag": "Flag"
+                    }
+                    for c_id, base_text in col_headers.items():
+                        if c_id == dm_tree.sort_col:
+                            arrow = " ▼" if dm_tree.sort_desc else " ▲"
+                            dm_tree.heading(c_id, text=base_text + arrow)
+                        else:
+                            dm_tree.heading(c_id, text=base_text)
+                            
+                    populate_dm_tree()
                     
                     dm_fig.clear()
                     ax = dm_fig.add_subplot(111)
+                    dm_tree.ax = ax  # Store active axis reference
+                    dm_tree.highlight_artists = []  # Clear highlights
                     
                     mags = np.array([s['mean_mag'] for s in final_stats])
                     rms = np.array([s['rms'] for s in final_stats])
                     sus = np.array([s.get('is_suspect', False) for s in final_stats])
                     
-                    ax.scatter(mags[~sus], rms[~sus], c='blue', alpha=0.5, s=10, label='Stable')
-                    ax.scatter(mags[sus], rms[sus], c='red', alpha=0.9, s=40, label='Suspect', marker='*')
+                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect')]
+                    suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                    
+                    mags_stable = mags[~sus]
+                    rms_stable = rms[~sus]
+                    mags_sus = mags[sus]
+                    rms_sus = rms[sus]
+                    
+                    # Task 4: Added picker=5 to enable clicks on points
+                    sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
+                    sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                    
+                    # Task 4: Store lists on collections to map indexes back to stars
+                    sc_stable.star_list = stable_stars_list
+                    sc_suspect.star_list = suspect_stars_list
                     
                     if exp_func:
                         x_curve = np.linspace(np.min(mags), np.max(mags), 100)
@@ -3395,6 +3423,19 @@ def run_config_gui(pipeline_callback=None):
     send_btn = tk.Button(dm_btn_frame, text="Send Suspect to Light Curves", command=on_send_suspect,
                            bg="#f57c00", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
     send_btn.pack(side=tk.LEFT, padx=10)
+
+    # Task 5: Added Preview Light Curve button
+    def on_preview_click():
+        selected = dm_tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Star", "Please select a star from the table to preview its light curve.")
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        show_mini_lightcurve(vals[0])
+
+    preview_btn = tk.Button(dm_btn_frame, text="Preview Light Curve", command=on_preview_click,
+                             bg="#2e7d32", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
+    preview_btn.pack(side=tk.LEFT, padx=10)
 
     def show_dm_help():
         pop = tk.Toplevel(root)
@@ -3463,22 +3504,249 @@ def run_config_gui(pipeline_callback=None):
     lf_dm_table = tk.LabelFrame(dm_container, text="Suspects Table", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
     lf_dm_table.pack(fill="both", expand=True, padx=10, pady=5)
     
-    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Flag"), show='headings', height=8)
-    dm_tree.heading("ID", text="ID")
-    dm_tree.heading("RA", text="RA (deg)")
-    dm_tree.heading("Dec", text="Dec (deg)")
-    dm_tree.heading("Mean Mag", text="Mean Mag")
-    dm_tree.heading("RMS", text="RMS")
-    dm_tree.heading("Excess", text="Excess RMS")
-    dm_tree.heading("Flag", text="Flag")
+    # Filter frame above Treeview
+    dm_filter_frame = tk.Frame(lf_dm_table, bg="white")
+    dm_filter_frame.pack(fill="x", side=tk.TOP, padx=5, pady=5)
     
+    show_non_suspects_var = tk.BooleanVar(value=False)
+    
+    # Task 2: Added "Valid" column to columns tuple
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag"), show='headings', height=8)
+    
+    def populate_dm_tree():
+        for item in dm_tree.get_children():
+            dm_tree.delete(item)
+            
+        show_all = show_non_suspects_var.get()
+        
+        stats_to_show = []
+        if hasattr(dm_tree, 'final_stats') and dm_tree.final_stats:
+            for s in dm_tree.final_stats:
+                if show_all or s.get('is_suspect'):
+                    stats_to_show.append(s)
+                    
+        # Apply sorting
+        if hasattr(dm_tree, 'sort_col') and dm_tree.sort_col:
+            col = dm_tree.sort_col
+            rev = dm_tree.sort_desc
+            
+            def try_numeric(val):
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return str(val).lower()
+                    
+            if col == "ID":
+                stats_to_show.sort(key=lambda x: try_numeric(x['id']), reverse=rev)
+            elif col == "RA":
+                stats_to_show.sort(key=lambda x: x['ra_deg'], reverse=rev)
+            elif col == "Dec":
+                stats_to_show.sort(key=lambda x: x['dec_deg'], reverse=rev)
+            elif col == "Mean Mag":
+                stats_to_show.sort(key=lambda x: x['mean_mag'], reverse=rev)
+            elif col == "RMS":
+                stats_to_show.sort(key=lambda x: x['rms'], reverse=rev)
+            elif col == "Excess":
+                stats_to_show.sort(key=lambda x: x['excess_rms'], reverse=rev)
+            elif col == "Valid":
+                # Task 2 Sorting on Valid column
+                stats_to_show.sort(key=lambda x: x.get('n_valid', 0), reverse=rev)
+            elif col == "Flag":
+                stats_to_show.sort(key=lambda x: ("SUSPECT" if x.get('is_suspect') else ""), reverse=rev)
+                
+        for s in stats_to_show:
+            flag = "SUSPECT" if s.get('is_suspect') else ""
+            # Task 2: Populate Valid count
+            dm_tree.insert("", tk.END, values=(
+                s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
+                f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}",
+                f"{s.get('n_valid', 0)}", flag
+            ))
+            
+    def sort_column(col):
+        if dm_tree.sort_col == col:
+            dm_tree.sort_desc = not dm_tree.sort_desc
+        else:
+            dm_tree.sort_col = col
+            dm_tree.sort_desc = False
+            
+        col_headers = {
+            "ID": "ID",
+            "RA": "RA (deg)",
+            "Dec": "Dec (deg)",
+            "Mean Mag": "Mean Mag",
+            "RMS": "RMS",
+            "Excess": "Excess RMS",
+            "Valid": "Valid",
+            "Flag": "Flag"
+        }
+        for c_id, base_text in col_headers.items():
+            if c_id == col:
+                arrow = " ▼" if dm_tree.sort_desc else " ▲"
+                dm_tree.heading(c_id, text=base_text + arrow)
+            else:
+                dm_tree.heading(c_id, text=base_text)
+                
+        populate_dm_tree()
+        
+    # Task 3: Draw a bright yellow halo and label over selected star in plot
+    def highlight_star_in_plot(star):
+        if not hasattr(dm_tree, 'ax') or not dm_tree.ax:
+            return
+        if hasattr(dm_tree, 'highlight_artists') and dm_tree.highlight_artists:
+            for artist in dm_tree.highlight_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            dm_tree.highlight_artists = []
+            
+        x = star['mean_mag']
+        y = star['rms']
+        
+        # Yellow circle around point
+        halo = dm_tree.ax.scatter([x], [y], s=120, facecolors='none', edgecolors='#ffd600', linewidths=2.0, zorder=10)
+        
+        # Text label above point
+        ylim = dm_tree.ax.get_ylim()
+        y_offset = 0.015 * (ylim[1] - ylim[0])
+        label = dm_tree.ax.text(x, y + y_offset, f"{star['id']}", 
+                                color='black', fontsize=9, fontweight='bold',
+                                bbox=dict(facecolor='yellow', alpha=0.8, boxstyle='round,pad=0.2'),
+                                zorder=11, ha='center')
+                           
+        dm_tree.highlight_artists = [halo, label]
+        dm_canvas.draw_idle()
+        
+    # Task 5: Non-blocking Toplevel popup window for Magnitude vs Frame preview
+    def show_mini_lightcurve(star_id):
+        star = None
+        for s in dm_tree.final_stats:
+            if str(s['id']) == str(star_id):
+                star = s
+                break
+        if not star or 'corrected_mags' not in star:
+            messagebox.showwarning("No Data", f"No magnitude data available for star {star_id}.")
+            return
+            
+        pop = tk.Toplevel(root)
+        pop.title(f"Light Curve Preview: {star_id}")
+        pop.geometry("600x400")
+        pop.configure(bg="white")
+        pop.transient(root)
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 600) // 2
+        py = ry + (rh - 400) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=10)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text=f"Raw Light Curve for {star_id}", font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        plot_frame = tk.Frame(pop, bg="white")
+        plot_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        fig, ax = plt.subplots(figsize=(6, 3))
+        canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        mags = np.array(star['corrected_mags'])
+        frames = np.arange(len(mags))
+        
+        valid = np.isfinite(mags)
+        if np.any(valid):
+            ax.plot(frames[valid], mags[valid], marker='o', color='#1a3a5f', linestyle='-', markersize=4, alpha=0.8, label="Instrumental Mag")
+            ax.invert_yaxis()
+            ax.set_xlabel("Frame Index")
+            ax.set_ylabel("Mag (Calibrated)")
+            ax.set_title(f"Mean Mag: {star['mean_mag']:.3f} | RMS: {star['rms']:.4f} | Valid Frames: {star['n_valid']}", fontdict={'fontsize': 10})
+            ax.grid(True, linestyle='--', alpha=0.5)
+        else:
+            ax.text(0.5, 0.5, "No valid magnitude measurements.", ha='center', va='center')
+            
+        canvas.draw()
+        
+    # Task 3: Selection callback for Treeview click
+    def on_dm_tree_select(event):
+        selected = dm_tree.selection()
+        if not selected:
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        star_id = vals[0]
+        
+        for s in dm_tree.final_stats:
+            if str(s['id']) == str(star_id):
+                highlight_star_in_plot(s)
+                break
+                
+    # Task 5: Double-click preview binding
+    def on_dm_double_click(event):
+        selected = dm_tree.selection()
+        if not selected:
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        show_mini_lightcurve(vals[0])
+        
+    # Task 4: Pick event callback for matplotlib canvas click
+    def on_canvas_pick(event):
+        col = event.artist
+        ind = event.ind[0]
+        if hasattr(col, 'star_list'):
+            star = col.star_list[ind]
+            star_id = star['id']
+            
+            found = False
+            for item in dm_tree.get_children():
+                if str(dm_tree.item(item, 'values')[0]) == str(star_id):
+                    dm_tree.selection_set(item)
+                    dm_tree.see(item)
+                    found = True
+                    break
+                    
+            highlight_star_in_plot(star)
+            
+    dm_tree.final_stats = []
+    dm_tree.sort_col = "Excess"
+    dm_tree.sort_desc = True
+    
+    chk_show_non = tk.Checkbutton(
+        dm_filter_frame, 
+        text="Show Non-Suspects (stable stars)", 
+        variable=show_non_suspects_var, 
+        command=populate_dm_tree,
+        bg="white", 
+        activebackground="white",
+        font=("Segoe UI", 9)
+    )
+    chk_show_non.pack(side=tk.LEFT, padx=10)
+
+    # Task 2: Setup Table Headings
+    dm_tree.heading("ID", text="ID", command=lambda: sort_column("ID"))
+    dm_tree.heading("RA", text="RA (deg)", command=lambda: sort_column("RA"))
+    dm_tree.heading("Dec", text="Dec (deg)", command=lambda: sort_column("Dec"))
+    dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_column("Mean Mag"))
+    dm_tree.heading("RMS", text="RMS", command=lambda: sort_column("RMS"))
+    dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
+    dm_tree.heading("Valid", text="Valid", command=lambda: sort_column("Valid"))
+    dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
+    
+    # Task 2: Setup Column Widths
     dm_tree.column("ID", width=70, anchor=tk.CENTER)
     dm_tree.column("RA", width=80, anchor=tk.CENTER)
     dm_tree.column("Dec", width=80, anchor=tk.CENTER)
     dm_tree.column("Mean Mag", width=70, anchor=tk.CENTER)
     dm_tree.column("RMS", width=70, anchor=tk.CENTER)
     dm_tree.column("Excess", width=70, anchor=tk.CENTER)
+    dm_tree.column("Valid", width=60, anchor=tk.CENTER)
     dm_tree.column("Flag", width=70, anchor=tk.CENTER)
+    
+    # Bindings
+    dm_tree.bind("<<TreeviewSelect>>", on_dm_tree_select)
+    dm_tree.bind("<Double-1>", on_dm_double_click)
+    dm_canvas.mpl_connect('pick_event', on_canvas_pick)
     
     dm_vsb = ttk.Scrollbar(lf_dm_table, orient="vertical", command=dm_tree.yview)
     dm_tree.configure(yscrollcommand=dm_vsb.set)
