@@ -436,3 +436,58 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             print(f"Error writing CSV: {e}")
             
     return final_stats, expected_rms_func
+
+
+def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=30.0, verbose=True):
+    """
+    Cross-matches all stars in final_stats against the AAVSO Variable Star Index (VSX).
+    Adds 'vsx_name' and 'vsx_type' fields to each star dict.
+    Returns the number of known matches found.
+    """
+    from photometry.calibration import get_vsx_stars
+    
+    if not final_stats or center_ra is None or center_dec is None:
+        for s in final_stats:
+            s['vsx_name'] = ''
+            s['vsx_type'] = ''
+        return 0
+    
+    vsx_stars = get_vsx_stars(center_ra, center_dec, radius_arcmin=radius_arcmin, verbose=verbose)
+    
+    if not vsx_stars:
+        for s in final_stats:
+            s['vsx_name'] = ''
+            s['vsx_type'] = ''
+        return 0
+    
+    vsx_coords = SkyCoord(
+        ra=[v['ra_deg'] for v in vsx_stars] * u.deg,
+        dec=[v['dec_deg'] for v in vsx_stars] * u.deg
+    )
+    
+    star_coords = SkyCoord(
+        ra=[s['ra_deg'] for s in final_stats] * u.deg,
+        dec=[s['dec_deg'] for s in final_stats] * u.deg
+    )
+    
+    idx, d2d, _ = star_coords.match_to_catalog_sky(vsx_coords)
+    
+    known_count = 0
+    for i, s in enumerate(final_stats):
+        if d2d[i].arcsec < 5.0:
+            matched = vsx_stars[idx[i]]
+            vsx_type = matched.get('Type', '')
+            # Don't label constant stars as known variables
+            if vsx_type and 'CST' in str(vsx_type).upper():
+                s['vsx_name'] = matched.get('id', '')
+                s['vsx_type'] = f"{vsx_type} (constant)"
+            else:
+                s['vsx_name'] = matched.get('id', '')
+                s['vsx_type'] = vsx_type
+                if s.get('is_suspect'):
+                    known_count += 1
+        else:
+            s['vsx_name'] = ''
+            s['vsx_type'] = ''
+    
+    return known_count

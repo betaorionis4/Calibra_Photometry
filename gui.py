@@ -3238,14 +3238,28 @@ def run_config_gui(pipeline_callback=None):
     dm_status_var = tk.StringVar(value="Ready to discover.")
     tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
     
+    # Summary Statistics Banner (hidden until results are available)
+    dm_summary_frame = tk.Frame(dm_container, bg="#e8f5e9", bd=1, relief="solid")
+    # Don't pack yet - packed after results arrive
+    
+    dm_summary_labels = {}
+    for col, key in enumerate(["total_stars", "total_suspects", "known_vsx", "new_discoveries", "median_rms"]):
+        nice_names = {"total_stars": "Stars Analyzed", "total_suspects": "Suspects", "known_vsx": "Known (VSX)", "new_discoveries": "New Discoveries", "median_rms": "Median RMS"}
+        tk.Label(dm_summary_frame, text=nice_names[key], font=("Segoe UI", 8), fg="#555", bg="#e8f5e9").grid(row=0, column=col, padx=15, pady=(5,0))
+        lbl = tk.Label(dm_summary_frame, text="—", font=("Segoe UI", 14, "bold"), fg="#1a3a5f", bg="#e8f5e9")
+        lbl.grid(row=1, column=col, padx=15, pady=(0,5))
+        dm_summary_labels[key] = lbl
+    
     # 2. Execution Button & Progress
     dm_progress = ttk.Progressbar(dm_container, orient="horizontal", length=400, mode="determinate")
     
     def on_run_datamining():
-        from photometry.data_mining import detect_all_stars, track_and_measure, calibrate_and_analyze
+        from photometry.data_mining import detect_all_stars, track_and_measure, calibrate_and_analyze, cross_match_vsx_suspects
         import threading
         import numpy as np
         import os
+        from astropy.io import fits as dm_fits
+        from astropy.wcs import WCS as dm_WCS
         
         selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
         if not selected_iids:
@@ -3315,6 +3329,22 @@ def run_config_gui(pipeline_callback=None):
                 if not final_stats:
                     dm_status_var.set("Analysis complete, but no valid stars survived filters.")
                     return
+                
+                # VSX Cross-Match: extract center RA/Dec from reference frame
+                center_ra_dm, center_dec_dm = None, None
+                try:
+                    with dm_fits.open(ref_file) as hdul:
+                        hdr = hdul[0].header
+                        w = dm_WCS(hdr)
+                        if w.has_celestial:
+                            ny, nx = hdul[0].data.shape[:2] if hdul[0].data is not None else (1000, 1000)
+                            center_ra_dm, center_dec_dm = w.all_pix2world(nx/2, ny/2, 0)
+                            center_ra_dm, center_dec_dm = float(center_ra_dm), float(center_dec_dm)
+                except Exception:
+                    pass
+                
+                dm_status_var.set("Cross-matching suspects with AAVSO VSX catalog...")
+                known_count = cross_match_vsx_suspects(final_stats, center_ra_dm, center_dec_dm, radius_arcmin=30.0, verbose=True)
                     
                 # Update UI
                 def update_ui():
@@ -3378,7 +3408,27 @@ def run_config_gui(pipeline_callback=None):
                         ax.invert_xaxis()
                     dm_canvas.draw()
                     
-                    dm_status_var.set(f"Complete! Found {np.sum(sus)} suspect(s). Saved to {out_csv}")
+                    # Update summary statistics banner
+                    n_suspects = int(np.sum(sus))
+                    n_total = len(final_stats)
+                    n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
+                    n_new = n_suspects - n_known
+                    med_rms = float(np.median(rms))
+                    
+                    dm_summary_labels["total_stars"].config(text=str(n_total))
+                    dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                    dm_summary_labels["known_vsx"].config(text=str(n_known))
+                    dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
+                    dm_summary_labels["median_rms"].config(text=f"{med_rms:.4f}")
+                    dm_summary_frame.pack(fill="x", padx=10, pady=(0, 5), before=dm_progress)
+                    
+                    status_parts = [f"Complete! {n_suspects} suspect(s)"]
+                    if n_known > 0:
+                        status_parts.append(f"{n_known} known VSX")
+                    if n_new > 0:
+                        status_parts.append(f"{n_new} potential new discovery!")
+                    status_parts.append(f"Saved to {out_csv}")
+                    dm_status_var.set(" | ".join(status_parts))
                 
                 root.after(0, update_ui)
                 
@@ -3436,6 +3486,34 @@ def run_config_gui(pipeline_callback=None):
     preview_btn = tk.Button(dm_btn_frame, text="Preview Light Curve", command=on_preview_click,
                              bg="#2e7d32", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
     preview_btn.pack(side=tk.LEFT, padx=10)
+
+    def on_export_all_click():
+        if not hasattr(dm_tree, 'final_stats') or not dm_tree.final_stats:
+            messagebox.showwarning("No Data", "No results to export.")
+            return
+        from tkinter import filedialog
+        import csv
+        path = filedialog.asksaveasfilename(initialdir="photometry_output", defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if path:
+            try:
+                with open(path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["ID", "RA (deg)", "Dec (deg)", "Mean Mag", "RMS", "Expected RMS", "Excess RMS", "Valid Frames", "Flag", "VSX Name", "VSX Type"])
+                    for s in dm_tree.final_stats:
+                        writer.writerow([
+                            s['id'], f"{s['ra_deg']:.6f}", f"{s['dec_deg']:.6f}", 
+                            f"{s['mean_mag']:.4f}", f"{s['rms']:.5f}", f"{s.get('expected_rms', 0):.5f}", 
+                            f"{s['excess_rms']:.5f}", s.get('n_valid', 0),
+                            'SUSPECT' if s.get('is_suspect') else '',
+                            s.get('vsx_name', ''), s.get('vsx_type', '')
+                        ])
+                messagebox.showinfo("Export Complete", f"Exported {len(dm_tree.final_stats)} stars to {path}")
+            except Exception as e:
+                messagebox.showerror("Export Failed", str(e))
+
+    export_all_btn = tk.Button(dm_btn_frame, text="Export All Results", command=on_export_all_click,
+                             bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"), pady=10, padx=15)
+    export_all_btn.pack(side=tk.LEFT, padx=10)
 
     def show_dm_help():
         pop = tk.Toplevel(root)
@@ -3511,7 +3589,11 @@ def run_config_gui(pipeline_callback=None):
     show_non_suspects_var = tk.BooleanVar(value=False)
     
     # Task 2: Added "Valid" column to columns tuple
-    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag"), show='headings', height=8)
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type"), show='headings', height=8)
+    
+    # Configure row tags for coloring
+    dm_tree.tag_configure("suspect", background="#ffcccc")
+    dm_tree.tag_configure("borderline", background="#fff3cd")
     
     def populate_dm_tree():
         for item in dm_tree.get_children():
@@ -3553,15 +3635,29 @@ def run_config_gui(pipeline_callback=None):
                 stats_to_show.sort(key=lambda x: x.get('n_valid', 0), reverse=rev)
             elif col == "Flag":
                 stats_to_show.sort(key=lambda x: ("SUSPECT" if x.get('is_suspect') else ""), reverse=rev)
+            elif col == "VSX Name":
+                stats_to_show.sort(key=lambda x: x.get('vsx_name', ''), reverse=rev)
+            elif col == "VSX Type":
+                stats_to_show.sort(key=lambda x: x.get('vsx_type', ''), reverse=rev)
                 
         for s in stats_to_show:
             flag = "SUSPECT" if s.get('is_suspect') else ""
+            vsx_name = s.get('vsx_name', '')
+            vsx_type = s.get('vsx_type', '')
+            
+            # Row coloring based on flag
+            tag = ""
+            if flag == "SUSPECT":
+                tag = "suspect"
+            elif s['excess_rms'] > 0.02 and s['rms'] > 2.0 * s.get('expected_rms', 0):
+                tag = "borderline"
+                
             # Task 2: Populate Valid count
             dm_tree.insert("", tk.END, values=(
                 s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
                 f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}",
-                f"{s.get('n_valid', 0)}", flag
-            ))
+                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type
+            ), tags=(tag,) if tag else ())
             
     def sort_column(col):
         if dm_tree.sort_col == col:
@@ -3578,7 +3674,9 @@ def run_config_gui(pipeline_callback=None):
             "RMS": "RMS",
             "Excess": "Excess RMS",
             "Valid": "Valid",
-            "Flag": "Flag"
+            "Flag": "Flag",
+            "VSX Name": "VSX Name",
+            "VSX Type": "VSX Type"
         }
         for c_id, base_text in col_headers.items():
             if c_id == col:
@@ -3708,6 +3806,26 @@ def run_config_gui(pipeline_callback=None):
                     
             highlight_star_in_plot(star)
             
+    def on_dm_right_click(event):
+        item = dm_tree.identify_row(event.y)
+        if item:
+            dm_tree.selection_set(item)
+            menu = tk.Menu(root, tearoff=0)
+            
+            vals = dm_tree.item(item, 'values')
+            ra, dec = vals[1], vals[2]
+            
+            menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
+            menu.add_command(label="Send to Light Curves", command=on_send_suspect)
+            
+            def copy_csv():
+                root.clipboard_clear()
+                root.clipboard_append(",".join(map(str, vals)))
+                
+            menu.add_command(label="Copy Row as CSV", command=copy_csv)
+            
+            menu.post(event.x_root, event.y_root)
+            
     dm_tree.final_stats = []
     dm_tree.sort_col = "Excess"
     dm_tree.sort_desc = True
@@ -3732,6 +3850,8 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
     dm_tree.heading("Valid", text="Valid", command=lambda: sort_column("Valid"))
     dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
+    dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_column("VSX Name"))
+    dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_column("VSX Type"))
     
     # Task 2: Setup Column Widths
     dm_tree.column("ID", width=70, anchor=tk.CENTER)
@@ -3742,10 +3862,13 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.column("Excess", width=70, anchor=tk.CENTER)
     dm_tree.column("Valid", width=60, anchor=tk.CENTER)
     dm_tree.column("Flag", width=70, anchor=tk.CENTER)
+    dm_tree.column("VSX Name", width=120, anchor=tk.W)
+    dm_tree.column("VSX Type", width=80, anchor=tk.W)
     
     # Bindings
     dm_tree.bind("<<TreeviewSelect>>", on_dm_tree_select)
     dm_tree.bind("<Double-1>", on_dm_double_click)
+    dm_tree.bind("<Button-3>", on_dm_right_click)
     dm_canvas.mpl_connect('pick_event', on_canvas_pick)
     
     dm_vsb = ttk.Scrollbar(lf_dm_table, orient="vertical", command=dm_tree.yview)
