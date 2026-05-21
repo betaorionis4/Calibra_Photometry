@@ -1290,7 +1290,11 @@ def run_config_gui(pipeline_callback=None):
     toolbar_frame = ttk.Frame(file_manager_frame)
     toolbar_frame.pack(fill="x", padx=5, pady=5)
     
-    def update_file_table():
+    def update_file_table(select_iid=None):
+        # Remember selection if select_iid is not explicitly passed
+        current_selection = tree.selection()
+        prev_selected_iid = current_selection[0] if current_selection else None
+        
         # Clear existing items
         for item in tree.get_children():
             tree.delete(item)
@@ -1356,8 +1360,13 @@ def run_config_gui(pipeline_callback=None):
                 if curr not in unique_filters:
                     vars_dict["ts_filter"][0].set(unique_filters[0])
         
-        # Select first item if nothing selected
-        if tree.get_children() and not tree.selection():
+        # Select target item, or re-select previous, or select first item if nothing selected
+        target_iid = select_iid if select_iid is not None else prev_selected_iid
+        if target_iid is not None and tree.exists(str(target_iid)):
+            tree.selection_set(str(target_iid))
+            tree.see(str(target_iid))
+            on_tree_select(None)
+        elif tree.get_children():
             first_iid = tree.get_children()[0]
             tree.selection_set(first_iid)
             tree.see(first_iid)
@@ -1483,11 +1492,376 @@ def run_config_gui(pipeline_callback=None):
     tree.configure(xscrollcommand=ts_hsb.set)
     ts_hsb.grid(row=1, column=0, sticky="ew")
     
-    add_treeview_copy_menu(tree)
+    # Right-click context menu for the treeview
+    tree_menu = tk.Menu(tree, tearoff=0)
     
+    def on_edit_header_context():
+        on_edit_header()
+        
+    def copy_to_clipboard(iids):
+        if not iids:
+            return
+        lines = []
+        cols = tree["columns"]
+        header = "\t".join([tree.heading(c)["text"] for c in cols if tree.heading(c)["text"]])
+        if header:
+            lines.append(header)
+        for iid in iids:
+            values = tree.item(iid, "values")
+            lines.append("\t".join([str(v) for v in values]))
+        data = "\n".join(lines)
+        tree.clipboard_clear()
+        tree.clipboard_append(data)
+
+    def copy_selected():
+        copy_to_clipboard(tree.selection())
+
+    def copy_all():
+        copy_to_clipboard(tree.get_children())
+
+    tree_menu.add_command(label="✏️ Edit FITS Header...", command=on_edit_header_context)
+    tree_menu.add_separator()
+    tree_menu.add_command(label="Copy Selected Rows (Excel-ready)", command=copy_selected)
+    tree_menu.add_command(label="Copy Entire List (Excel-ready)", command=copy_all)
+
+    def show_tree_menu(event):
+        item = tree.identify_row(event.y)
+        if item and item not in tree.selection():
+            tree.selection_set(item)
+        tree_menu.post(event.x_root, event.y_root)
+
+    tree.bind("<Button-3>", show_tree_menu)
+    
+    def open_header_editor(file_path, file_idx):
+        if not os.path.exists(file_path):
+            messagebox.showerror("Error", f"File not found: {file_path}")
+            return
+            
+        editor_win = tk.Toplevel(root)
+        editor_win.title(f"✏️ Edit FITS Header - {os.path.basename(file_path)}")
+        editor_win.geometry("750x650")
+        editor_win.minsize(650, 550)
+        editor_win.transient(root)
+        editor_win.grab_set()
+        editor_win.configure(bg="#f0f2f5")
+
+        # Center popup over root window
+        editor_win.update_idletasks()
+        rx = root.winfo_x()
+        ry = root.winfo_y()
+        rw = root.winfo_width()
+        rh = root.winfo_height()
+        px = rx + (rw - 750) // 2
+        py = ry + (rh - 650) // 2
+        editor_win.geometry(f"+{px}+{py}")
+
+        # Top Header Frame
+        top_frame = tk.Frame(editor_win, bg="#1a3a5f", pady=12)
+        top_frame.pack(fill="x", side=tk.TOP)
+        tk.Label(top_frame, text="✏️ FITS Header Editor", font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(top_frame, text=file_path, font=("Segoe UI", 8, "italic"), fg="#cbd5e1", bg="#1a3a5f").pack()
+
+        # Structural keywords definition
+        STRUCTURAL_KEYWORDS = {
+            'SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'EXTEND', 
+            'BSCALE', 'BZERO', 'PCOUNT', 'GCOUNT', 'TFIELDS', 'XTENSION'
+        }
+        COMMENTARY_KEYWORDS = {'COMMENT', 'HISTORY', ''}
+
+        # Load cards in memory
+        from astropy.io import fits
+        all_cards = []
+        try:
+            with fits.open(file_path) as hdul:
+                hdr = hdul[0].header
+                for card in hdr.cards:
+                    if card.keyword:
+                        val_str = str(card.value) if card.value is not None else ''
+                        comment = card.comment or ''
+                        all_cards.append([card.keyword.upper(), val_str, comment])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read FITS header: {e}")
+            editor_win.destroy()
+            return
+
+        # Main body container
+        body_frame = tk.Frame(editor_win, bg="#f0f2f5", padx=10, pady=10)
+        body_frame.pack(fill="both", expand=True)
+
+        # Search Bar
+        search_frame = ttk.Frame(body_frame)
+        search_frame.pack(fill="x", pady=(0, 5))
+        
+        ttk.Label(search_frame, text="🔍 Search Card:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=search_var)
+        search_entry.pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        search_entry.focus_set()
+
+        # Cards Treeview Frame
+        table_frame = ttk.Frame(body_frame)
+        table_frame.pack(fill="both", expand=True)
+
+        editor_tree = ttk.Treeview(table_frame, columns=("key", "val", "comment"), show="headings", selectmode="browse")
+        editor_tree.heading("key", text="Keyword")
+        editor_tree.heading("val", text="Value")
+        editor_tree.heading("comment", text="Comment")
+        
+        editor_tree.column("key", width=120, anchor=tk.W)
+        editor_tree.column("val", width=200, anchor=tk.W)
+        editor_tree.column("comment", width=350, anchor=tk.W)
+
+        # Scrollbars for table
+        v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=editor_tree.yview)
+        editor_tree.configure(yscrollcommand=v_scroll.set)
+        h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=editor_tree.xview)
+        editor_tree.configure(xscrollcommand=h_scroll.set)
+
+        editor_tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        # Style tag for structural keys to show them in light grey
+        editor_tree.tag_configure('structural', foreground='#94a3b8', background='#f8fafc')
+        editor_tree.tag_configure('even', background='#ffffff')
+        editor_tree.tag_configure('odd', background='#f1f5f9')
+
+        # Filter function
+        def refresh_tree(event=None):
+            for item in editor_tree.get_children():
+                editor_tree.delete(item)
+            
+            query = search_var.get().lower().strip()
+            for idx, (key, val, comment) in enumerate(all_cards):
+                if not query or query in key.lower() or query in val.lower() or query in comment.lower():
+                    tag = 'even' if idx % 2 == 0 else 'odd'
+                    if key in STRUCTURAL_KEYWORDS:
+                        tag = 'structural'
+                    editor_tree.insert('', tk.END, iid=str(idx), values=(key, val, comment), tags=(tag,))
+
+        search_var.trace_add("write", lambda *args: refresh_tree())
+
+        # Inputs Form Frame
+        form_frame = ttk.LabelFrame(body_frame, text="Edit / Add Card")
+        form_frame.pack(fill="x", pady=10)
+
+        for i in range(3):
+            form_frame.columnconfigure(i, weight=1)
+
+        ttk.Label(form_frame, text="Keyword (max 8 chars):", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Label(form_frame, text="Value:", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(form_frame, text="Comment:", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w", padx=10, pady=5)
+
+        key_var = tk.StringVar()
+        val_var = tk.StringVar()
+        comment_var = tk.StringVar()
+
+        def limit_key(*args):
+            s = key_var.get().upper().strip()
+            if len(s) > 8:
+                s = s[:8]
+            key_var.set(s)
+        key_var.trace_add("write", limit_key)
+
+        key_entry = ttk.Entry(form_frame, textvariable=key_var)
+        val_entry = ttk.Entry(form_frame, textvariable=val_var)
+        comment_entry = ttk.Entry(form_frame, textvariable=comment_var)
+
+        key_entry.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        val_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        comment_entry.grid(row=1, column=2, sticky="ew", padx=10, pady=5)
+
+        # Form Buttons
+        form_btn_frame = ttk.Frame(form_frame)
+        form_btn_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
+
+        def on_select_card(event):
+            selected = editor_tree.selection()
+            if not selected:
+                return
+            idx = int(selected[0])
+            k, v, c = all_cards[idx]
+            key_var.set(k)
+            val_var.set(v)
+            comment_var.set(c)
+
+        editor_tree.bind("<<TreeviewSelect>>", on_select_card)
+
+        def clear_form():
+            editor_tree.selection_remove(editor_tree.selection())
+            key_var.set("")
+            val_var.set("")
+            comment_var.set("")
+
+        def apply_changes():
+            key = key_var.get().strip().upper()
+            val = val_var.get()
+            comment = comment_var.get().strip()
+
+            if not key:
+                messagebox.showwarning("Validation Error", "Keyword cannot be empty.")
+                return
+
+            if key in STRUCTURAL_KEYWORDS:
+                if not messagebox.askyesno("Warning", f"'{key}' is a structural FITS keyword. Modifying it can corrupt the FITS file layout. Are you sure you want to proceed?"):
+                    return
+
+            selected = editor_tree.selection()
+            if selected:
+                idx = int(selected[0])
+                all_cards[idx] = [key, val, comment]
+            else:
+                existing_idx = None
+                for idx, (k, _, _) in enumerate(all_cards):
+                    if k == key and key not in COMMENTARY_KEYWORDS:
+                        existing_idx = idx
+                        break
+                if existing_idx is not None:
+                    all_cards[existing_idx] = [key, val, comment]
+                else:
+                    all_cards.append([key, val, comment])
+            
+            refresh_tree()
+            clear_form()
+
+        def delete_card():
+            selected = editor_tree.selection()
+            if not selected:
+                messagebox.showwarning("No Selection", "Please select a card to delete.")
+                return
+            
+            idx = int(selected[0])
+            key, _, _ = all_cards[idx]
+            
+            if key in STRUCTURAL_KEYWORDS:
+                if not messagebox.askyesno("Warning", f"'{key}' is a structural FITS keyword. Deleting it can corrupt the FITS file layout. Are you sure you want to proceed?"):
+                    return
+
+            if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the '{key}' card?"):
+                all_cards.pop(idx)
+                refresh_tree()
+                clear_form()
+
+        ttk.Button(form_btn_frame, text="Apply / Add Card", command=apply_changes).pack(side=tk.LEFT, padx=5)
+        ttk.Button(form_btn_frame, text="Delete Card", command=delete_card).pack(side=tk.LEFT, padx=5)
+        ttk.Button(form_btn_frame, text="Clear Fields", command=clear_form).pack(side=tk.LEFT, padx=5)
+
+        # Bottom Window Controls
+        bottom_frame = ttk.Frame(editor_win)
+        bottom_frame.pack(fill="x", side=tk.BOTTOM, padx=10, pady=10)
+
+        def save_and_close():
+            # Automatically apply any active edits before saving
+            key = key_var.get().strip().upper()
+            if key:
+                val = val_var.get()
+                comment = comment_var.get().strip()
+                selected = editor_tree.selection()
+                if selected:
+                    idx = int(selected[0])
+                    all_cards[idx] = [key, val, comment]
+                else:
+                    existing_idx = None
+                    for idx, (k, _, _) in enumerate(all_cards):
+                        if k == key and key not in COMMENTARY_KEYWORDS:
+                            existing_idx = idx
+                            break
+                    if existing_idx is not None:
+                        all_cards[existing_idx] = [key, val, comment]
+                    else:
+                        all_cards.append([key, val, comment])
+
+            def parse_fits_value(val_str):
+                val_str_stripped = val_str.strip()
+                if not val_str_stripped:
+                    return None
+                if val_str_stripped.upper() == 'TRUE':
+                    return True
+                if val_str_stripped.upper() == 'FALSE':
+                    return False
+                try:
+                    if '.' not in val_str_stripped and (val_str_stripped.isdigit() or (val_str_stripped.startswith('-') and val_str_stripped[1:].isdigit())):
+                        return int(val_str_stripped)
+                except ValueError:
+                    pass
+                try:
+                    return float(val_str_stripped)
+                except ValueError:
+                    pass
+                if (val_str_stripped.startswith("'") and val_str_stripped.endswith("'")) or (val_str_stripped.startswith('"') and val_str_stripped.endswith('"')):
+                    return val_str_stripped[1:-1]
+                return val_str_stripped
+
+            try:
+                with fits.open(file_path, mode='update') as hdul:
+                    hdr = hdul[0].header
+                    
+                    new_std_keys = {card[0].upper() for card in all_cards if card[0].upper() not in STRUCTURAL_KEYWORDS and card[0].upper() not in COMMENTARY_KEYWORDS}
+                    
+                    for key in list(hdr.keys()):
+                        key_upper = key.upper()
+                        if key_upper not in STRUCTURAL_KEYWORDS and key_upper not in COMMENTARY_KEYWORDS:
+                            if key_upper not in new_std_keys:
+                                try:
+                                    del hdr[key]
+                                except KeyError:
+                                    pass
+                                    
+                    for key, val_str, comment in all_cards:
+                        key_upper = key.upper()
+                        if key_upper in STRUCTURAL_KEYWORDS:
+                            parsed_val = parse_fits_value(val_str)
+                            hdr.set(key, parsed_val, comment)
+                        elif key_upper in COMMENTARY_KEYWORDS:
+                            continue
+                        else:
+                            parsed_val = parse_fits_value(val_str)
+                            hdr.set(key, parsed_val, comment)
+                    
+                    hdul.flush()
+                
+                loaded_files[file_idx] = scan_fits_header(file_path)
+                update_file_table(select_iid=str(file_idx))
+                on_tree_select(None)
+                
+                messagebox.showinfo("Success", "FITS header saved successfully.")
+                editor_win.destroy()
+                
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Could not save FITS header: {e}")
+
+        # Save button styled with accent green
+        style = ttk.Style()
+        style.configure("Save.TButton", background="#2e7d32", foreground="white", font=("Segoe UI", 9, "bold"))
+        style.map("Save.TButton", background=[("active", "#1b5e20")])
+
+        ttk.Button(bottom_frame, text="Save to FITS File", style="Save.TButton", command=save_and_close).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Cancel", command=editor_win.destroy).pack(side=tk.RIGHT, padx=5)
+
+        refresh_tree()
+
     # Right side: Header Viewer
     right_side = tk.LabelFrame(paned, text=f"{get_icon('📄', '')} FITS Header Preview".strip())
     paned.add(right_side, width=350)
+    
+    # Edit button frame at the top of the preview pane
+    hdr_btn_frame = ttk.Frame(right_side)
+    hdr_btn_frame.pack(side=tk.TOP, fill="x", padx=5, pady=5)
+    
+    def on_edit_header():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a FITS file in the table first.")
+            return
+        iid = selected[0]
+        file_path = loaded_files[int(iid)]['path']
+        open_header_editor(file_path, int(iid))
+        
+    edit_hdr_btn = ttk.Button(hdr_btn_frame, text="✏️ Edit FITS Header...", command=on_edit_header)
+    edit_hdr_btn.pack(fill="x", expand=True)
     
     header_text = tk.Text(right_side, font=("Courier", 9), wrap=tk.NONE, bg="#fdfdfe")
     h_hsb = ttk.Scrollbar(right_side, orient="horizontal", command=header_text.xview)
@@ -3448,15 +3822,6 @@ def run_config_gui(pipeline_callback=None):
                     warn_msg = "\n".join(warnings_lst)
                     root.after(0, lambda: messagebox.showwarning("Data Mining Warnings", warn_msg))
                     
-                dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
-                
-                out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
-                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct)
-                
-                if not final_stats:
-                    dm_status_var.set("Analysis complete, but no valid stars survived filters.")
-                    return
-                
                 # VSX Cross-Match: extract center RA/Dec from reference frame
                 center_ra_dm, center_dec_dm = None, None
                 try:
@@ -3469,6 +3834,15 @@ def run_config_gui(pipeline_callback=None):
                             center_ra_dm, center_dec_dm = float(center_ra_dm), float(center_dec_dm)
                 except Exception:
                     pass
+
+                dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
+                
+                out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
+                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct, center_ra=center_ra_dm, center_dec=center_dec_dm)
+                
+                if not final_stats:
+                    dm_status_var.set("Analysis complete, but no valid stars survived filters.")
+                    return
                 
                 dm_status_var.set("Cross-matching suspects with AAVSO VSX catalog...")
                 known_count = cross_match_vsx_suspects(final_stats, center_ra_dm, center_dec_dm, radius_arcmin=30.0, verbose=True)

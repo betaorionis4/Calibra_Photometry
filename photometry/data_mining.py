@@ -263,7 +263,7 @@ def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_b
         print(f"Error in detect_all_stars for {fits_path}: {e}")
         return []
 
-def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid_fraction=0.7, ensemble_size=100):
+def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid_fraction=0.7, ensemble_size=100, center_ra=None, center_dec=None):
     """
     Performs the 2-Pass Global Differential Calibration and Statistical Analysis.
     Returns final_stats list and expected_rms_func for plotting.
@@ -330,7 +330,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         corrected_mags = valid_stars[sid]['mags'] + zp_pass1
         clean_mags = corrected_mags[np.isfinite(corrected_mags)]
         if len(clean_mags) > 0:
-            _, _, rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+            _, _, rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='std')
         else:
             rms = np.nan
         ens_rms[sid] = rms
@@ -351,9 +351,10 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         corrected_mags = data['mags'] + zp_pass2
         clean_mags = corrected_mags[np.isfinite(corrected_mags)]
         if len(clean_mags) > 0:
-            final_mean, _, final_rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='mad_std')
+            final_mean, _, final_rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='std')
+            _, _, tight_rms = sigma_clipped_stats(clean_mags, sigma=2.5, maxiters=5, cenfunc='median', stdfunc='std')
         else:
-            final_mean, final_rms = np.nan, np.nan
+            final_mean, final_rms, tight_rms = np.nan, np.nan, np.nan
         n_valid = np.sum(data['valid_mask'])
         
         final_stats.append({
@@ -362,6 +363,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             'dec_deg': data['star_info']['dec_deg'],
             'mean_mag': final_mean,
             'rms': final_rms,
+            'tight_rms': tight_rms,
             'n_valid': n_valid,
             'corrected_mags': list(corrected_mags)
         })
@@ -404,22 +406,49 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         s['excess_rms'] = excess_rms
         
         # Flagging suspects: RMS must be 3x expected noise floor AND > 0.03 magnitude deviation
-        if s['rms'] > 3.0 * exp_rms and excess_rms > 0.03:
-            s['is_suspect'] = True
-            suspects.append(s)
+        is_suspect = s['rms'] > 3.0 * exp_rms and excess_rms > 0.03
+        s['is_noisy'] = False
+        if is_suspect:
+            tight_val = s.get('tight_rms', np.nan)
+            if not np.isnan(tight_val) and tight_val < 1.5 * exp_rms:
+                s['is_suspect'] = False
+                s['is_noisy'] = True
+            else:
+                s['is_suspect'] = True
+                suspects.append(s)
         else:
             s['is_suspect'] = False
             
     # Sort ALL results by excess RMS descending
     final_stats.sort(key=lambda x: x['excess_rms'], reverse=True)
     
+    # Initialize VSX name and type fields for all stars to prevent KeyError
+    for s in final_stats:
+        s['vsx_name'] = ''
+        s['vsx_type'] = ''
+        
+    # Cross-match suspects with AAVSO VSX catalog before writing CSV
+    if center_ra is None or center_dec is None:
+        if master_catalog:
+            try:
+                center_ra = float(np.median([s['ra_deg'] for s in master_catalog]))
+                center_dec = float(np.median([s['dec_deg'] for s in master_catalog]))
+            except Exception:
+                pass
+                
+    if center_ra is not None and center_dec is not None:
+        try:
+            cross_match_vsx_suspects(final_stats, center_ra, center_dec, verbose=False)
+        except Exception as e:
+            print(f"Error performing VSX cross-match in calibrate_and_analyze: {e}")
+            
     # Write CSV
     if out_csv_path:
         import csv
         try:
             with open(out_csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect'])
+                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect', 'VSX Name', 'VSX Type'])
                 for s in final_stats:
                     writer.writerow([
                         s['id'], 
@@ -430,7 +459,9 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
                         f"{s['expected_rms']:.5f}", 
                         f"{s['excess_rms']:.5f}", 
                         s['n_valid'],
-                        'YES' if s['is_suspect'] else 'NO'
+                        'SUSPECT' if s['is_suspect'] else ('NOISY' if s.get('is_noisy') else 'NO'),
+                        s.get('vsx_name', ''),
+                        s.get('vsx_type', '')
                     ])
         except Exception as e:
             print(f"Error writing CSV: {e}")
@@ -448,16 +479,38 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
     
     if not final_stats or center_ra is None or center_dec is None:
         for s in final_stats:
-            s['vsx_name'] = ''
-            s['vsx_type'] = ''
+            s['vsx_name'] = s.get('vsx_name', '')
+            s['vsx_type'] = s.get('vsx_type', '')
         return 0
+        
+    # Dynamic Bounding Radius: ensure radius_arcmin covers all stars in final_stats
+    try:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        center_coord = SkyCoord(ra=center_ra * u.deg, dec=center_dec * u.deg)
+        star_coords = SkyCoord(
+            ra=[s['ra_deg'] for s in final_stats] * u.deg,
+            dec=[s['dec_deg'] for s in final_stats] * u.deg
+        )
+        seps = center_coord.separation(star_coords)
+        max_sep = float(seps.arcmin.max())
+        dynamic_radius = min(max_sep + 5.0, 90.0)
+        if radius_arcmin is None:
+            radius_arcmin = max(30.0, dynamic_radius)
+        else:
+            radius_arcmin = max(radius_arcmin, dynamic_radius)
+    except Exception as e:
+        if verbose:
+            print(f"Error computing dynamic VSX radius: {e}")
+        if radius_arcmin is None:
+            radius_arcmin = 30.0
     
     vsx_stars = get_vsx_stars(center_ra, center_dec, radius_arcmin=radius_arcmin, verbose=verbose)
     
     if not vsx_stars:
         for s in final_stats:
-            s['vsx_name'] = ''
-            s['vsx_type'] = ''
+            s['vsx_name'] = s.get('vsx_name', '')
+            s['vsx_type'] = s.get('vsx_type', '')
         return 0
     
     vsx_coords = SkyCoord(
@@ -474,7 +527,7 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
     
     known_count = 0
     for i, s in enumerate(final_stats):
-        if d2d[i].arcsec < 5.0:
+        if d2d[i].arcsec < 10.0:  # Relaxed from 5.0 to 10.0 to handle boundary WCS distortions
             matched = vsx_stars[idx[i]]
             vsx_type = matched.get('Type', '')
             # Don't label constant stars as known variables
@@ -487,7 +540,7 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
                 if s.get('is_suspect'):
                     known_count += 1
         else:
-            s['vsx_name'] = ''
-            s['vsx_type'] = ''
+            s['vsx_name'] = s.get('vsx_name', '')
+            s['vsx_type'] = s.get('vsx_type', '')
     
     return known_count

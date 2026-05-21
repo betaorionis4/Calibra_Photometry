@@ -401,7 +401,7 @@ def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose
         
     idx, d2d, _ = star_coords.match_to_catalog_sky(vsx_coords)
     for i, s in enumerate(star_list):
-        is_close = (d2d[i].arcsec < 5.0)
+        is_close = (d2d[i].arcsec < 10.0)  # Relaxed from 5.0 to 10.0 to handle boundary WCS distortions
         matched_vsx = vsx_stars[idx[i]]
         # AAVSO sometimes includes constant stars in VSX for reference. Don't flag them as variable.
         var_type = matched_vsx.get('Type', '')
