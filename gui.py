@@ -1570,8 +1570,12 @@ def run_config_gui(pipeline_callback=None):
     sub_solve_scroll = ScrollableFrame(pre_notebook)
     tab_pre_right = sub_solve_scroll.scrollable_frame
     
+    sub_osc_scroll = ScrollableFrame(pre_notebook)
+    tab_pre_osc = sub_osc_scroll.scrollable_frame
+    
     pre_notebook.add(sub_calib_scroll, text=f"{get_icon('🧪', '')}  FITS Calibration".strip())
     pre_notebook.add(sub_solve_scroll, text=f"{get_icon('🧭', '')}  WCS Plate Solving".strip())
+    pre_notebook.add(sub_osc_scroll, text=f"{get_icon('🌈', '')}  OSC Channel Split".strip())
     
     tab_pre = tab_pre_left
 
@@ -1907,6 +1911,122 @@ def run_config_gui(pipeline_callback=None):
     plate_info_btn = tk.Button(plate_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_plate_solve_info,
                                bg="#f0f2f5", fg="#0288d1", font=("Arial", 11, "bold"), pady=10, padx=15)
     plate_info_btn.pack(side=tk.LEFT, padx=5)
+
+
+    # 3. OSC Channel Splitter Tab CONTENT
+    lf_osc = tk.LabelFrame(tab_pre_osc, text="One-Shot Color (OSC) Demultiplexing")
+    lf_osc.pack(fill="x", padx=10, pady=10)
+    
+    tk.Label(lf_osc, text="Extract monochrome Red, Green, and/or Blue FITS channels from OSC Bayered files.\nSuperpixel mode reduces resolution by 2x to avoid interpolation artifacts.", justify=tk.LEFT).pack(padx=10, pady=10)
+
+    lf_osc_settings = tk.LabelFrame(tab_pre_osc, text="Splitter Settings")
+    lf_osc_settings.pack(fill="x", padx=10, pady=10)
+    
+    add_dropdown(lf_osc_settings, "Bayer Pattern:", "osc_pattern", ["RGGB", "BGGR", "GRBG", "GBRG"], "RGGB", 0, col_offset=0)
+    add_dropdown(lf_osc_settings, "Extraction Method:", "osc_method", ["Superpixel (2x2 -> 1px)", "Bilinear (Interpolated)"], "Superpixel (2x2 -> 1px)", 0, col_offset=1)
+    
+    add_check(lf_osc_settings, "Extract Red Channel", "osc_chan_r", True, 1, col_offset=0)
+    add_check(lf_osc_settings, "Extract Green Channel", "osc_chan_g", True, 1, col_offset=1)
+    add_check(lf_osc_settings, "Extract Blue Channel", "osc_chan_b", True, 2, col_offset=0)
+
+    osc_status_var = tk.StringVar(value="Ready")
+    osc_status_label = SelectableLabel(tab_pre_osc, textvariable=osc_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    osc_status_label.pack(pady=5, fill="x")
+
+    def show_osc_info():
+        info_text = (
+            "One-Shot Color (OSC) Channel Splitter\n\n"
+            "This tool extracts the individual Red, Green, and Blue channels from your color raw FITS images, "
+            "converting them into separate monochrome FITS files that Calibra can analyze.\n\n"
+            "Methods:\n"
+            "1. Superpixel (2x2 -> 1px) [Highly Recommended for Photometry]:\n"
+            "   Combines a 2x2 grid of pixels (R, G, G, B) into a single pixel at half resolution. "
+            "   This avoids any pixel interpolation or color 'bleeding' between channels, maintaining pure "
+            "   physical measurements and reducing noise (especially in Green). It scales the WCS header automatically.\n\n"
+            "2. Bilinear (Interpolated):\n"
+            "   Estimates missing color data at every pixel using standard bilinear interpolation. "
+            "   Keeps the original image resolution, but correlates noise and causes color bleeding near high-contrast stars.\n\n"
+            "Settings Alignment:\n"
+            "Once split, you will see new files in your File Manager (e.g. ending in _SP_G.fits). "
+            "Go to the 'Settings' tab and map the B-Filter and V-Filter keywords to 'B' and 'G' respectively "
+            "to run calibration on them."
+        )
+        messagebox.showinfo("About OSC Channel Splitter", info_text)
+
+    def on_run_osc_split():
+        selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        if not selected_iids:
+            messagebox.showwarning("No Selection", "Please check at least one FITS file in the File Manager.")
+            return
+            
+        bayer_pat = vars_dict["osc_pattern"][0].get()
+        method_str = vars_dict["osc_method"][0].get()
+        method = "superpixel" if "Superpixel" in method_str else "bilinear"
+        
+        chans = []
+        if vars_dict["osc_chan_r"][0].get(): chans.append('R')
+        if vars_dict["osc_chan_g"][0].get(): chans.append('G')
+        if vars_dict["osc_chan_b"][0].get(): chans.append('B')
+        
+        if not chans:
+            messagebox.showwarning("No Channels", "Please check at least one color channel (Red, Green, or Blue) to extract.")
+            return
+            
+        osc_status_var.set(f"Splitting {len(selected_iids)} OSC files...")
+        run_osc_btn.config(state=tk.DISABLED, text="Splitting...")
+        
+        def osc_thread():
+            try:
+                from photometry.osc_splitter import split_osc_fits
+                print(f"\n--- Starting Batch OSC Channel Split ---")
+                print(f"Target files: {len(selected_iids)}")
+                print(f"Pattern: {bayer_pat} | Method: {method} | Channels: {chans}")
+                
+                success_count = 0
+                new_files_added = 0
+                
+                for idx, iid in enumerate(selected_iids):
+                    iid_int = int(iid)
+                    orig_path = loaded_files[iid_int]['path']
+                    print(f"[{idx+1}/{len(selected_iids)}] Splitting {os.path.basename(orig_path)}...")
+                    
+                    try:
+                        out_dir = os.path.dirname(orig_path)
+                        split_paths = split_osc_fits(orig_path, output_dir=out_dir, pattern=bayer_pat, method=method, channels=chans)
+                        
+                        existing_paths = {f['path'] for f in loaded_files}
+                        for sp in split_paths:
+                            if sp not in existing_paths:
+                                loaded_files.append(scan_fits_header(sp))
+                                new_files_added += 1
+                        success_count += 1
+                    except Exception as fe:
+                        print(f"[{idx+1}/{len(selected_iids)}] Error splitting {os.path.basename(orig_path)}: {fe}")
+                
+                msg = f"OSC Channel Split complete.\nSuccessfully split {success_count} of {len(selected_iids)} files.\nImported {new_files_added} new monochrome frames into File Manager."
+                print(f"\n{msg}")
+                root.after(0, lambda: messagebox.showinfo("Batch Complete", msg))
+                root.after(0, lambda: osc_status_var.set("Complete."))
+                root.after(0, update_file_table)
+            except Exception as e:
+                print(f"OSC Split error: {e}")
+                root.after(0, lambda: messagebox.showerror("Error", f"OSC Split failed: {e}"))
+                root.after(0, lambda: osc_status_var.set("Error occurred."))
+            finally:
+                root.after(0, lambda: run_osc_btn.config(state=tk.NORMAL, text="Run OSC Channel Split on Selected"))
+                
+        threading.Thread(target=osc_thread, daemon=True).start()
+
+    osc_btn_frame = ttk.Frame(tab_pre_osc)
+    osc_btn_frame.pack(pady=20)
+    
+    run_osc_btn = tk.Button(osc_btn_frame, text="Run OSC Channel Split on Selected", command=on_run_osc_split,
+                             bg="#8e24aa", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
+    run_osc_btn.pack(side=tk.LEFT, padx=5)
+    
+    osc_info_btn = tk.Button(osc_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_osc_info,
+                              bg="#f0f2f5", fg="#8e24aa", font=("Arial", 11, "bold"), pady=10, padx=15)
+    osc_info_btn.pack(side=tk.LEFT, padx=5)
 
 
 
@@ -3243,8 +3363,15 @@ def run_config_gui(pipeline_callback=None):
     # Don't pack yet - packed after results arrive
     
     dm_summary_labels = {}
-    for col, key in enumerate(["total_stars", "total_suspects", "known_vsx", "new_discoveries", "median_rms"]):
-        nice_names = {"total_stars": "Stars Analyzed", "total_suspects": "Suspects", "known_vsx": "Known (VSX)", "new_discoveries": "New Discoveries", "median_rms": "Median RMS"}
+    for col, key in enumerate(["total_stars", "total_suspects", "total_noisy", "known_vsx", "new_discoveries", "median_rms"]):
+        nice_names = {
+            "total_stars": "Stars Analyzed", 
+            "total_suspects": "Suspects", 
+            "total_noisy": "Noisy (Rejected)", 
+            "known_vsx": "Known (VSX)", 
+            "new_discoveries": "New Discoveries", 
+            "median_rms": "Median RMS"
+        }
         tk.Label(dm_summary_frame, text=nice_names[key], font=("Segoe UI", 8), fg="#555", bg="#e8f5e9").grid(row=0, column=col, padx=15, pady=(5,0))
         lbl = tk.Label(dm_summary_frame, text="—", font=("Segoe UI", 14, "bold"), fg="#1a3a5f", bg="#e8f5e9")
         lbl.grid(row=1, column=col, padx=15, pady=(0,5))
@@ -3377,23 +3504,29 @@ def run_config_gui(pipeline_callback=None):
                     
                     mags = np.array([s['mean_mag'] for s in final_stats])
                     rms = np.array([s['rms'] for s in final_stats])
-                    sus = np.array([s.get('is_suspect', False) for s in final_stats])
                     
-                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect')]
+                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
                     suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                    noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
                     
-                    mags_stable = mags[~sus]
-                    rms_stable = rms[~sus]
-                    mags_sus = mags[sus]
-                    rms_sus = rms[sus]
+                    mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
+                    rms_stable = np.array([s['rms'] for s in stable_stars_list])
+                    
+                    mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
+                    rms_sus = np.array([s['rms'] for s in suspect_stars_list])
+                    
+                    mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
+                    rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
                     
                     # Task 4: Added picker=5 to enable clicks on points
                     sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
                     sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                    sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
                     
                     # Task 4: Store lists on collections to map indexes back to stars
                     sc_stable.star_list = stable_stars_list
                     sc_suspect.star_list = suspect_stars_list
+                    sc_noisy.star_list = noisy_stars_list
                     
                     if exp_func:
                         x_curve = np.linspace(np.min(mags), np.max(mags), 100)
@@ -3409,20 +3542,24 @@ def run_config_gui(pipeline_callback=None):
                     dm_canvas.draw()
                     
                     # Update summary statistics banner
-                    n_suspects = int(np.sum(sus))
+                    n_suspects = len(suspect_stars_list)
+                    n_noisy = len(noisy_stars_list)
                     n_total = len(final_stats)
                     n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
-                    n_new = n_suspects - n_known
+                    n_new = max(0, n_suspects - n_known)
                     med_rms = float(np.median(rms))
                     
                     dm_summary_labels["total_stars"].config(text=str(n_total))
                     dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                    dm_summary_labels["total_noisy"].config(text=str(n_noisy), fg="#7b1fa2" if n_noisy > 0 else "#1a3a5f")
                     dm_summary_labels["known_vsx"].config(text=str(n_known))
                     dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
                     dm_summary_labels["median_rms"].config(text=f"{med_rms:.4f}")
                     dm_summary_frame.pack(fill="x", padx=10, pady=(0, 5), before=dm_progress)
                     
                     status_parts = [f"Complete! {n_suspects} suspect(s)"]
+                    if n_noisy > 0:
+                        status_parts.append(f"{n_noisy} noisy star(s) rejected")
                     if n_known > 0:
                         status_parts.append(f"{n_known} known VSX")
                     if n_new > 0:
@@ -3504,7 +3641,7 @@ def run_config_gui(pipeline_callback=None):
                             s['id'], f"{s['ra_deg']:.6f}", f"{s['dec_deg']:.6f}", 
                             f"{s['mean_mag']:.4f}", f"{s['rms']:.5f}", f"{s.get('expected_rms', 0):.5f}", 
                             f"{s['excess_rms']:.5f}", s.get('n_valid', 0),
-                            'SUSPECT' if s.get('is_suspect') else '',
+                            'SUSPECT' if s.get('is_suspect') else ('NOISY' if s.get('is_noisy') else ''),
                             s.get('vsx_name', ''), s.get('vsx_type', '')
                         ])
                 messagebox.showinfo("Export Complete", f"Exported {len(dm_tree.final_stats)} stars to {path}")
@@ -3553,10 +3690,15 @@ def run_config_gui(pipeline_callback=None):
             "   Identifies the brightest, most stable stars across your sequence and builds an automated 'Global Ensemble'. It uses this ensemble to remove atmospheric variations (clouds, airmass) from all stars.\n\n"
             "4. Statistical Outlier Detection (Flagging):\n"
             "   It calculates the expected photometric 'noise floor' for your specific camera system based on Poisson statistics. Any star that fluctuates significantly above this expected noise curve (and > 0.03 mag absolute) is flagged as a Suspect.\n\n"
+            "5. VSX Cross-Matching:\n"
+            "   Automatically cross-matches suspects against the AAVSO International Variable Star Index (VSX) within 5 arcseconds. This flags known variables with their VSX Name and Type, making it easy to identify truly new discoveries.\n\n"
             "----------------------------\n"
-            "RESULTS:\n"
+            "RESULTS & INSPECTION FEATURES:\n"
+            "- Summary Banner: Real-time statistics showing Stars Analyzed, Suspects found, Known VSX matches, New Discoveries, and Median RMS.\n"
+            "- Row Coloring: Suspects passing the threshold are highlighted in red. 'Borderline' candidates (high excess scatter but not meeting full threshold criteria) are highlighted in amber for manual review.\n"
+            "- Right-Click Context Menu: Right-click any suspect to copy its RA/Dec, send it to the Time-Series/Light Curves tab, or copy the row data as CSV.\n"
             "- Variability Diagram: Stable stars are plotted as small blue dots. The green line represents the expected noise floor. Discovered Suspects are highlighted as large red stars.\n"
-            "- Send to Light Curves: Click on a suspect in the table and press the 'Send' button to instantly transfer its coordinates to the Light Curves tab for full analysis!\n"
+            "- Exporting: Use 'Export All Results' to output coordinates and photometry stats for every single tracked star in the field (both stable and variable) to a CSV for external analysis.\n"
         )
         info_box.insert(tk.END, details)
         info_box.config(state=tk.DISABLED)
@@ -3594,6 +3736,7 @@ def run_config_gui(pipeline_callback=None):
     # Configure row tags for coloring
     dm_tree.tag_configure("suspect", background="#ffcccc")
     dm_tree.tag_configure("borderline", background="#fff3cd")
+    dm_tree.tag_configure("noisy", background="#e8eaf6")
     
     def populate_dm_tree():
         for item in dm_tree.get_children():
@@ -3604,7 +3747,7 @@ def run_config_gui(pipeline_callback=None):
         stats_to_show = []
         if hasattr(dm_tree, 'final_stats') and dm_tree.final_stats:
             for s in dm_tree.final_stats:
-                if show_all or s.get('is_suspect'):
+                if show_all or s.get('is_suspect') or s.get('is_noisy'):
                     stats_to_show.append(s)
                     
         # Apply sorting
@@ -3634,14 +3777,14 @@ def run_config_gui(pipeline_callback=None):
                 # Task 2 Sorting on Valid column
                 stats_to_show.sort(key=lambda x: x.get('n_valid', 0), reverse=rev)
             elif col == "Flag":
-                stats_to_show.sort(key=lambda x: ("SUSPECT" if x.get('is_suspect') else ""), reverse=rev)
+                stats_to_show.sort(key=lambda x: ("SUSPECT" if x.get('is_suspect') else ("NOISY" if x.get('is_noisy') else "")), reverse=rev)
             elif col == "VSX Name":
                 stats_to_show.sort(key=lambda x: x.get('vsx_name', ''), reverse=rev)
             elif col == "VSX Type":
                 stats_to_show.sort(key=lambda x: x.get('vsx_type', ''), reverse=rev)
                 
         for s in stats_to_show:
-            flag = "SUSPECT" if s.get('is_suspect') else ""
+            flag = "SUSPECT" if s.get('is_suspect') else ("NOISY" if s.get('is_noisy') else "")
             vsx_name = s.get('vsx_name', '')
             vsx_type = s.get('vsx_type', '')
             
@@ -3649,6 +3792,8 @@ def run_config_gui(pipeline_callback=None):
             tag = ""
             if flag == "SUSPECT":
                 tag = "suspect"
+            elif flag == "NOISY":
+                tag = "noisy"
             elif s['excess_rms'] > 0.02 and s['rms'] > 2.0 * s.get('expected_rms', 0):
                 tag = "borderline"
                 

@@ -62,25 +62,36 @@ Calibra can perform basic instrumental calibration (Bias and Flat-fielding) for 
 ## 3.1 Plate Solving (via ASTAP)
 To perform photometric analysis, your FITS files must be plate solved (i.e., contain valid WCS headers like RA and DEC). If your raw files are not already plate solved, you can use Calibra's integrated **Plate Solving** tab. This feature utilizes ASTAP—an external command-line engine that must be installed separately, with its executable path provided in the GUI—to automatically add WCS coordinates to your files prior to analysis.
 
-## 3.2 Enabling Calibration
+## 3.2 One-Shot Color (OSC) Demultiplexing
+When using a One-Shot Color (OSC) camera, each exposure contains a mosaic of red, green, and blue sensitive pixels arranged in a Bayer pattern (e.g. RGGB, BGGR). For scientific-grade photometry, analyzing raw color frames directly can introduce systematic errors due to color-channel cross-talk and interpolation. 
+
+Calibra provides a dedicated **OSC Channel Split** tab under Pre-processing to demultiplex these files before ingestion into the photometry pipeline:
+*   **Bayer Pattern Options**: Supports common patterns including `RGGB`, `BGGR`, `GRBG`, and `GBRG`.
+*   **Extraction Methods**:
+    *   **Superpixel (2x2 -> 1px)** *(Highly Recommended)*: Combines each 2x2 grid of Bayer pixels into a single monochrome pixel. The red, green, and blue intensities are mapped to independent monochrome FITS files. Green values are averaged. Crucially, **no interpolation** is performed, preventing spatial leakage/bleeding between channels and maintaining physical measurement purity. WCS headers are automatically updated (coordinates `CRPIX` are scaled by 0.5, and pixel scales `CDELT`/`CD` are doubled) to preserve sub-pixel accuracy.
+    *   **Bilinear (Interpolated)**: Interpolates missing values for each color channel at every pixel coordinate to retain the original frame dimensions. Note that this correlates noise and is generally not recommended for high-precision science.
+*   **Workflow Integration**: Captured channels are written to disk as 16-bit integers (matching original storage footprint to prevent bloat) with suffixes `_SP_R.fits`, `_SP_G.fits`, and `_SP_B.fits`. They are automatically re-imported into the File Manager.
+*   **Photometric Calibration**: The split green channel behaves as a standard Johnson $V$ filter mock-up. By mapping `V-Filter Keyword` to `G` and `B-Filter Keyword` to `B` in the **Settings** tab, Calibra will calibrate the split frames directly against standard catalogues.
+
+## 3.3 Enabling Calibration
 In the **"Pre-processing"** tab of the Configuration GUI:
 1.  Check **"Enable Pre-processing (Apply Bias/Flats)"**.
 2.  Select your **Master Bias** file (Default: `C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits`).
 3.  Select your **Master Flat** files for both V-mag and B-mag.
 
-## 3.3 Automatic Filter Detection
+## 3.4 Automatic Filter Detection
 Calibra automatically reads the `FILTER` keyword from the FITS header of your target image.
 - If the filter contains **"B"**, the B-mag Master Flat is used.
 - Otherwise, the V-mag Master Flat is used by default.
 
-## 3.4 Output of Calibrated Files
+## 3.5 Output of Calibrated Files
 When pre-processing is enabled, Calibra performs the following operation:
 `Calibrated = (Raw - Bias) / (Flat / median(Flat))`
 I.e. it is assumed that the flat is already corrected for bias!
 
 The resulting calibrated images are saved as new FITS files in a `calibrated/` subfolder located within your input FITS directory (e.g., `C:\Astro\Photometry_Calibra\fitsfiles\calibrated\`). These files are then used for the subsequent star detection and photometry steps.
 
-## 3.5 Online Catalog Transformations
+## 3.6 Online Catalog Transformations
 Calibra defaults to **ATLAS-RefCat2** for high-precision zero-point calibration, but also supports **APASS DR9**, **GAIA_DR3**, and the **Landolt Standard Star Catalogue**.
 
 Since **ATLAS-RefCat2** and **GAIA_DR3** do not natively use the Johnson V/B filters, Calibra applies rigorous mathematical transformations to convert their native photometry for zero-point calibration. 
@@ -112,7 +123,7 @@ Based on **GAIA DR3 Documentation,Table 5.9**, which provides coefficients for V
 - $B = G - 0.01448 + 0.6874 \cdot C + 0.3604 \cdot C^2 - 0.06718 \cdot C^3 + 0.006061 \cdot C^4$
 - *where $C = G_{BP} - G_{RP}$*
 
-## 3.6 AAVSO VSX Integration (Variable Star Exclusion)
+## 3.7 AAVSO VSX Integration (Variable Star Exclusion)
 To ensure the highest photometric rigor, Calibra automatically cross-matches all detected stars and reference catalogs against the **AAVSO International Variable Star Index (VSX)** via VizieR (`B/vsx/vsx`).
 
 - **Calibration Rigor**: Any reference star found within 2 arcseconds of a known VSX variable is automatically excluded from the Zero-Point derivation.
@@ -253,18 +264,54 @@ The module produces three files in `photometry_output/`:
 
 ---
 
-## 7. Running the Pipeline: The Configuration GUI (v4.0)
+## 7. Data Mining (Automated Variable Star Discovery)
 
-Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v4.0, the interface is split into a persistent top panel and a set of six processing tabs:
+Calibra includes a powerful, automated **Data Mining** module designed to discover unknown or undocumented variable stars in your FITS image sequences without requiring any prior knowledge of targets or field geometry.
 
-### 7.1 FITS File Manager (Top Panel)
+### 7.1 Mathematical Principles of Detection
+Data Mining runs a bulk analysis over a sequence of images to detect variability statistically:
+1.  **Bulk Tracking**: Every detected point source in a user-selected reference frame is registered. The algorithm tracks their positions across all loaded frames in the sequence (using sub-pixel centroid refinement).
+2.  **Ensemble Detrending**: To remove global systematic variations (such as atmospheric extinction changes, passing thin clouds, or minor tracking errors), Calibra builds a "Global Ensemble" from the brightest, most stable stars in the field. Every star's light curve is detrended against this global ensemble.
+3.  **Poisson Noise Floor Modeling**: The pipeline fits a statistical "noise floor" curve describing the expected RMS scatter as a function of stellar magnitude. This noise floor represents the physical limit of the camera and is calculated using Poisson photon noise:
+    $$\sigma_{\text{expected}}^2 \approx \sigma_{\text{poisson}}^2 + \sigma_{\text{sky}}^2 + \sigma_{\text{read}}^2$$
+4.  **Excess Scatter Flagging**: Any star exhibiting a measured standard deviation (RMS) that lies significantly above the fitted noise floor and exceeds a minimum absolute variability threshold (default: 0.03 mag) is flagged as a **Suspect**.
+
+### 7.2 Catalog Cross-Matching & VSX Integration
+Once suspects are identified, Calibra performs a spatial query against the **AAVSO International Variable Star Index (VSX)** via VizieR. 
+- A search radius of 5 arcseconds is used to correlate suspects with known variables.
+- Suspects are automatically categorized:
+  - **Known VSX Variables**: Displays the official VSX Name and Variability Type (e.g. `RRAB`, `EA`, `SR`).
+  - **New Discoveries**: Marked explicitly if no VSX match is found within the search radius.
+- Real-time statistics are shown in the GUI, showing:
+  - **Stars Analyzed**: Total number of tracked stars in the field.
+  - **Suspects**: Total candidates exceeding the variability threshold.
+  - **Known VSX**: Number of candidates matching known VSX records.
+  - **New Discoveries**: Number of candidate variables without matching catalog records.
+  - **Median RMS**: Overall quality metric of the photometry sequence.
+
+### 7.3 Interactivity & Data Export
+- **Visual Mapping**: The module generates a **Variability Diagram** (RMS Scatter vs. Magnitude) showing all stable stars (blue dots), the fitted noise floor (green line), and suspects (large red stars).
+- **Row Coloring**: The Suspects Table highlights candidates for easy manual verification (Red for full suspects, Amber for borderline candidates with elevated scatter).
+- **Right-Click Context Menu**:
+  - *Copy RA/Dec*: Quick clipboard copying for target identification.
+  - *Send to Light Curves*: Instantly exports coordinates to the Light Curves tab for detailed time-series plotting.
+  - *Copy Row as CSV*: Copies a single star's data to the clipboard.
+- **Exporting Results**: Click **"Export All Results"** to save a CSV containing coordinates, mean magnitudes, RMS scatter, excess scatter, and VSX metadata for every single star tracked in the sequence.
+
+---
+
+## 8. Running the Pipeline: The Configuration GUI (v4.0)
+
+Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. In v4.0, the interface is split into a persistent top panel and a set of eight processing tabs:
+
+### 8.1 FITS File Manager (Top Panel)
 Always visible at the top of the window, this centralized manager allows you to load, preview, and select your FITS files.
 - **Add Files/Directory**: Load your images.
 - **Preview**: View FITS headers directly in the GUI.
 - **Selection**: Check the boxes next to files to select them for Plate Solving, Calibration, or Analysis.
-- **Interactive Viewer**: Double-click any file in the list to open the **Interactive FITS Viewer** (see Section 7.1.1).
+- **Interactive Viewer**: Double-click any file in the list to open the **Interactive FITS Viewer** (see Section 8.1.1).
 
-#### 7.1.1 Interactive FITS Viewer
+#### 8.1.1 Interactive FITS Viewer
 
 The FITS Viewer is a powerful, integrated inspection and configuration tool. It opens as a separate window when you double-click a file in the File Manager.
 
@@ -296,39 +343,34 @@ The FITS Viewer is a powerful, integrated inspection and configuration tool. It 
 
 7.  **Image Display**: The FITS rendering uses `ZScaleInterval` with the display floor set to the image median, producing a dark background with high star contrast. Zoom in/out with the scroll wheel; pan by clicking and dragging.
 
-### 7.2 Processing Tabs
+### 8.2 Processing Tabs
 1.  **About**: Version information and a summary of Calibra's capabilities.
-2.  **⚙ Settings**: All shared configuration in one scrollable tab:
-    - **Reference Catalog**: Select from ATLAS, APASS, GAIA, Landolt.
-    - **Region Filtering**: Restrict analysis to specific pixel or RA/DEC windows.
-    - **CCD Settings**: Gain, Read Noise, Dark Current, and Saturation Limit for formal error analysis.
-    - **Detection**: DAOStarFinder parameters (sigma, sharpness, roundness).
-    - **Aperture Photometry**: PSF box size, aperture radius, annulus inner/outer radii.
-    - **Zero Point Calibration**: Match tolerance, default ZP, min SNR, catalog search radius.
-    - **Atmospheric Extinction**: Shared $k_V$ and $k_B$ values used by all analysis modes.
-    - **Output Toggles**: Control diagnostic plots, detailed calibration logs, shift analysis.
-3.  **Plate Solving**: Directly integrates with the ASTAP command-line engine to add WCS coordinates to raw FITS files.
-    - Requires ASTAP executable path and an active internet connection (or downloaded database).
-    - Files are processed non-destructively (saved with a `_wcs` suffix).
-4.  **🔍 Analysis & Calibration**: A unified top-to-bottom workflow for all primary photometry tasks:
-    - **Pipeline Configuration**: Runs the full star detection and zero-point calibration pipeline on the FITS files selected in the File Manager.
-    - **Color Transformation**: Automatically populates from pipeline results. Computes transformation coefficients from paired B/V images with live preview plots.
-    - **Differential Photometry**: Applies transformation coefficients to compute standard magnitudes relative to a reference star. Features an Accuracy Evaluation preview plot.
-5.  **Time Series**: Time-series photometry for variable star analysis:
+2.  **Pre-processing**: Subdivided into:
+    - **FITS Calibration**: Standard Bias and Flat field correction.
+    - **WCS Plate Solving**: Command-line integration with ASTAP to append celestial coordinates.
+    - **OSC Channel Split**: One-Shot Color Bayer demultiplexing (Superpixel & Bilinear).
+3.  **🔍 Analysis & Calibration**: A unified top-to-bottom workflow for all primary photometry tasks:
+    - **1. Detection & Zero-Point**: Runs the full star detection and zero-point calibration pipeline.
+    - **2. Color Coefficients**: Computes transformation coefficients from paired B/V images.
+    - **3. Differential Photometry**: Applies transformation coefficients to compute standard magnitudes relative to a reference star.
+4.  **Time Series**: Time-series photometry for variable star analysis:
     - **FITS Sequence Selection**: Glob pattern for a sequence of images.
-    - **Ensemble Reference Stars**: Up to 5 comparison stars, resolved via SIMBAD with automatic catalog data retrieval.
+    - **Ensemble Reference Stars**: Up to 5 comparison stars, resolved via SIMBAD.
     - **Target Star**: The variable star to measure.
-    - **Check Star**: One ensemble star can be designated as a check star for independent validation.
-    - **FITS Viewer Integration**: Stars selected in the Interactive FITS Viewer can be exported directly into the Light Curves tab via the "Export Stars to LC Tab" button, automatically populating names, coordinates, magnitudes, and B-V values.
+    - **Check Star**: One ensemble star designated as a check star for independent validation.
     - **Generate Light Curve**: Outputs an AAVSO Extended Format report, a detailed CSV, and a light curve plot.
-6.  **Help**: Links to the README and this User Manual.
-
+5.  **Data Mining**: Visualizations, statistics, and table results for automated variable star discovery.
+6.  **⚙ Settings**: Grid configuration sub-tabs:
+    - **Astro & Catalog**: Reference catalog selection, region filtering, zero point limits.
+    - **Camera & Photometry**: Gain, read noise, saturation limits, detection thresholds, and aperture sizes.
+    - **Operator & Session**: AAVSO observer codes, session directories, and logger options.
+7.  **Help**: Quick markdown links to the README and this User Manual.
 
 ---
 
-## 8. Understanding the Output
+## 9. Understanding the Output
 
-### 8.1 Results CSV (`photometry_output/`)
+### 9.1 Results CSV (`photometry_output/`)
 The primary output for every image. Key columns include:
 - `refined_x` / `refined_y`: The high-precision sub-pixel coordinates.
 - `ra_hms` / `dec_dms`: Celestial coordinates from the WCS header.
@@ -338,7 +380,7 @@ The primary output for every image. Key columns include:
 - `is_variable`: A "Yes/No" flag indicating if the star matched a record in the AAVSO VSX catalog.
 - `airmass`: The atmospheric airmass calculated from the FITS header.
 
-### 8.2 Diagnostic Plots (`photometry_plots/`)
+### 9.2 Diagnostic Plots (`photometry_plots/`)
 If enabled, the pipeline saves a four-panel graphic for each star showing:
 1.  **Raw Data**: The original pixel cutout.
 2.  **Gaussian Model**: The idealized mathematical fit.
@@ -347,7 +389,7 @@ If enabled, the pipeline saves a four-panel graphic for each star showing:
 
 ---
 
-## 9. Troubleshooting & Tips
+## 10. Troubleshooting & Tips
 - **No Stars Found?** Verify your `Detection Sigma`. Lower it (e.g., to 3.0) for faint targets or increase it (e.g., to 10.0) for crowded fields.
 - **Calibration Failures?** 
     - Check if the FITS header has valid `RA`/`DEC` keywords for online queries.
