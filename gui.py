@@ -105,7 +105,7 @@ def run_config_gui(pipeline_callback=None):
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "4.0"
+    APP_VERSION = "4.1"
     root = tk.Tk()
     root.title(f"Calibra v{APP_VERSION} - Astro Analysis & Photometry Suite")
     root.geometry("1100x750")
@@ -4494,7 +4494,7 @@ def run_config_gui(pipeline_callback=None):
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 4.0 \tLatest Update: 2026-05-17", font=("Arial", 10), bg="white").pack(fill="x")
+    tk.Label(info_frame, text="Version: 4.1 \tLatest Update: 2026-05-22", font=("Arial", 10), bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
     desc_text = (
