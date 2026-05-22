@@ -274,7 +274,7 @@ Data Mining runs a bulk analysis over a sequence of images to detect variability
 2.  **Ensemble Detrending**: To remove global systematic variations (such as atmospheric extinction changes, passing thin clouds, or minor tracking errors), Calibra builds a "Global Ensemble" from the brightest, most stable stars in the field. Every star's light curve is detrended against this global ensemble.
 3.  **Poisson Noise Floor Modeling**: The pipeline fits a statistical "noise floor" curve describing the expected RMS scatter as a function of stellar magnitude. This noise floor represents the physical limit of the camera and is calculated using Poisson photon noise:
     $$\sigma_{\text{expected}}^2 \approx \sigma_{\text{poisson}}^2 + \sigma_{\text{sky}}^2 + \sigma_{\text{read}}^2$$
-4.  **Excess Scatter Flagging**: Any star exhibiting a measured standard deviation (RMS) that lies significantly above the fitted noise floor and exceeds a minimum absolute variability threshold (default: 0.03 mag) is flagged as a **Suspect**.
+4.  **Excess Scatter Flagging**: Any star exhibiting a measured standard deviation (RMS) that lies significantly above the fitted noise floor and exceeds a minimum absolute variability threshold (default: 0.03 mag) is flagged as a **Suspect**. The pipeline also uses Median Absolute Deviation (MAD) to filter out stars with massive, unphysical frame-to-frame jumps (such as cosmic rays or tracking errors), correctly reclassifying them as **Noisy** rather than suspect variables.
 
 ### 7.2 Catalog Cross-Matching & VSX Integration
 Once suspects are identified, Calibra performs a spatial query against the **AAVSO International Variable Star Index (VSX)** via VizieR. 
@@ -290,11 +290,12 @@ Once suspects are identified, Calibra performs a spatial query against the **AAV
   - **Median RMS**: Overall quality metric of the photometry sequence.
 
 ### 7.3 Interactivity & Data Export
-- **Visual Mapping**: The module generates a **Variability Diagram** (RMS Scatter vs. Magnitude) showing all stable stars (blue dots), the fitted noise floor (green line), and suspects (large red stars).
-- **Row Coloring**: The Suspects Table highlights candidates for easy manual verification (Red for full suspects, Amber for borderline candidates with elevated scatter).
-- **Right-Click Context Menu**:
+- **Visual Mapping**: The module generates a **Variability Diagram** (RMS Scatter vs. Magnitude) showing all stable stars (blue dots), the fitted noise floor (green line), and suspects (large red stars). The diagram is fully interactive: selecting a row in the table draws a bright yellow halo and ID label around the corresponding point in the diagram, and clicking points on the plot highlights them.
+- **Row Coloring & Columns**: The Suspects Table highlights candidates for easy manual verification (Red for full suspects, Amber for borderline candidates with elevated scatter). It includes a **Valid Frames** column to show how many images the star was successfully measured in.
+- **Right-Click Context Menu & Preview**:
   - *Copy RA/Dec*: Quick clipboard copying for target identification.
   - *Send to Light Curves*: Instantly exports coordinates to the Light Curves tab for detailed time-series plotting.
+  - *Preview Light Curve*: Select a suspect and click this dedicated button to instantly view a pop-up plot of the magnitude across all frames without leaving the tab.
   - *Copy Row as CSV*: Copies a single star's data to the clipboard.
 - **Exporting Results**: Click **"Export All Results"** to save a CSV containing coordinates, mean magnitudes, RMS scatter, excess scatter, and VSX metadata for every single star tracked in the sequence.
 

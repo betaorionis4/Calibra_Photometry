@@ -2,7 +2,7 @@ import numpy as np
 import warnings
 from astropy.io import fits
 from astropy.wcs import WCS
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats, mad_std
 from astropy.utils.exceptions import AstropyWarning
 from photutils.detection import DAOStarFinder
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
@@ -353,8 +353,9 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         if len(clean_mags) > 0:
             final_mean, _, final_rms = sigma_clipped_stats(clean_mags, sigma=4.0, maxiters=2, cenfunc='median', stdfunc='std')
             _, _, tight_rms = sigma_clipped_stats(clean_mags, sigma=2.5, maxiters=5, cenfunc='median', stdfunc='std')
+            mad_rms = mad_std(clean_mags, ignore_nan=True)
         else:
-            final_mean, final_rms, tight_rms = np.nan, np.nan, np.nan
+            final_mean, final_rms, tight_rms, mad_rms = np.nan, np.nan, np.nan, np.nan
         n_valid = np.sum(data['valid_mask'])
         
         final_stats.append({
@@ -364,6 +365,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             'mean_mag': final_mean,
             'rms': final_rms,
             'tight_rms': tight_rms,
+            'mad_rms': mad_rms,
             'n_valid': n_valid,
             'corrected_mags': list(corrected_mags)
         })
@@ -410,7 +412,16 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         s['is_noisy'] = False
         if is_suspect:
             tight_val = s.get('tight_rms', np.nan)
+            mad_val = s.get('mad_rms', np.nan)
+            
+            # Reclassify as noisy if sigma-clipped scatter is low OR mad scatter is low
+            is_flat = False
             if not np.isnan(tight_val) and tight_val < 1.5 * exp_rms:
+                is_flat = True
+            if not np.isnan(mad_val) and mad_val < 1.5 * exp_rms:
+                is_flat = True
+                
+            if is_flat:
                 s['is_suspect'] = False
                 s['is_noisy'] = True
             else:
