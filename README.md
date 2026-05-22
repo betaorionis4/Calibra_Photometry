@@ -1,6 +1,6 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 4.0 — 2026-05-17
+**Version:** 4.1 — 2026-05-22
 **Description:** 
 An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformation coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. Calibra features **Ensemble Differential Photometry** with multiple comparison stars, **Time-Series Light Curve** generation with AAVSO-format reporting, an **Interactive FITS Viewer** with role-based star marking, real-time PSF analysis, and bidirectional synchronization with the photometry pipeline. It integrates **AAVSO VSX** cross-matching to automatically exclude known variable stars from calibration sets.
 
@@ -8,8 +8,18 @@ The code was created with lots of help from Google Antigravity (various agents),
 
 ---
 
+## What's New in v4.1
+
+- **Data Mining Robustness**: Relaxed the VSX cross-match radius from 5 arcsec to 10 arcsec and added adaptive bounding box calculations to prevent `Max stars` warnings and WCS boundary clipping issues. Implemented advanced outlier rejection using Median Absolute Deviation (MAD) to correctly classify stars with extreme frame-to-frame magnitude jumps as `NOISY` rather than false-positive variables.
+- **Interactive Data Mining UI**: Enhanced the Data Mining tab with an interactive variability diagram (clicking points highlights rows, selecting rows draws a yellow halo), a new "Valid Frames" column, and a fast "Preview Light Curve" pop-up for rapid candidate review.
+- **Interactive FITS Header Editor**: Added a new graphical editor accessible via the File Manager to inspect, modify, add, or delete FITS header keywords and values, providing a quick way to fix missing data like filters or exposure times.
+  
+---
+
 ## What's New in v4.0
 
+- **Data Mining & Variable Star Discovery**: Added an automated data mining tab to scan FITS sequences. Combines DAOStarFinder star tracking, global ensemble detrending, and statistical excess RMS scatter calculations (Poisson noise floor modeling) to identify candidate variable stars. Automatically cross-matches candidates against the AAVSO International Variable Star Index (VSX) to label known variable types and highlight new discoveries.
+- **One-Shot Color (OSC) Demultiplexing**: Added a dedicated pre-processing tab to split raw color Bayer FITS files into Red, Green, and Blue channels. Supports `Superpixel` (2x2 -> 1px, preserving physical flux with automatic WCS scaling) and `Bilinear` interpolation methods. Automatically imports split frames back into the File Manager.
 - **Interactive FITS Viewer Keyboard Shortcuts**: Hover the mouse cursor over a star in the FITS Viewer and press single-key hotkeys to instantly assign stellar roles (`V` for Variable, `R` for Reference, `C` for Check) or press `Delete`/`Backspace` to remove a marker, bypassing right-click menus entirely for lightning-fast sequencing.
 - **Integrated FITS Viewer Launchers**: Added `Open Selected FITS in Viewer` buttons in both the main File Manager toolbar and the Light Curves analysis panel. Allows users to instantly open any selected image, view stellar profiles, and synchronize targets/check stars bidirectionally with a single click.
 - **Educational Quick-Help Modals**: Added `❓ What does this do?` popup helpers next to all execution buttons in FITS Calibration, ASTAP Plate Solving, and Time-Series Photometry tabs, offering detailed guides on theoretical principles.
@@ -61,10 +71,12 @@ For a more detailed dive into the mathematical principles, theoretical backgroun
 ### Key Manual Sections:
 *   **Theory of Operation**: Aperture Photometry vs. Sky Annulus math.
 *   **Mathematical Principles**: PSF Fitting, Sub-pixel Refinement, and Error Propagation.
+*   **FITS Pre-processing & OSC Split**: Plate solving via ASTAP, flat/bias calibration, and demultiplexing raw One-Shot Color Bayer FITS files (RGGB, BGGR, etc.) via Superpixel extraction with scaled WCS parameters.
 *   **The Processing Pipeline**: From Star Detection to Shift Analysis and color calibration.
 *   **Differential Photometry**: Computing formal AAVSO-ready magnitudes ($B$, $V$, $B-V$) using reference stars.
 *   **Time-Series & Light Curves**: Ensemble comparison star photometry with formal uncertainty propagation.
-*   **GUI Guide**: The v4.0 Interactive FITS Viewer, FITS File Manager, unified Analysis tab layout, and Plate Solving.
+*   **Data Mining**: Statistical excess scatter calculations, global ensemble detrending, and VizieR AAVSO VSX cross-matching.
+*   **GUI Guide**: The v4.0 Interactive FITS Viewer, FITS File Manager, sidebar tabs, and Settings configuration.
 
 ---
 

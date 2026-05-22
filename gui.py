@@ -208,6 +208,8 @@ def run_config_gui(pipeline_callback=None):
             tab_analysis_outer.tkraise()
         elif tab_name == "ts":
             tab_ts_outer.tkraise()
+        elif tab_name == "datamining":
+            tab_datamining_outer.tkraise()
         elif tab_name == "settings":
             tab_settings_outer.tkraise()
         elif tab_name == "about":
@@ -1288,7 +1290,11 @@ def run_config_gui(pipeline_callback=None):
     toolbar_frame = ttk.Frame(file_manager_frame)
     toolbar_frame.pack(fill="x", padx=5, pady=5)
     
-    def update_file_table():
+    def update_file_table(select_iid=None):
+        # Remember selection if select_iid is not explicitly passed
+        current_selection = tree.selection()
+        prev_selected_iid = current_selection[0] if current_selection else None
+        
         # Clear existing items
         for item in tree.get_children():
             tree.delete(item)
@@ -1354,8 +1360,13 @@ def run_config_gui(pipeline_callback=None):
                 if curr not in unique_filters:
                     vars_dict["ts_filter"][0].set(unique_filters[0])
         
-        # Select first item if nothing selected
-        if tree.get_children() and not tree.selection():
+        # Select target item, or re-select previous, or select first item if nothing selected
+        target_iid = select_iid if select_iid is not None else prev_selected_iid
+        if target_iid is not None and tree.exists(str(target_iid)):
+            tree.selection_set(str(target_iid))
+            tree.see(str(target_iid))
+            on_tree_select(None)
+        elif tree.get_children():
             first_iid = tree.get_children()[0]
             tree.selection_set(first_iid)
             tree.see(first_iid)
@@ -1481,11 +1492,376 @@ def run_config_gui(pipeline_callback=None):
     tree.configure(xscrollcommand=ts_hsb.set)
     ts_hsb.grid(row=1, column=0, sticky="ew")
     
-    add_treeview_copy_menu(tree)
+    # Right-click context menu for the treeview
+    tree_menu = tk.Menu(tree, tearoff=0)
     
+    def on_edit_header_context():
+        on_edit_header()
+        
+    def copy_to_clipboard(iids):
+        if not iids:
+            return
+        lines = []
+        cols = tree["columns"]
+        header = "\t".join([tree.heading(c)["text"] for c in cols if tree.heading(c)["text"]])
+        if header:
+            lines.append(header)
+        for iid in iids:
+            values = tree.item(iid, "values")
+            lines.append("\t".join([str(v) for v in values]))
+        data = "\n".join(lines)
+        tree.clipboard_clear()
+        tree.clipboard_append(data)
+
+    def copy_selected():
+        copy_to_clipboard(tree.selection())
+
+    def copy_all():
+        copy_to_clipboard(tree.get_children())
+
+    tree_menu.add_command(label="✏️ Edit FITS Header...", command=on_edit_header_context)
+    tree_menu.add_separator()
+    tree_menu.add_command(label="Copy Selected Rows (Excel-ready)", command=copy_selected)
+    tree_menu.add_command(label="Copy Entire List (Excel-ready)", command=copy_all)
+
+    def show_tree_menu(event):
+        item = tree.identify_row(event.y)
+        if item and item not in tree.selection():
+            tree.selection_set(item)
+        tree_menu.post(event.x_root, event.y_root)
+
+    tree.bind("<Button-3>", show_tree_menu)
+    
+    def open_header_editor(file_path, file_idx):
+        if not os.path.exists(file_path):
+            messagebox.showerror("Error", f"File not found: {file_path}")
+            return
+            
+        editor_win = tk.Toplevel(root)
+        editor_win.title(f"✏️ Edit FITS Header - {os.path.basename(file_path)}")
+        editor_win.geometry("750x650")
+        editor_win.minsize(650, 550)
+        editor_win.transient(root)
+        editor_win.grab_set()
+        editor_win.configure(bg="#f0f2f5")
+
+        # Center popup over root window
+        editor_win.update_idletasks()
+        rx = root.winfo_x()
+        ry = root.winfo_y()
+        rw = root.winfo_width()
+        rh = root.winfo_height()
+        px = rx + (rw - 750) // 2
+        py = ry + (rh - 650) // 2
+        editor_win.geometry(f"+{px}+{py}")
+
+        # Top Header Frame
+        top_frame = tk.Frame(editor_win, bg="#1a3a5f", pady=12)
+        top_frame.pack(fill="x", side=tk.TOP)
+        tk.Label(top_frame, text="✏️ FITS Header Editor", font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack()
+        tk.Label(top_frame, text=file_path, font=("Segoe UI", 8, "italic"), fg="#cbd5e1", bg="#1a3a5f").pack()
+
+        # Structural keywords definition
+        STRUCTURAL_KEYWORDS = {
+            'SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'EXTEND', 
+            'BSCALE', 'BZERO', 'PCOUNT', 'GCOUNT', 'TFIELDS', 'XTENSION'
+        }
+        COMMENTARY_KEYWORDS = {'COMMENT', 'HISTORY', ''}
+
+        # Load cards in memory
+        from astropy.io import fits
+        all_cards = []
+        try:
+            with fits.open(file_path) as hdul:
+                hdr = hdul[0].header
+                for card in hdr.cards:
+                    if card.keyword:
+                        val_str = str(card.value) if card.value is not None else ''
+                        comment = card.comment or ''
+                        all_cards.append([card.keyword.upper(), val_str, comment])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read FITS header: {e}")
+            editor_win.destroy()
+            return
+
+        # Main body container
+        body_frame = tk.Frame(editor_win, bg="#f0f2f5", padx=10, pady=10)
+        body_frame.pack(fill="both", expand=True)
+
+        # Search Bar
+        search_frame = ttk.Frame(body_frame)
+        search_frame.pack(fill="x", pady=(0, 5))
+        
+        ttk.Label(search_frame, text="🔍 Search Card:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=search_var)
+        search_entry.pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        search_entry.focus_set()
+
+        # Cards Treeview Frame
+        table_frame = ttk.Frame(body_frame)
+        table_frame.pack(fill="both", expand=True)
+
+        editor_tree = ttk.Treeview(table_frame, columns=("key", "val", "comment"), show="headings", selectmode="browse")
+        editor_tree.heading("key", text="Keyword")
+        editor_tree.heading("val", text="Value")
+        editor_tree.heading("comment", text="Comment")
+        
+        editor_tree.column("key", width=120, anchor=tk.W)
+        editor_tree.column("val", width=200, anchor=tk.W)
+        editor_tree.column("comment", width=350, anchor=tk.W)
+
+        # Scrollbars for table
+        v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=editor_tree.yview)
+        editor_tree.configure(yscrollcommand=v_scroll.set)
+        h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=editor_tree.xview)
+        editor_tree.configure(xscrollcommand=h_scroll.set)
+
+        editor_tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        # Style tag for structural keys to show them in light grey
+        editor_tree.tag_configure('structural', foreground='#94a3b8', background='#f8fafc')
+        editor_tree.tag_configure('even', background='#ffffff')
+        editor_tree.tag_configure('odd', background='#f1f5f9')
+
+        # Filter function
+        def refresh_tree(event=None):
+            for item in editor_tree.get_children():
+                editor_tree.delete(item)
+            
+            query = search_var.get().lower().strip()
+            for idx, (key, val, comment) in enumerate(all_cards):
+                if not query or query in key.lower() or query in val.lower() or query in comment.lower():
+                    tag = 'even' if idx % 2 == 0 else 'odd'
+                    if key in STRUCTURAL_KEYWORDS:
+                        tag = 'structural'
+                    editor_tree.insert('', tk.END, iid=str(idx), values=(key, val, comment), tags=(tag,))
+
+        search_var.trace_add("write", lambda *args: refresh_tree())
+
+        # Inputs Form Frame
+        form_frame = ttk.LabelFrame(body_frame, text="Edit / Add Card")
+        form_frame.pack(fill="x", pady=10)
+
+        for i in range(3):
+            form_frame.columnconfigure(i, weight=1)
+
+        ttk.Label(form_frame, text="Keyword (max 8 chars):", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Label(form_frame, text="Value:", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        ttk.Label(form_frame, text="Comment:", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w", padx=10, pady=5)
+
+        key_var = tk.StringVar()
+        val_var = tk.StringVar()
+        comment_var = tk.StringVar()
+
+        def limit_key(*args):
+            s = key_var.get().upper().strip()
+            if len(s) > 8:
+                s = s[:8]
+            key_var.set(s)
+        key_var.trace_add("write", limit_key)
+
+        key_entry = ttk.Entry(form_frame, textvariable=key_var)
+        val_entry = ttk.Entry(form_frame, textvariable=val_var)
+        comment_entry = ttk.Entry(form_frame, textvariable=comment_var)
+
+        key_entry.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        val_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        comment_entry.grid(row=1, column=2, sticky="ew", padx=10, pady=5)
+
+        # Form Buttons
+        form_btn_frame = ttk.Frame(form_frame)
+        form_btn_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
+
+        def on_select_card(event):
+            selected = editor_tree.selection()
+            if not selected:
+                return
+            idx = int(selected[0])
+            k, v, c = all_cards[idx]
+            key_var.set(k)
+            val_var.set(v)
+            comment_var.set(c)
+
+        editor_tree.bind("<<TreeviewSelect>>", on_select_card)
+
+        def clear_form():
+            editor_tree.selection_remove(editor_tree.selection())
+            key_var.set("")
+            val_var.set("")
+            comment_var.set("")
+
+        def apply_changes():
+            key = key_var.get().strip().upper()
+            val = val_var.get()
+            comment = comment_var.get().strip()
+
+            if not key:
+                messagebox.showwarning("Validation Error", "Keyword cannot be empty.")
+                return
+
+            if key in STRUCTURAL_KEYWORDS:
+                if not messagebox.askyesno("Warning", f"'{key}' is a structural FITS keyword. Modifying it can corrupt the FITS file layout. Are you sure you want to proceed?"):
+                    return
+
+            selected = editor_tree.selection()
+            if selected:
+                idx = int(selected[0])
+                all_cards[idx] = [key, val, comment]
+            else:
+                existing_idx = None
+                for idx, (k, _, _) in enumerate(all_cards):
+                    if k == key and key not in COMMENTARY_KEYWORDS:
+                        existing_idx = idx
+                        break
+                if existing_idx is not None:
+                    all_cards[existing_idx] = [key, val, comment]
+                else:
+                    all_cards.append([key, val, comment])
+            
+            refresh_tree()
+            clear_form()
+
+        def delete_card():
+            selected = editor_tree.selection()
+            if not selected:
+                messagebox.showwarning("No Selection", "Please select a card to delete.")
+                return
+            
+            idx = int(selected[0])
+            key, _, _ = all_cards[idx]
+            
+            if key in STRUCTURAL_KEYWORDS:
+                if not messagebox.askyesno("Warning", f"'{key}' is a structural FITS keyword. Deleting it can corrupt the FITS file layout. Are you sure you want to proceed?"):
+                    return
+
+            if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the '{key}' card?"):
+                all_cards.pop(idx)
+                refresh_tree()
+                clear_form()
+
+        ttk.Button(form_btn_frame, text="Apply / Add Card", command=apply_changes).pack(side=tk.LEFT, padx=5)
+        ttk.Button(form_btn_frame, text="Delete Card", command=delete_card).pack(side=tk.LEFT, padx=5)
+        ttk.Button(form_btn_frame, text="Clear Fields", command=clear_form).pack(side=tk.LEFT, padx=5)
+
+        # Bottom Window Controls
+        bottom_frame = ttk.Frame(editor_win)
+        bottom_frame.pack(fill="x", side=tk.BOTTOM, padx=10, pady=10)
+
+        def save_and_close():
+            # Automatically apply any active edits before saving
+            key = key_var.get().strip().upper()
+            if key:
+                val = val_var.get()
+                comment = comment_var.get().strip()
+                selected = editor_tree.selection()
+                if selected:
+                    idx = int(selected[0])
+                    all_cards[idx] = [key, val, comment]
+                else:
+                    existing_idx = None
+                    for idx, (k, _, _) in enumerate(all_cards):
+                        if k == key and key not in COMMENTARY_KEYWORDS:
+                            existing_idx = idx
+                            break
+                    if existing_idx is not None:
+                        all_cards[existing_idx] = [key, val, comment]
+                    else:
+                        all_cards.append([key, val, comment])
+
+            def parse_fits_value(val_str):
+                val_str_stripped = val_str.strip()
+                if not val_str_stripped:
+                    return None
+                if val_str_stripped.upper() == 'TRUE':
+                    return True
+                if val_str_stripped.upper() == 'FALSE':
+                    return False
+                try:
+                    if '.' not in val_str_stripped and (val_str_stripped.isdigit() or (val_str_stripped.startswith('-') and val_str_stripped[1:].isdigit())):
+                        return int(val_str_stripped)
+                except ValueError:
+                    pass
+                try:
+                    return float(val_str_stripped)
+                except ValueError:
+                    pass
+                if (val_str_stripped.startswith("'") and val_str_stripped.endswith("'")) or (val_str_stripped.startswith('"') and val_str_stripped.endswith('"')):
+                    return val_str_stripped[1:-1]
+                return val_str_stripped
+
+            try:
+                with fits.open(file_path, mode='update') as hdul:
+                    hdr = hdul[0].header
+                    
+                    new_std_keys = {card[0].upper() for card in all_cards if card[0].upper() not in STRUCTURAL_KEYWORDS and card[0].upper() not in COMMENTARY_KEYWORDS}
+                    
+                    for key in list(hdr.keys()):
+                        key_upper = key.upper()
+                        if key_upper not in STRUCTURAL_KEYWORDS and key_upper not in COMMENTARY_KEYWORDS:
+                            if key_upper not in new_std_keys:
+                                try:
+                                    del hdr[key]
+                                except KeyError:
+                                    pass
+                                    
+                    for key, val_str, comment in all_cards:
+                        key_upper = key.upper()
+                        if key_upper in STRUCTURAL_KEYWORDS:
+                            parsed_val = parse_fits_value(val_str)
+                            hdr.set(key, parsed_val, comment)
+                        elif key_upper in COMMENTARY_KEYWORDS:
+                            continue
+                        else:
+                            parsed_val = parse_fits_value(val_str)
+                            hdr.set(key, parsed_val, comment)
+                    
+                    hdul.flush()
+                
+                loaded_files[file_idx] = scan_fits_header(file_path)
+                update_file_table(select_iid=str(file_idx))
+                on_tree_select(None)
+                
+                messagebox.showinfo("Success", "FITS header saved successfully.")
+                editor_win.destroy()
+                
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Could not save FITS header: {e}")
+
+        # Save button styled with accent green
+        style = ttk.Style()
+        style.configure("Save.TButton", background="#2e7d32", foreground="white", font=("Segoe UI", 9, "bold"))
+        style.map("Save.TButton", background=[("active", "#1b5e20")])
+
+        ttk.Button(bottom_frame, text="Save to FITS File", style="Save.TButton", command=save_and_close).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Cancel", command=editor_win.destroy).pack(side=tk.RIGHT, padx=5)
+
+        refresh_tree()
+
     # Right side: Header Viewer
     right_side = tk.LabelFrame(paned, text=f"{get_icon('📄', '')} FITS Header Preview".strip())
     paned.add(right_side, width=350)
+    
+    # Edit button frame at the top of the preview pane
+    hdr_btn_frame = ttk.Frame(right_side)
+    hdr_btn_frame.pack(side=tk.TOP, fill="x", padx=5, pady=5)
+    
+    def on_edit_header():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a FITS file in the table first.")
+            return
+        iid = selected[0]
+        file_path = loaded_files[int(iid)]['path']
+        open_header_editor(file_path, int(iid))
+        
+    edit_hdr_btn = ttk.Button(hdr_btn_frame, text="✏️ Edit FITS Header...", command=on_edit_header)
+    edit_hdr_btn.pack(fill="x", expand=True)
     
     header_text = tk.Text(right_side, font=("Courier", 9), wrap=tk.NONE, bg="#fdfdfe")
     h_hsb = ttk.Scrollbar(right_side, orient="horizontal", command=header_text.xview)
@@ -1568,8 +1944,12 @@ def run_config_gui(pipeline_callback=None):
     sub_solve_scroll = ScrollableFrame(pre_notebook)
     tab_pre_right = sub_solve_scroll.scrollable_frame
     
+    sub_osc_scroll = ScrollableFrame(pre_notebook)
+    tab_pre_osc = sub_osc_scroll.scrollable_frame
+    
     pre_notebook.add(sub_calib_scroll, text=f"{get_icon('🧪', '')}  FITS Calibration".strip())
     pre_notebook.add(sub_solve_scroll, text=f"{get_icon('🧭', '')}  WCS Plate Solving".strip())
+    pre_notebook.add(sub_osc_scroll, text=f"{get_icon('🌈', '')}  OSC Channel Split".strip())
     
     tab_pre = tab_pre_left
 
@@ -1605,7 +1985,15 @@ def run_config_gui(pipeline_callback=None):
     ts_scroll.pack(fill="both", expand=True)
     tab_ts = ts_scroll.scrollable_frame
 
-    # --- TAB 5: Settings ---
+    # --- TAB 5: Data Mining ---
+    tab_datamining_outer = ttk.Frame(content_container)
+    tab_datamining_outer.grid(row=0, column=0, sticky="nsew")
+    
+    dm_scroll = ScrollableFrame(tab_datamining_outer)
+    dm_scroll.pack(fill="both", expand=True)
+    tab_datamining = dm_scroll.scrollable_frame
+
+    # --- TAB 6: Settings ---
     tab_settings_outer = ttk.Frame(content_container)
     tab_settings_outer.grid(row=0, column=0, sticky="nsew")
     
@@ -1897,6 +2285,122 @@ def run_config_gui(pipeline_callback=None):
     plate_info_btn = tk.Button(plate_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_plate_solve_info,
                                bg="#f0f2f5", fg="#0288d1", font=("Arial", 11, "bold"), pady=10, padx=15)
     plate_info_btn.pack(side=tk.LEFT, padx=5)
+
+
+    # 3. OSC Channel Splitter Tab CONTENT
+    lf_osc = tk.LabelFrame(tab_pre_osc, text="One-Shot Color (OSC) Demultiplexing")
+    lf_osc.pack(fill="x", padx=10, pady=10)
+    
+    tk.Label(lf_osc, text="Extract monochrome Red, Green, and/or Blue FITS channels from OSC Bayered files.\nSuperpixel mode reduces resolution by 2x to avoid interpolation artifacts.", justify=tk.LEFT).pack(padx=10, pady=10)
+
+    lf_osc_settings = tk.LabelFrame(tab_pre_osc, text="Splitter Settings")
+    lf_osc_settings.pack(fill="x", padx=10, pady=10)
+    
+    add_dropdown(lf_osc_settings, "Bayer Pattern:", "osc_pattern", ["RGGB", "BGGR", "GRBG", "GBRG"], "RGGB", 0, col_offset=0)
+    add_dropdown(lf_osc_settings, "Extraction Method:", "osc_method", ["Superpixel (2x2 -> 1px)", "Bilinear (Interpolated)"], "Superpixel (2x2 -> 1px)", 0, col_offset=1)
+    
+    add_check(lf_osc_settings, "Extract Red Channel", "osc_chan_r", True, 1, col_offset=0)
+    add_check(lf_osc_settings, "Extract Green Channel", "osc_chan_g", True, 1, col_offset=1)
+    add_check(lf_osc_settings, "Extract Blue Channel", "osc_chan_b", True, 2, col_offset=0)
+
+    osc_status_var = tk.StringVar(value="Ready")
+    osc_status_label = SelectableLabel(tab_pre_osc, textvariable=osc_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    osc_status_label.pack(pady=5, fill="x")
+
+    def show_osc_info():
+        info_text = (
+            "One-Shot Color (OSC) Channel Splitter\n\n"
+            "This tool extracts the individual Red, Green, and Blue channels from your color raw FITS images, "
+            "converting them into separate monochrome FITS files that Calibra can analyze.\n\n"
+            "Methods:\n"
+            "1. Superpixel (2x2 -> 1px) [Highly Recommended for Photometry]:\n"
+            "   Combines a 2x2 grid of pixels (R, G, G, B) into a single pixel at half resolution. "
+            "   This avoids any pixel interpolation or color 'bleeding' between channels, maintaining pure "
+            "   physical measurements and reducing noise (especially in Green). It scales the WCS header automatically.\n\n"
+            "2. Bilinear (Interpolated):\n"
+            "   Estimates missing color data at every pixel using standard bilinear interpolation. "
+            "   Keeps the original image resolution, but correlates noise and causes color bleeding near high-contrast stars.\n\n"
+            "Settings Alignment:\n"
+            "Once split, you will see new files in your File Manager (e.g. ending in _SP_G.fits). "
+            "Go to the 'Settings' tab and map the B-Filter and V-Filter keywords to 'B' and 'G' respectively "
+            "to run calibration on them."
+        )
+        messagebox.showinfo("About OSC Channel Splitter", info_text)
+
+    def on_run_osc_split():
+        selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        if not selected_iids:
+            messagebox.showwarning("No Selection", "Please check at least one FITS file in the File Manager.")
+            return
+            
+        bayer_pat = vars_dict["osc_pattern"][0].get()
+        method_str = vars_dict["osc_method"][0].get()
+        method = "superpixel" if "Superpixel" in method_str else "bilinear"
+        
+        chans = []
+        if vars_dict["osc_chan_r"][0].get(): chans.append('R')
+        if vars_dict["osc_chan_g"][0].get(): chans.append('G')
+        if vars_dict["osc_chan_b"][0].get(): chans.append('B')
+        
+        if not chans:
+            messagebox.showwarning("No Channels", "Please check at least one color channel (Red, Green, or Blue) to extract.")
+            return
+            
+        osc_status_var.set(f"Splitting {len(selected_iids)} OSC files...")
+        run_osc_btn.config(state=tk.DISABLED, text="Splitting...")
+        
+        def osc_thread():
+            try:
+                from photometry.osc_splitter import split_osc_fits
+                print(f"\n--- Starting Batch OSC Channel Split ---")
+                print(f"Target files: {len(selected_iids)}")
+                print(f"Pattern: {bayer_pat} | Method: {method} | Channels: {chans}")
+                
+                success_count = 0
+                new_files_added = 0
+                
+                for idx, iid in enumerate(selected_iids):
+                    iid_int = int(iid)
+                    orig_path = loaded_files[iid_int]['path']
+                    print(f"[{idx+1}/{len(selected_iids)}] Splitting {os.path.basename(orig_path)}...")
+                    
+                    try:
+                        out_dir = os.path.dirname(orig_path)
+                        split_paths = split_osc_fits(orig_path, output_dir=out_dir, pattern=bayer_pat, method=method, channels=chans)
+                        
+                        existing_paths = {f['path'] for f in loaded_files}
+                        for sp in split_paths:
+                            if sp not in existing_paths:
+                                loaded_files.append(scan_fits_header(sp))
+                                new_files_added += 1
+                        success_count += 1
+                    except Exception as fe:
+                        print(f"[{idx+1}/{len(selected_iids)}] Error splitting {os.path.basename(orig_path)}: {fe}")
+                
+                msg = f"OSC Channel Split complete.\nSuccessfully split {success_count} of {len(selected_iids)} files.\nImported {new_files_added} new monochrome frames into File Manager."
+                print(f"\n{msg}")
+                root.after(0, lambda: messagebox.showinfo("Batch Complete", msg))
+                root.after(0, lambda: osc_status_var.set("Complete."))
+                root.after(0, update_file_table)
+            except Exception as e:
+                print(f"OSC Split error: {e}")
+                root.after(0, lambda: messagebox.showerror("Error", f"OSC Split failed: {e}"))
+                root.after(0, lambda: osc_status_var.set("Error occurred."))
+            finally:
+                root.after(0, lambda: run_osc_btn.config(state=tk.NORMAL, text="Run OSC Channel Split on Selected"))
+                
+        threading.Thread(target=osc_thread, daemon=True).start()
+
+    osc_btn_frame = ttk.Frame(tab_pre_osc)
+    osc_btn_frame.pack(pady=20)
+    
+    run_osc_btn = tk.Button(osc_btn_frame, text="Run OSC Channel Split on Selected", command=on_run_osc_split,
+                             bg="#8e24aa", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
+    run_osc_btn.pack(side=tk.LEFT, padx=5)
+    
+    osc_info_btn = tk.Button(osc_btn_frame, text=f"{get_icon('❓', '?')} What does this do?", command=show_osc_info,
+                              bg="#f0f2f5", fg="#8e24aa", font=("Arial", 11, "bold"), pady=10, padx=15)
+    osc_info_btn.pack(side=tk.LEFT, padx=5)
 
 
 
@@ -3207,6 +3711,690 @@ def run_config_gui(pipeline_callback=None):
     ts_tree.pack(side=tk.LEFT, fill="both", expand=True)
     ts_vsb.pack(side=tk.RIGHT, fill="y")
 
+    # =========================================================================
+    # --- TAB 5: DATA MINING ---
+    # =========================================================================
+    dm_container = tk.Frame(tab_datamining, bg="white")
+    dm_container.pack(fill="both", expand=True, padx=20, pady=10)
+
+    tk.Label(dm_container, text=f"{get_icon('🚀', '')}  Data Mining & Variable Star Discovery", font=("Segoe UI", 16, "bold"), fg="#1a3a5f", bg="white").pack(anchor="w", pady=(0,10))
+    
+    # 1. Config Frame
+    lf_dm_config = tk.LabelFrame(dm_container, text="Data Mining Configuration", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_config.pack(fill="x", pady=5)
+    
+    add_entry(lf_dm_config, "Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0)
+    add_entry(lf_dm_config, "Saturation Limit (ADU):", "dm_saturation", 55000, 1, vtype=int)
+    add_entry(lf_dm_config, "Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, vtype=int)
+    add_entry(lf_dm_config, "Min Valid Frames Fraction (0.0 - 1.0):", "dm_min_valid_pct", 0.7, 3)
+    add_check(lf_dm_config, "Fast Test Mode (limit ensemble to top 100 stars)", "dm_fast_test", True, 4)
+    
+    dm_status_var = tk.StringVar(value="Ready to discover.")
+    tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
+    
+    # Summary Statistics Banner (hidden until results are available)
+    dm_summary_frame = tk.Frame(dm_container, bg="#e8f5e9", bd=1, relief="solid")
+    # Don't pack yet - packed after results arrive
+    
+    dm_summary_labels = {}
+    for col, key in enumerate(["total_stars", "total_suspects", "total_noisy", "known_vsx", "new_discoveries", "median_rms"]):
+        nice_names = {
+            "total_stars": "Stars Analyzed", 
+            "total_suspects": "Suspects", 
+            "total_noisy": "Noisy (Rejected)", 
+            "known_vsx": "Known (VSX)", 
+            "new_discoveries": "New Discoveries", 
+            "median_rms": "Median RMS"
+        }
+        tk.Label(dm_summary_frame, text=nice_names[key], font=("Segoe UI", 8), fg="#555", bg="#e8f5e9").grid(row=0, column=col, padx=15, pady=(5,0))
+        lbl = tk.Label(dm_summary_frame, text="—", font=("Segoe UI", 14, "bold"), fg="#1a3a5f", bg="#e8f5e9")
+        lbl.grid(row=1, column=col, padx=15, pady=(0,5))
+        dm_summary_labels[key] = lbl
+    
+    # 2. Execution Button & Progress
+    dm_progress = ttk.Progressbar(dm_container, orient="horizontal", length=400, mode="determinate")
+    
+    def on_run_datamining():
+        from photometry.data_mining import detect_all_stars, track_and_measure, calibrate_and_analyze, cross_match_vsx_suspects
+        import threading
+        import numpy as np
+        import os
+        from astropy.io import fits as dm_fits
+        from astropy.wcs import WCS as dm_WCS
+        
+        selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        if not selected_iids:
+            messagebox.showerror("No Files", "Please select at least one FITS file in the File Manager.")
+            return
+            
+        fits_files = [loaded_files[int(iid)]['path'] for iid in selected_iids]
+        ref_file = fits_files[0]
+        
+        detect_sig = vars_dict["dm_detect_sigma"][0].get()
+        sat_limit = vars_dict["dm_saturation"][0].get()
+        edge_buf = vars_dict["dm_edge_buffer"][0].get()
+        min_pct = vars_dict["dm_min_valid_pct"][0].get()
+        is_fast = vars_dict["dm_fast_test"][0].get()
+        
+        # Aperture settings are shared with general config
+        ap_rad = vars_dict["aperture_radius"][0].get()
+        ann_in = vars_dict["annulus_inner"][0].get()
+        ann_out = vars_dict["annulus_outer"][0].get()
+        
+        cancel_event = threading.Event()
+        
+        dm_progress.pack(pady=5)
+        dm_progress["value"] = 0
+        
+        btn_cancel = tk.Button(dm_container, text="Cancel", command=cancel_event.set, bg="#d32f2f", fg="white", font=("Arial", 9, "bold"))
+        btn_cancel.pack(pady=5)
+        
+        run_dm_btn.config(state=tk.DISABLED)
+        
+        def dm_thread():
+            try:
+                dm_status_var.set("Phase 1/3: Detecting stars in reference frame...")
+                master_cat = detect_all_stars(ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf)
+                
+                if cancel_event.is_set(): return
+                
+                if is_fast and len(master_cat) > 100:
+                    master_cat = master_cat[:100]
+                    
+                if not master_cat:
+                    dm_status_var.set("Error: No stars detected in reference frame.")
+                    return
+                    
+                dm_status_var.set(f"Phase 2/3: Tracking {len(master_cat)} stars across {len(fits_files)} frames...")
+                
+                def update_prog(val):
+                    root.after(0, lambda: dm_progress.configure(value=val))
+                    
+                track_res, warnings_lst = track_and_measure(
+                    fits_files, master_cat, 
+                    aperture_radius=ap_rad, annulus_inner=ann_in, annulus_outer=ann_out,
+                    saturation_limit=sat_limit, edge_buffer=edge_buf,
+                    cancel_event=cancel_event, progress_callback=update_prog
+                )
+                
+                if cancel_event.is_set(): return
+                if warnings_lst:
+                    warn_msg = "\n".join(warnings_lst)
+                    root.after(0, lambda: messagebox.showwarning("Data Mining Warnings", warn_msg))
+                    
+                # VSX Cross-Match: extract center RA/Dec from reference frame
+                center_ra_dm, center_dec_dm = None, None
+                try:
+                    with dm_fits.open(ref_file) as hdul:
+                        hdr = hdul[0].header
+                        w = dm_WCS(hdr)
+                        if w.has_celestial:
+                            ny, nx = hdul[0].data.shape[:2] if hdul[0].data is not None else (1000, 1000)
+                            center_ra_dm, center_dec_dm = w.all_pix2world(nx/2, ny/2, 0)
+                            center_ra_dm, center_dec_dm = float(center_ra_dm), float(center_dec_dm)
+                except Exception:
+                    pass
+
+                dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
+                
+                out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
+                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct, center_ra=center_ra_dm, center_dec=center_dec_dm)
+                
+                if not final_stats:
+                    dm_status_var.set("Analysis complete, but no valid stars survived filters.")
+                    return
+                
+                dm_status_var.set("Cross-matching suspects with AAVSO VSX catalog...")
+                known_count = cross_match_vsx_suspects(final_stats, center_ra_dm, center_dec_dm, radius_arcmin=30.0, verbose=True)
+                    
+                # Update UI
+                def update_ui():
+                    dm_tree.final_stats = final_stats
+                    
+                    # Reset sorting column text highlights (removing / adding arrows)
+                    col_headers = {
+                        "ID": "ID",
+                        "RA": "RA (deg)",
+                        "Dec": "Dec (deg)",
+                        "Mean Mag": "Mean Mag",
+                        "RMS": "RMS",
+                        "Excess": "Excess RMS",
+                        "Valid": "Valid",
+                        "Flag": "Flag"
+                    }
+                    for c_id, base_text in col_headers.items():
+                        if c_id == dm_tree.sort_col:
+                            arrow = " ▼" if dm_tree.sort_desc else " ▲"
+                            dm_tree.heading(c_id, text=base_text + arrow)
+                        else:
+                            dm_tree.heading(c_id, text=base_text)
+                            
+                    populate_dm_tree()
+                    
+                    dm_fig.clear()
+                    ax = dm_fig.add_subplot(111)
+                    dm_tree.ax = ax  # Store active axis reference
+                    dm_tree.highlight_artists = []  # Clear highlights
+                    
+                    mags = np.array([s['mean_mag'] for s in final_stats])
+                    rms = np.array([s['rms'] for s in final_stats])
+                    
+                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
+                    suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                    noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
+                    
+                    mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
+                    rms_stable = np.array([s['rms'] for s in stable_stars_list])
+                    
+                    mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
+                    rms_sus = np.array([s['rms'] for s in suspect_stars_list])
+                    
+                    mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
+                    rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
+                    
+                    # Task 4: Added picker=5 to enable clicks on points
+                    sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
+                    sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                    sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
+                    
+                    # Task 4: Store lists on collections to map indexes back to stars
+                    sc_stable.star_list = stable_stars_list
+                    sc_suspect.star_list = suspect_stars_list
+                    sc_noisy.star_list = noisy_stars_list
+                    
+                    if exp_func:
+                        x_curve = np.linspace(np.min(mags), np.max(mags), 100)
+                        y_curve = exp_func(x_curve)
+                        ax.plot(x_curve, y_curve, c='green', lw=2, label='Expected Noise Floor')
+                        
+                    ax.set_xlabel("Mean Instrumental Mag")
+                    ax.set_ylabel("RMS (std dev)")
+                    ax.set_title("Stellar Variability Diagram")
+                    ax.legend()
+                    if not ax.xaxis_inverted():
+                        ax.invert_xaxis()
+                    dm_canvas.draw()
+                    
+                    # Update summary statistics banner
+                    n_suspects = len(suspect_stars_list)
+                    n_noisy = len(noisy_stars_list)
+                    n_total = len(final_stats)
+                    n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
+                    n_new = max(0, n_suspects - n_known)
+                    med_rms = float(np.median(rms))
+                    
+                    dm_summary_labels["total_stars"].config(text=str(n_total))
+                    dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                    dm_summary_labels["total_noisy"].config(text=str(n_noisy), fg="#7b1fa2" if n_noisy > 0 else "#1a3a5f")
+                    dm_summary_labels["known_vsx"].config(text=str(n_known))
+                    dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
+                    dm_summary_labels["median_rms"].config(text=f"{med_rms:.4f}")
+                    dm_summary_frame.pack(fill="x", padx=10, pady=(0, 5), before=dm_progress)
+                    
+                    status_parts = [f"Complete! {n_suspects} suspect(s)"]
+                    if n_noisy > 0:
+                        status_parts.append(f"{n_noisy} noisy star(s) rejected")
+                    if n_known > 0:
+                        status_parts.append(f"{n_known} known VSX")
+                    if n_new > 0:
+                        status_parts.append(f"{n_new} potential new discovery!")
+                    status_parts.append(f"Saved to {out_csv}")
+                    dm_status_var.set(" | ".join(status_parts))
+                
+                root.after(0, update_ui)
+                
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                dm_status_var.set("Error occurred.")
+            finally:
+                root.after(0, lambda: dm_progress.pack_forget())
+                root.after(0, lambda: btn_cancel.pack_forget())
+                root.after(0, lambda: run_dm_btn.config(state=tk.NORMAL))
+                
+        threading.Thread(target=dm_thread, daemon=True).start()
+
+    dm_btn_frame = tk.Frame(dm_container, bg="white")
+    dm_btn_frame.pack(pady=5)
+    
+    run_dm_btn = tk.Button(dm_btn_frame, text="Run Data Mining", command=on_run_datamining,
+                           bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
+    run_dm_btn.pack(side=tk.LEFT, padx=10)
+    
+    def on_send_suspect():
+        selected = dm_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a star from the table first.")
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        ra_deg, dec_deg = float(vals[1]), float(vals[2])
+        
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg))
+        ra_hms = coord.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+        dec_dms = coord.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+        
+        vars_dict["ts_target_ra"][0].set(ra_hms)
+        vars_dict["ts_target_dec"][0].set(dec_dms)
+        vars_dict["ts_target_mode"][0].set("manual")
+        ts_target_name_var.set(f"Suspect_{vals[0]}")
+        messagebox.showinfo("Sent", f"Target {vals[0]} coordinates sent to Light Curves tab!")
+        switch_tab("ts")
+
+    send_btn = tk.Button(dm_btn_frame, text="Send Suspect to Light Curves", command=on_send_suspect,
+                           bg="#f57c00", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
+    send_btn.pack(side=tk.LEFT, padx=10)
+
+    # Task 5: Added Preview Light Curve button
+    def on_preview_click():
+        selected = dm_tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Star", "Please select a star from the table to preview its light curve.")
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        show_mini_lightcurve(vals[0])
+
+    preview_btn = tk.Button(dm_btn_frame, text="Preview Light Curve", command=on_preview_click,
+                             bg="#2e7d32", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
+    preview_btn.pack(side=tk.LEFT, padx=10)
+
+    def on_export_all_click():
+        if not hasattr(dm_tree, 'final_stats') or not dm_tree.final_stats:
+            messagebox.showwarning("No Data", "No results to export.")
+            return
+        from tkinter import filedialog
+        import csv
+        path = filedialog.asksaveasfilename(initialdir="photometry_output", defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if path:
+            try:
+                with open(path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["ID", "RA (deg)", "Dec (deg)", "Mean Mag", "RMS", "Expected RMS", "Excess RMS", "Valid Frames", "Flag", "VSX Name", "VSX Type"])
+                    for s in dm_tree.final_stats:
+                        writer.writerow([
+                            s['id'], f"{s['ra_deg']:.6f}", f"{s['dec_deg']:.6f}", 
+                            f"{s['mean_mag']:.4f}", f"{s['rms']:.5f}", f"{s.get('expected_rms', 0):.5f}", 
+                            f"{s['excess_rms']:.5f}", s.get('n_valid', 0),
+                            'SUSPECT' if s.get('is_suspect') else ('NOISY' if s.get('is_noisy') else ''),
+                            s.get('vsx_name', ''), s.get('vsx_type', '')
+                        ])
+                messagebox.showinfo("Export Complete", f"Exported {len(dm_tree.final_stats)} stars to {path}")
+            except Exception as e:
+                messagebox.showerror("Export Failed", str(e))
+
+    export_all_btn = tk.Button(dm_btn_frame, text="Export All Results", command=on_export_all_click,
+                             bg="#f0f2f5", fg="#1a3a5f", font=("Arial", 10, "bold"), pady=10, padx=15)
+    export_all_btn.pack(side=tk.LEFT, padx=10)
+
+    def show_dm_help():
+        pop = tk.Toplevel(root)
+        pop.title("About Data Mining (Variable Star Discovery)")
+        pop.geometry("650x550")
+        pop.resizable(False, False)
+        pop.transient(root)
+        pop.configure(bg="white")
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 650) // 2
+        py = ry + (rh - 550) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=15)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text=f"{get_icon('🚀', '')}  Data Mining & Discovery".strip(), font=("Segoe UI", 13, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        content_frame = tk.Frame(pop, bg="white", padx=20, pady=15)
+        content_frame.pack(fill="both", expand=True)
+        
+        info_box = scrolledtext.ScrolledText(content_frame, font=("Segoe UI", 9), bg="white", fg="#333333", relief="flat", wrap=tk.WORD)
+        info_box.pack(fill="both", expand=True)
+        
+        details = (
+            "WHAT DATA MINING DOES:\n"
+            "----------------------------\n"
+            "This tool automatically scans your entire FITS sequence to discover unknown variable stars! It operates without requiring any prior knowledge of targets or reference stars.\n\n"
+            "HOW IT WORKS:\n"
+            "1. Star Detection:\n"
+            "   Identifies all point sources in your reference frame using DAOStarFinder.\n\n"
+            "2. Bulk Photometry:\n"
+            "   Tracks every star across every loaded frame and measures its instrumental magnitude.\n\n"
+            "3. Global Calibration:\n"
+            "   Identifies the brightest, most stable stars across your sequence and builds an automated 'Global Ensemble'. It uses this ensemble to remove atmospheric variations (clouds, airmass) from all stars.\n\n"
+            "4. Statistical Outlier Detection (Flagging):\n"
+            "   It calculates the expected photometric 'noise floor' for your specific camera system based on Poisson statistics. Any star that fluctuates significantly above this expected noise curve (and > 0.03 mag absolute) is flagged as a Suspect.\n\n"
+            "5. VSX Cross-Matching:\n"
+            "   Automatically cross-matches suspects against the AAVSO International Variable Star Index (VSX) within 5 arcseconds. This flags known variables with their VSX Name and Type, making it easy to identify truly new discoveries.\n\n"
+            "----------------------------\n"
+            "RESULTS & INSPECTION FEATURES:\n"
+            "- Summary Banner: Real-time statistics showing Stars Analyzed, Suspects found, Known VSX matches, New Discoveries, and Median RMS.\n"
+            "- Row Coloring: Suspects passing the threshold are highlighted in red. 'Borderline' candidates (high excess scatter but not meeting full threshold criteria) are highlighted in amber for manual review.\n"
+            "- Right-Click Context Menu: Right-click any suspect to copy its RA/Dec, send it to the Time-Series/Light Curves tab, or copy the row data as CSV.\n"
+            "- Variability Diagram: Stable stars are plotted as small blue dots. The green line represents the expected noise floor. Discovered Suspects are highlighted as large red stars.\n"
+            "- Exporting: Use 'Export All Results' to output coordinates and photometry stats for every single tracked star in the field (both stable and variable) to a CSV for external analysis.\n"
+        )
+        info_box.insert(tk.END, details)
+        info_box.config(state=tk.DISABLED)
+        
+        btn_close = tk.Button(content_frame, text="Got it!", command=pop.destroy, 
+                              bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"), 
+                              relief="flat", width=15, pady=8)
+        btn_close.pack(pady=(15, 0))
+    
+    tk.Button(dm_btn_frame, text="❓ What does this do?", command=show_dm_help, bg="#f0f2f5", fg="#00796b", font=("Arial", 9, "bold"), pady=10, padx=15).pack(side=tk.LEFT, padx=10)
+
+    # 3. Plot Frame
+    lf_dm_plot = tk.LabelFrame(dm_container, text="Variability Diagram", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_plot.pack(fill="both", expand=True, padx=10, pady=5)
+    
+    dm_fig, dm_ax = plt.subplots(figsize=(8, 4))
+    dm_canvas = FigureCanvasTkAgg(dm_fig, master=lf_dm_plot)
+    dm_canvas.get_tk_widget().pack(fill="both", expand=True)
+    dm_toolbar = NavigationToolbar2Tk(dm_canvas, lf_dm_plot)
+    dm_toolbar.update()
+    
+    # 4. Table Frame
+    lf_dm_table = tk.LabelFrame(dm_container, text="Suspects Table", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_dm_table.pack(fill="both", expand=True, padx=10, pady=5)
+    
+    # Filter frame above Treeview
+    dm_filter_frame = tk.Frame(lf_dm_table, bg="white")
+    dm_filter_frame.pack(fill="x", side=tk.TOP, padx=5, pady=5)
+    
+    show_non_suspects_var = tk.BooleanVar(value=False)
+    
+    # Task 2: Added "Valid" column to columns tuple
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type"), show='headings', height=8)
+    
+    # Configure row tags for coloring
+    dm_tree.tag_configure("suspect", background="#ffcccc")
+    dm_tree.tag_configure("borderline", background="#fff3cd")
+    dm_tree.tag_configure("noisy", background="#e8eaf6")
+    
+    def populate_dm_tree():
+        for item in dm_tree.get_children():
+            dm_tree.delete(item)
+            
+        show_all = show_non_suspects_var.get()
+        
+        stats_to_show = []
+        if hasattr(dm_tree, 'final_stats') and dm_tree.final_stats:
+            for s in dm_tree.final_stats:
+                if show_all or s.get('is_suspect') or s.get('is_noisy'):
+                    stats_to_show.append(s)
+                    
+        # Apply sorting
+        if hasattr(dm_tree, 'sort_col') and dm_tree.sort_col:
+            col = dm_tree.sort_col
+            rev = dm_tree.sort_desc
+            
+            def try_numeric(val):
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return str(val).lower()
+                    
+            if col == "ID":
+                stats_to_show.sort(key=lambda x: try_numeric(x['id']), reverse=rev)
+            elif col == "RA":
+                stats_to_show.sort(key=lambda x: x['ra_deg'], reverse=rev)
+            elif col == "Dec":
+                stats_to_show.sort(key=lambda x: x['dec_deg'], reverse=rev)
+            elif col == "Mean Mag":
+                stats_to_show.sort(key=lambda x: x['mean_mag'], reverse=rev)
+            elif col == "RMS":
+                stats_to_show.sort(key=lambda x: x['rms'], reverse=rev)
+            elif col == "Excess":
+                stats_to_show.sort(key=lambda x: x['excess_rms'], reverse=rev)
+            elif col == "Valid":
+                # Task 2 Sorting on Valid column
+                stats_to_show.sort(key=lambda x: x.get('n_valid', 0), reverse=rev)
+            elif col == "Flag":
+                stats_to_show.sort(key=lambda x: ("SUSPECT" if x.get('is_suspect') else ("NOISY" if x.get('is_noisy') else "")), reverse=rev)
+            elif col == "VSX Name":
+                stats_to_show.sort(key=lambda x: x.get('vsx_name', ''), reverse=rev)
+            elif col == "VSX Type":
+                stats_to_show.sort(key=lambda x: x.get('vsx_type', ''), reverse=rev)
+                
+        for s in stats_to_show:
+            flag = "SUSPECT" if s.get('is_suspect') else ("NOISY" if s.get('is_noisy') else "")
+            vsx_name = s.get('vsx_name', '')
+            vsx_type = s.get('vsx_type', '')
+            
+            # Row coloring based on flag
+            tag = ""
+            if flag == "SUSPECT":
+                tag = "suspect"
+            elif flag == "NOISY":
+                tag = "noisy"
+            elif s['excess_rms'] > 0.02 and s['rms'] > 2.0 * s.get('expected_rms', 0):
+                tag = "borderline"
+                
+            # Task 2: Populate Valid count
+            dm_tree.insert("", tk.END, values=(
+                s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
+                f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}",
+                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type
+            ), tags=(tag,) if tag else ())
+            
+    def sort_column(col):
+        if dm_tree.sort_col == col:
+            dm_tree.sort_desc = not dm_tree.sort_desc
+        else:
+            dm_tree.sort_col = col
+            dm_tree.sort_desc = False
+            
+        col_headers = {
+            "ID": "ID",
+            "RA": "RA (deg)",
+            "Dec": "Dec (deg)",
+            "Mean Mag": "Mean Mag",
+            "RMS": "RMS",
+            "Excess": "Excess RMS",
+            "Valid": "Valid",
+            "Flag": "Flag",
+            "VSX Name": "VSX Name",
+            "VSX Type": "VSX Type"
+        }
+        for c_id, base_text in col_headers.items():
+            if c_id == col:
+                arrow = " ▼" if dm_tree.sort_desc else " ▲"
+                dm_tree.heading(c_id, text=base_text + arrow)
+            else:
+                dm_tree.heading(c_id, text=base_text)
+                
+        populate_dm_tree()
+        
+    # Task 3: Draw a bright yellow halo and label over selected star in plot
+    def highlight_star_in_plot(star):
+        if not hasattr(dm_tree, 'ax') or not dm_tree.ax:
+            return
+        if hasattr(dm_tree, 'highlight_artists') and dm_tree.highlight_artists:
+            for artist in dm_tree.highlight_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            dm_tree.highlight_artists = []
+            
+        x = star['mean_mag']
+        y = star['rms']
+        
+        # Yellow circle around point
+        halo = dm_tree.ax.scatter([x], [y], s=120, facecolors='none', edgecolors='#ffd600', linewidths=2.0, zorder=10)
+        
+        # Text label above point
+        ylim = dm_tree.ax.get_ylim()
+        y_offset = 0.015 * (ylim[1] - ylim[0])
+        label = dm_tree.ax.text(x, y + y_offset, f"{star['id']}", 
+                                color='black', fontsize=9, fontweight='bold',
+                                bbox=dict(facecolor='yellow', alpha=0.8, boxstyle='round,pad=0.2'),
+                                zorder=11, ha='center')
+                           
+        dm_tree.highlight_artists = [halo, label]
+        dm_canvas.draw_idle()
+        
+    # Task 5: Non-blocking Toplevel popup window for Magnitude vs Frame preview
+    def show_mini_lightcurve(star_id):
+        star = None
+        for s in dm_tree.final_stats:
+            if str(s['id']) == str(star_id):
+                star = s
+                break
+        if not star or 'corrected_mags' not in star:
+            messagebox.showwarning("No Data", f"No magnitude data available for star {star_id}.")
+            return
+            
+        pop = tk.Toplevel(root)
+        pop.title(f"Light Curve Preview: {star_id}")
+        pop.geometry("600x400")
+        pop.configure(bg="white")
+        pop.transient(root)
+        
+        pop.update_idletasks()
+        rx, ry = root.winfo_x(), root.winfo_y()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        px = rx + (rw - 600) // 2
+        py = ry + (rh - 400) // 2
+        pop.geometry(f"+{px}+{py}")
+        
+        header = tk.Frame(pop, bg="#1a3a5f", pady=10)
+        header.pack(fill="x", side=tk.TOP)
+        tk.Label(header, text=f"Raw Light Curve for {star_id}", font=("Segoe UI", 12, "bold"), fg="white", bg="#1a3a5f").pack()
+        
+        plot_frame = tk.Frame(pop, bg="white")
+        plot_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        fig, ax = plt.subplots(figsize=(6, 3))
+        canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        mags = np.array(star['corrected_mags'])
+        frames = np.arange(len(mags))
+        
+        valid = np.isfinite(mags)
+        if np.any(valid):
+            ax.plot(frames[valid], mags[valid], marker='o', color='#1a3a5f', linestyle='-', markersize=4, alpha=0.8, label="Instrumental Mag")
+            ax.invert_yaxis()
+            ax.set_xlabel("Frame Index")
+            ax.set_ylabel("Mag (Calibrated)")
+            ax.set_title(f"Mean Mag: {star['mean_mag']:.3f} | RMS: {star['rms']:.4f} | Valid Frames: {star['n_valid']}", fontdict={'fontsize': 10})
+            ax.grid(True, linestyle='--', alpha=0.5)
+        else:
+            ax.text(0.5, 0.5, "No valid magnitude measurements.", ha='center', va='center')
+            
+        canvas.draw()
+        
+    # Task 3: Selection callback for Treeview click
+    def on_dm_tree_select(event):
+        selected = dm_tree.selection()
+        if not selected:
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        star_id = vals[0]
+        
+        for s in dm_tree.final_stats:
+            if str(s['id']) == str(star_id):
+                highlight_star_in_plot(s)
+                break
+                
+    # Task 5: Double-click preview binding
+    def on_dm_double_click(event):
+        selected = dm_tree.selection()
+        if not selected:
+            return
+        vals = dm_tree.item(selected[0], 'values')
+        show_mini_lightcurve(vals[0])
+        
+    # Task 4: Pick event callback for matplotlib canvas click
+    def on_canvas_pick(event):
+        col = event.artist
+        ind = event.ind[0]
+        if hasattr(col, 'star_list'):
+            star = col.star_list[ind]
+            star_id = star['id']
+            
+            found = False
+            for item in dm_tree.get_children():
+                if str(dm_tree.item(item, 'values')[0]) == str(star_id):
+                    dm_tree.selection_set(item)
+                    dm_tree.see(item)
+                    found = True
+                    break
+                    
+            highlight_star_in_plot(star)
+            
+    def on_dm_right_click(event):
+        item = dm_tree.identify_row(event.y)
+        if item:
+            dm_tree.selection_set(item)
+            menu = tk.Menu(root, tearoff=0)
+            
+            vals = dm_tree.item(item, 'values')
+            ra, dec = vals[1], vals[2]
+            
+            menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
+            menu.add_command(label="Send to Light Curves", command=on_send_suspect)
+            
+            def copy_csv():
+                root.clipboard_clear()
+                root.clipboard_append(",".join(map(str, vals)))
+                
+            menu.add_command(label="Copy Row as CSV", command=copy_csv)
+            
+            menu.post(event.x_root, event.y_root)
+            
+    dm_tree.final_stats = []
+    dm_tree.sort_col = "Excess"
+    dm_tree.sort_desc = True
+    
+    chk_show_non = tk.Checkbutton(
+        dm_filter_frame, 
+        text="Show Non-Suspects (stable stars)", 
+        variable=show_non_suspects_var, 
+        command=populate_dm_tree,
+        bg="white", 
+        activebackground="white",
+        font=("Segoe UI", 9)
+    )
+    chk_show_non.pack(side=tk.LEFT, padx=10)
+
+    # Task 2: Setup Table Headings
+    dm_tree.heading("ID", text="ID", command=lambda: sort_column("ID"))
+    dm_tree.heading("RA", text="RA (deg)", command=lambda: sort_column("RA"))
+    dm_tree.heading("Dec", text="Dec (deg)", command=lambda: sort_column("Dec"))
+    dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_column("Mean Mag"))
+    dm_tree.heading("RMS", text="RMS", command=lambda: sort_column("RMS"))
+    dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
+    dm_tree.heading("Valid", text="Valid", command=lambda: sort_column("Valid"))
+    dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
+    dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_column("VSX Name"))
+    dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_column("VSX Type"))
+    
+    # Task 2: Setup Column Widths
+    dm_tree.column("ID", width=70, anchor=tk.CENTER)
+    dm_tree.column("RA", width=80, anchor=tk.CENTER)
+    dm_tree.column("Dec", width=80, anchor=tk.CENTER)
+    dm_tree.column("Mean Mag", width=70, anchor=tk.CENTER)
+    dm_tree.column("RMS", width=70, anchor=tk.CENTER)
+    dm_tree.column("Excess", width=70, anchor=tk.CENTER)
+    dm_tree.column("Valid", width=60, anchor=tk.CENTER)
+    dm_tree.column("Flag", width=70, anchor=tk.CENTER)
+    dm_tree.column("VSX Name", width=120, anchor=tk.W)
+    dm_tree.column("VSX Type", width=80, anchor=tk.W)
+    
+    # Bindings
+    dm_tree.bind("<<TreeviewSelect>>", on_dm_tree_select)
+    dm_tree.bind("<Double-1>", on_dm_double_click)
+    dm_tree.bind("<Button-3>", on_dm_right_click)
+    dm_canvas.mpl_connect('pick_event', on_canvas_pick)
+    
+    dm_vsb = ttk.Scrollbar(lf_dm_table, orient="vertical", command=dm_tree.yview)
+    dm_tree.configure(yscrollcommand=dm_vsb.set)
+    dm_tree.pack(side=tk.LEFT, fill="both", expand=True)
+    dm_vsb.pack(side=tk.RIGHT, fill="y")
+
     # --- END TAB 6 ---
 
     # Camera Settings (from old TAB 2)
@@ -3363,6 +4551,7 @@ def run_config_gui(pipeline_callback=None):
     create_sidebar_button(f"{get_icon('⚙', '')}  Pre-processing".strip(), "pre")
     create_sidebar_button(f"{get_icon('🔍', '')}  Analysis & Calib".strip(), "analysis")
     create_sidebar_button(f"{get_icon('📈', '')}  Light Curves".strip(), "ts")
+    create_sidebar_button(f"{get_icon('🚀', '')}  Data Mining".strip(), "datamining")
     create_sidebar_button(f"{get_icon('🔧', '')}  Settings".strip(), "settings")
     create_sidebar_button(f"{get_icon('ℹ', '')}  About Calibra".strip(), "about")
     create_sidebar_button(f"{get_icon('❓', '')}  User Help".strip(), "help")
