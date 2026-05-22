@@ -309,6 +309,7 @@ Launch the pipeline via `python calibra.py` to open the **Configuration GUI**. I
 Always visible at the top of the window, this centralized manager allows you to load, preview, and select your FITS files.
 - **Add Files/Directory**: Load your images.
 - **Preview**: View FITS headers directly in the GUI.
+- **Edit Header**: Right-click a file or use the dedicated "✏️ Edit FITS Header..." button to open an interactive editor. This allows you to inspect, modify, add, or delete FITS header keywords and values, providing a quick way to fix missing data like filters or exposure times.
 - **Selection**: Check the boxes next to files to select them for Plate Solving, Calibration, or Analysis.
 - **Interactive Viewer**: Double-click any file in the list to open the **Interactive FITS Viewer** (see Section 8.1.1).
 
