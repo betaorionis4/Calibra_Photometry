@@ -707,7 +707,6 @@ def run_config_gui(pipeline_callback=None):
                         vars_dict["ts_target_dec"][0].set(c.dec.to_string(unit='degree', sep=':', precision=2, alwayssign=True))
                         
                         # Use exported mag/bv if available to skip re-fetch
-                        if v.get('mag') is not None: vars_dict["ts_target_mag"][0].set(v['mag'])
                         if v.get('bv') is not None: vars_dict["ts_target_bv"][0].set(v['bv'])
                     
                     # Check & Refs
@@ -3633,12 +3632,6 @@ def run_config_gui(pipeline_callback=None):
                     vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
             
             # Clear check star
-            vars_dict["ts_check_use"][0].set(False)
-            vars_dict["ts_check_name"][0].set("")
-            vars_dict["ts_check_mag"][0].set(0.0)
-            vars_dict["ts_check_bv"][0].set(0.0)
-            vars_dict["ts_check_ra"][0].set(0.0)
-            vars_dict["ts_check_dec"][0].set(0.0)
             ts_check_star_idx_var.set(-1)
             
             # Reset target defaults if needed
@@ -3854,13 +3847,18 @@ def run_config_gui(pipeline_callback=None):
                     # Reset sorting column text highlights (removing / adding arrows)
                     col_headers = {
                         "ID": "ID",
-                        "RA": "RA (deg)",
-                        "Dec": "Dec (deg)",
+                        "RA (hms)": "RA (hms)",
+                        "Dec (dms)": "Dec (dms)",
+                        "RA (deg)": "RA (deg)",
+                        "Dec (deg)": "Dec (deg)",
                         "Mean Mag": "Mean Mag",
                         "RMS": "RMS",
                         "Excess": "Excess RMS",
                         "Valid": "Valid",
-                        "Flag": "Flag"
+                        "Flag": "Flag",
+                        "VSX Name": "VSX Name",
+                        "VSX Type": "VSX Type",
+                        "Catalog ID": "Catalog ID"
                     }
                     for c_id, base_text in col_headers.items():
                         if c_id == dm_tree.sort_col:
@@ -3966,7 +3964,7 @@ def run_config_gui(pipeline_callback=None):
             messagebox.showwarning("No Selection", "Please select a star from the table first.")
             return
         vals = dm_tree.item(selected[0], 'values')
-        ra_deg, dec_deg = float(vals[1]), float(vals[2])
+        ra_deg, dec_deg = float(vals[3]), float(vals[4])
         
         from astropy.coordinates import SkyCoord
         import astropy.units as u
@@ -4104,8 +4102,8 @@ def run_config_gui(pipeline_callback=None):
     
     show_non_suspects_var = tk.BooleanVar(value=False)
     
-    # Task 2: Added "Valid" column to columns tuple
-    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type"), show='headings', height=8)
+    # Task 2: Added "Valid" and "Catalog ID" column to columns tuple
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA (hms)", "Dec (dms)", "RA (deg)", "Dec (deg)", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type", "Catalog ID"), show='headings', height=8)
     
     # Configure row tags for coloring
     dm_tree.tag_configure("suspect", background="#ffcccc")
@@ -4137,9 +4135,9 @@ def run_config_gui(pipeline_callback=None):
                     
             if col == "ID":
                 stats_to_show.sort(key=lambda x: try_numeric(x['id']), reverse=rev)
-            elif col == "RA":
+            elif col == "RA (deg)":
                 stats_to_show.sort(key=lambda x: x['ra_deg'], reverse=rev)
-            elif col == "Dec":
+            elif col == "Dec (deg)":
                 stats_to_show.sort(key=lambda x: x['dec_deg'], reverse=rev)
             elif col == "Mean Mag":
                 stats_to_show.sort(key=lambda x: x['mean_mag'], reverse=rev)
@@ -4156,26 +4154,39 @@ def run_config_gui(pipeline_callback=None):
                 stats_to_show.sort(key=lambda x: x.get('vsx_name', ''), reverse=rev)
             elif col == "VSX Type":
                 stats_to_show.sort(key=lambda x: x.get('vsx_type', ''), reverse=rev)
+            elif col == "Catalog ID":
+                stats_to_show.sort(key=lambda x: x.get('catalog_id', ''), reverse=rev)
                 
         for s in stats_to_show:
             flag = "SUSPECT" if s.get('is_suspect') else ("NOISY" if s.get('is_noisy') else "")
+            if s.get('high_bg_var'):
+                flag = flag + " (High Bg Var)" if flag else "(High Bg Var)"
+                
             vsx_name = s.get('vsx_name', '')
             vsx_type = s.get('vsx_type', '')
             
             # Row coloring based on flag
             tag = ""
-            if flag == "SUSPECT":
+            if "SUSPECT" in flag:
                 tag = "suspect"
-            elif flag == "NOISY":
+            elif "NOISY" in flag:
                 tag = "noisy"
             elif s['excess_rms'] > 0.02 and s['rms'] > 2.0 * s.get('expected_rms', 0):
                 tag = "borderline"
                 
-            # Task 2: Populate Valid count
+            # Populate Valid count and Catalog ID
+            catalog_id = s.get('catalog_id', '')
+            
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            c = SkyCoord(ra=s['ra_deg']*u.deg, dec=s['dec_deg']*u.deg)
+            ra_hms = c.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+            dec_dms = c.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+            
             dm_tree.insert("", tk.END, values=(
-                s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
+                s['id'], ra_hms, dec_dms, f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
                 f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}",
-                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type
+                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type, catalog_id
             ), tags=(tag,) if tag else ())
             
     def sort_column(col):
@@ -4187,15 +4198,18 @@ def run_config_gui(pipeline_callback=None):
             
         col_headers = {
             "ID": "ID",
-            "RA": "RA (deg)",
-            "Dec": "Dec (deg)",
+            "RA (hms)": "RA (hms)",
+            "Dec (dms)": "Dec (dms)",
+            "RA (deg)": "RA (deg)",
+            "Dec (deg)": "Dec (deg)",
             "Mean Mag": "Mean Mag",
             "RMS": "RMS",
             "Excess": "Excess RMS",
             "Valid": "Valid",
             "Flag": "Flag",
             "VSX Name": "VSX Name",
-            "VSX Type": "VSX Type"
+            "VSX Type": "VSX Type",
+            "Catalog ID": "Catalog ID"
         }
         for c_id, base_text in col_headers.items():
             if c_id == col:
@@ -4332,10 +4346,33 @@ def run_config_gui(pipeline_callback=None):
             menu = tk.Menu(root, tearoff=0)
             
             vals = dm_tree.item(item, 'values')
-            ra, dec = vals[1], vals[2]
+            ra, dec = vals[3], vals[4]
             
             menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
             menu.add_command(label="Send to Light Curves", command=on_send_suspect)
+            
+            def open_in_viewer():
+                selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+                if not selected_iids:
+                    messagebox.showwarning("No Selection", "Please check a FITS file in the File Manager to view it.")
+                    return
+                file_path = loaded_files[int(selected_iids[0])]['path']
+                
+                star_id = vals[0]
+                target_stat = None
+                if hasattr(dm_tree, 'final_stats'):
+                    for s in dm_tree.final_stats:
+                        if str(s['id']) == str(star_id):
+                            target_stat = s
+                            break
+                
+                if target_stat:
+                    viewer_win = tk.Toplevel(root)
+                    from photometry.fits_viewer import FITSViewer
+                    FITSViewer(viewer_win, file_path, 
+                               initial_stars={'target': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id}, 'check': None, 'refs': []})
+            
+            menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
             
             def copy_csv():
                 root.clipboard_clear()
@@ -4362,8 +4399,10 @@ def run_config_gui(pipeline_callback=None):
 
     # Task 2: Setup Table Headings
     dm_tree.heading("ID", text="ID", command=lambda: sort_column("ID"))
-    dm_tree.heading("RA", text="RA (deg)", command=lambda: sort_column("RA"))
-    dm_tree.heading("Dec", text="Dec (deg)", command=lambda: sort_column("Dec"))
+    dm_tree.heading("RA (hms)", text="RA (hms)")
+    dm_tree.heading("Dec (dms)", text="Dec (dms)")
+    dm_tree.heading("RA (deg)", text="RA (deg)", command=lambda: sort_column("RA (deg)"))
+    dm_tree.heading("Dec (deg)", text="Dec (deg)", command=lambda: sort_column("Dec (deg)"))
     dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_column("Mean Mag"))
     dm_tree.heading("RMS", text="RMS", command=lambda: sort_column("RMS"))
     dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
@@ -4371,11 +4410,14 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
     dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_column("VSX Name"))
     dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_column("VSX Type"))
+    dm_tree.heading("Catalog ID", text="Catalog ID", command=lambda: sort_column("Catalog ID"))
     
     # Task 2: Setup Column Widths
     dm_tree.column("ID", width=70, anchor=tk.CENTER)
-    dm_tree.column("RA", width=80, anchor=tk.CENTER)
-    dm_tree.column("Dec", width=80, anchor=tk.CENTER)
+    dm_tree.column("RA (hms)", width=90, anchor=tk.CENTER)
+    dm_tree.column("Dec (dms)", width=90, anchor=tk.CENTER)
+    dm_tree.column("RA (deg)", width=80, anchor=tk.CENTER)
+    dm_tree.column("Dec (deg)", width=80, anchor=tk.CENTER)
     dm_tree.column("Mean Mag", width=70, anchor=tk.CENTER)
     dm_tree.column("RMS", width=70, anchor=tk.CENTER)
     dm_tree.column("Excess", width=70, anchor=tk.CENTER)
@@ -4383,6 +4425,7 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.column("Flag", width=70, anchor=tk.CENTER)
     dm_tree.column("VSX Name", width=120, anchor=tk.W)
     dm_tree.column("VSX Type", width=80, anchor=tk.W)
+    dm_tree.column("Catalog ID", width=120, anchor=tk.CENTER)
     
     # Bindings
     dm_tree.bind("<<TreeviewSelect>>", on_dm_tree_select)

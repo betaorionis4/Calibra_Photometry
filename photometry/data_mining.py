@@ -11,6 +11,16 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 import os
 
+# =============================================================================
+# DATA MINING PIPELINE
+# =============================================================================
+# The Data Mining module is responsible for analyzing entire fields of view across
+# an entire timeseries of FITS files. It detects all stars in a reference frame,
+# forces aperture photometry at those coordinates across all frames, and performs
+# global differential calibration to extract intrinsic stellar variability,
+# identifying candidate variable stars while rejecting artifacts and noise.
+# =============================================================================
+
 def track_and_measure(fits_files, master_catalog, aperture_radius=5.0, 
                       annulus_inner=7.0, annulus_outer=13.0, 
                       saturation_limit=55000, edge_buffer=50, 
@@ -70,12 +80,18 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
             if not wcs.has_celestial:
                 continue
                 
+            # Calculate global image background std to compare against local annulus std
+            # This helps us identify if a star's local background is unusually noisy 
+            # (e.g. it sits on the diffraction spike of a very bright neighbor).
+            _, _, img_std = sigma_clipped_stats(data, sigma=3.0, maxiters=3)
+            frame_result['img_std'] = img_std
+                
             y_max, x_max = data.shape
             
-            # WCS -> pixel for all stars
+            # Fast bulk conversion: WCS world coordinates -> image pixel coordinates
             x_arr, y_arr = wcs.world_to_pixel(coords)
             
-            # Now loop over stars and measure
+            # Now loop over stars and measure flux using aperture photometry
             for idx, star in enumerate(master_catalog):
                 star_id = star['id']
                 x_init = x_arr[idx]
@@ -92,11 +108,15 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                     frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
                     continue
                     
-                # Re-centroid in a 15x15 box
+                # ---------------------------------------------------------
+                # Centroid Refinement
+                # ---------------------------------------------------------
+                # Since telescope tracking drifts slightly and WCS solutions aren't perfect,
+                # we attempt to find the true center of the star within a 15x15 pixel box.
                 size = 15
                 x_int, y_int = int(np.round(x_init)), int(np.round(y_init))
                 
-                # Make sure the box is fully inside the image
+                # Make sure the box is fully inside the image boundaries
                 if (x_int - size < 0 or x_int + size > x_max or
                     y_int - size < 0 or y_int + size > y_max):
                     frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
@@ -109,7 +129,11 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", category=UserWarning)
                         warnings.simplefilter("ignore", category=AstropyWarning)
+                        # centroid_2dg fits a 2D Gaussian to find the sub-pixel center
                         x_rel, y_rel = centroid_2dg(cutout - median_bg_cutout)
+                    
+                    # If Gaussian fitting fails (star is too faint or a hot pixel), 
+                    # fallback to the original exact WCS coordinate to force measurement.
                     if np.isnan(x_rel) or np.isnan(y_rel):
                         x_ref, y_ref = x_init, y_init
                     else:
@@ -118,7 +142,10 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                 except Exception:
                     x_ref, y_ref = x_init, y_init
                     
-                # Saturation check inside aperture
+                # ---------------------------------------------------------
+                # Measurement: Saturation Check & Photometry
+                # ---------------------------------------------------------
+                # Check for saturation (non-linear detector response) within the aperture
                 aperture = CircularAperture((x_ref, y_ref), r=aperture_radius)
                 ap_mask = aperture.to_mask(method='center')
                 ap_data = ap_mask.get_values(data)
@@ -159,7 +186,8 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                 frame_result['measurements'][star_id] = {
                     'net_flux': net_flux,
                     'mag_inst': mag_inst,
-                    'snr': snr
+                    'snr': snr,
+                    'bkg_std': bkg_std
                 }
                 
         except Exception as e:
@@ -197,9 +225,15 @@ def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_b
             print(f"Error: {fits_path} missing valid WCS.")
             return []
 
+        # ---------------------------------------------------------
+        # Background Estimation & Source Detection
+        # ---------------------------------------------------------
+        # Calculate the global background median and standard deviation.
         mean, median_bg, std_bg = sigma_clipped_stats(data, sigma=3.0, maxiters=5)
         
-        # Initialize DAOStarFinder (using the robust fallback from earlier)
+        # Initialize DAOStarFinder (using the robust fallback for different photutils versions)
+        # We detect sources that are `detect_sigma` times brighter than the background std.
+        # FWHM=3.5 is a generic starting point. Sharpness and roundness help reject cosmic rays.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=AstropyWarning)
             try:
@@ -266,6 +300,12 @@ def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_b
 def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid_fraction=0.7, ensemble_size=100, center_ra=None, center_dec=None):
     """
     Performs the 2-Pass Global Differential Calibration and Statistical Analysis.
+    
+    This function takes raw instrumental magnitudes for thousands of stars across the time series,
+    constructs an artificial 'super-reference' ensemble of the most stable stars, and aligns every 
+    frame's zero-point so that instrumental drops in brightness (due to clouds, airmass, etc) are 
+    perfectly subtracted out.
+    
     Returns final_stats list and expected_rms_func for plotting.
     """
     if not track_results or not master_catalog:
@@ -302,12 +342,23 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     # Sort valid stars by mean instrumental magnitude (brightest to faintest)
     sorted_star_ids = sorted(valid_stars.keys(), key=lambda sid: valid_stars[sid]['mean_mag'])
     
-    # PASS 1: Select initial ensemble
+    # =========================================================================
+    # 2-PASS DIFFERENTIAL CALIBRATION
+    # =========================================================================
+    # PASS 1: Select an initial ensemble of the brightest available stars.
+    # We assume brightest = highest signal-to-noise = most stable.
     ensemble_ids = sorted_star_ids[:ensemble_size]
     if len(ensemble_ids) < 5:
         print("Warning: Very few stars available for ensemble calibration.")
         
     def compute_zero_points(ens_ids):
+        """
+        Computes the frame-by-frame zero-point offsets.
+        For every frame, we compute how much each ensemble star shifted from its 
+        own average magnitude, and take the MEDIAN shift across the ensemble.
+        Using the median makes it highly robust against individual variable stars 
+        in the ensemble.
+        """
         zps = np.zeros(num_frames)
         for f in range(num_frames):
             shifts = []
@@ -324,9 +375,10 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     # Calculate Pass 1 zero-points
     zp_pass1 = compute_zero_points(ensemble_ids)
     
-    # Calculate preliminary RMS for ensemble
+    # Calculate preliminary RMS for the initial ensemble
     ens_rms = {}
     for sid in ensemble_ids:
+        # Apply the Pass 1 correction to this star
         corrected_mags = valid_stars[sid]['mags'] + zp_pass1
         clean_mags = corrected_mags[np.isfinite(corrected_mags)]
         if len(clean_mags) > 0:
@@ -338,11 +390,15 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     median_ens_rms = np.median(list(ens_rms.values()))
     
     # PASS 2: Refine ensemble
+    # Kick out any "bad" stars from the initial ensemble. If a bright star was actually 
+    # highly variable (e.g. an eclipsing binary) or noisy, its RMS will be much higher 
+    # than the median RMS of the ensemble. By kicking them out, our Pass 2 ensemble is 
+    # strictly composed of constant, stable stars.
     refined_ensemble_ids = [sid for sid in ensemble_ids if ens_rms[sid] <= 2.0 * median_ens_rms]
     if len(refined_ensemble_ids) < 3:
         refined_ensemble_ids = ensemble_ids
         
-    # Calculate Pass 2 zero-points
+    # Calculate Pass 2 zero-points using the purified ensemble
     zp_pass2 = compute_zero_points(refined_ensemble_ids)
     
     # Apply Pass 2 zero-points to ALL valid stars and compute final stats
@@ -356,6 +412,26 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             mad_rms = mad_std(clean_mags, ignore_nan=True)
         else:
             final_mean, final_rms, tight_rms, mad_rms = np.nan, np.nan, np.nan, np.nan
+            
+        # ---------------------------------------------------------
+        # High Background Variance Check
+        # ---------------------------------------------------------
+        # Some coordinates fall on the boundary of a very bright star's glare. As the 
+        # tracking drifts, the bright star's light spills into the local background annulus,
+        # causing the background subtraction to fluctuate wildly, which corrupts the target flux.
+        # We flag stars whose local background standard deviation is consistently much higher 
+        # (> 2x) than the overall image background standard deviation.
+        star_meas = [track_results[i]['measurements'].get(sid, {}) for i in range(num_frames) if data['valid_mask'][i]]
+        bkg_stds = [m.get('bkg_std', np.nan) for m in star_meas]
+        img_stds = [track_results[i].get('img_std', np.nan) for i in range(num_frames) if data['valid_mask'][i]]
+        bkg_stds = [v for v in bkg_stds if not np.isnan(v)]
+        img_stds = [v for v in img_stds if not np.isnan(v)]
+        
+        high_bg_var = False
+        if len(bkg_stds) > 0 and len(img_stds) > 0:
+            if np.median(bkg_stds) > 2.0 * np.median(img_stds):
+                high_bg_var = True
+
         n_valid = np.sum(data['valid_mask'])
         
         final_stats.append({
@@ -367,15 +443,23 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             'tight_rms': tight_rms,
             'mad_rms': mad_rms,
             'n_valid': n_valid,
-            'corrected_mags': list(corrected_mags)
+            'corrected_mags': list(corrected_mags),
+            'high_bg_var': high_bg_var
         })
         
+    # =========================================================================
     # OUTLIER DETECTION (Noise Floor Model)
+    # =========================================================================
+    # In order to identify true variable stars, we must establish a baseline for
+    # what "normal" photometric scatter (noise) looks like at any given magnitude.
+    # Fainter stars naturally have higher RMS scatter due to lower signal-to-noise.
+    
     mags_all = np.array([s['mean_mag'] for s in final_stats])
     rms_all = np.array([s['rms'] for s in final_stats])
     
     min_mag = np.min(mags_all)
     max_mag = np.max(mags_all)
+    # Divide the magnitude range into dynamic bins (up to 20 bins)
     bins = np.linspace(min_mag, max_mag, min(20, len(final_stats)//10 + 2))
     
     bin_centers = []
@@ -386,35 +470,54 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         in_bin = rms_all[inds == i]
         if len(in_bin) > 0:
             bin_centers.append(0.5 * (bins[i] + bins[i-1]))
-            # Use 15th percentile to track the dense lower envelope of noise
+            # Use the 15th percentile of RMS in this bin to track the dense lower 
+            # envelope of the noise floor. We use a low percentile because true 
+            # variables (outliers) will pull the mean/median upwards.
             bin_rms_env.append(np.percentile(in_bin, 15))
             
     if len(bin_centers) > 3:
-        # Linear fit in log-space: log10(RMS) = A * mag + B
+        # Fit a linear model in log-space: log10(RMS) = A * mag + B
+        # This models the exponential relationship between magnitude and noise.
         poly_coeffs = np.polyfit(bin_centers, np.log10(bin_rms_env), 1)
         expected_rms_func = lambda m: 10**(np.polyval(poly_coeffs, m))
     else:
+        # Fallback to a flat median if there are too few stars to fit a curve
         med_rms = np.median(rms_all)
         expected_rms_func = lambda m: float(med_rms)
         
-    # Calculate excess RMS
+    # =========================================================================
+    # CALCULATE EXCESS RMS & CLASSIFY STARS (Suspect vs Noisy)
+    # =========================================================================
     suspects = []
     for s in final_stats:
+        # Determine the expected baseline noise for a star of this brightness
         exp_rms = expected_rms_func(s['mean_mag'])
-        exp_rms = max(exp_rms, 0.001)
+        exp_rms = max(exp_rms, 0.001) # Prevent division by zero / negative noise
         
+        # Excess RMS is how much more scatter the star has compared to the noise floor
         excess_rms = s['rms'] - exp_rms
         s['expected_rms'] = exp_rms
         s['excess_rms'] = excess_rms
         
-        # Flagging suspects: RMS must be 3x expected noise floor AND > 0.03 magnitude deviation
+        # Initial Flagging: 
+        # 1. The scatter must be at least 3x the expected noise floor (Sigma detection).
+        # 2. The absolute scatter must be > 0.03 mag to avoid flagging micro-variations 
+        #    in ultra-bright stars where the theoretical noise floor approaches zero.
         is_suspect = s['rms'] > 3.0 * exp_rms and excess_rms > 0.03
         s['is_noisy'] = False
+        
         if is_suspect:
+            # We have a candidate! But is it a true variable or just a bad measurement?
+            # 'tight_rms': Standard deviation calculated after heavily aggressively clipping outliers (2.5 sigma).
+            # 'mad_rms': Median Absolute Deviation, which is intrinsically robust to single-point spikes.
             tight_val = s.get('tight_rms', np.nan)
             mad_val = s.get('mad_rms', np.nan)
             
-            # Reclassify as noisy if sigma-clipped scatter is low OR mad scatter is low
+            # Reclassify as "Noisy" if the robust scatter metrics are low.
+            # Why? If 'rms' is high but 'tight_rms' or 'mad_rms' is low, it means the 
+            # high scatter is driven entirely by a few extreme outlier frames (e.g. 
+            # a cosmic ray hit, bad tracking frame, or satellite trail) rather than 
+            # intrinsic, continuous stellar variability.
             is_flat = False
             if not np.isnan(tight_val) and tight_val < 1.5 * exp_rms:
                 is_flat = True
@@ -422,9 +525,11 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
                 is_flat = True
                 
             if is_flat:
+                # Discard as a true variable suspect, mark as a "noisy" artifact
                 s['is_suspect'] = False
                 s['is_noisy'] = True
             else:
+                # The variability is robust and continuous. Mark as a true suspect!
                 s['is_suspect'] = True
                 suspects.append(s)
         else:
@@ -450,8 +555,9 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     if center_ra is not None and center_dec is not None:
         try:
             cross_match_vsx_suspects(final_stats, center_ra, center_dec, verbose=False)
+            cross_match_deep_catalog(final_stats, center_ra, center_dec, catalog_name="GAIA_DR3", verbose=False)
         except Exception as e:
-            print(f"Error performing VSX cross-match in calibrate_and_analyze: {e}")
+            print(f"Error performing cross-match in calibrate_and_analyze: {e}")
             
     # Write CSV
     if out_csv_path:
@@ -459,7 +565,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         try:
             with open(out_csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect', 'VSX Name', 'VSX Type'])
+                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect', 'VSX Name', 'VSX Type', 'Catalog ID'])
                 for s in final_stats:
                     writer.writerow([
                         s['id'], 
@@ -472,7 +578,8 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
                         s['n_valid'],
                         'SUSPECT' if s['is_suspect'] else ('NOISY' if s.get('is_noisy') else 'NO'),
                         s.get('vsx_name', ''),
-                        s.get('vsx_type', '')
+                        s.get('vsx_type', ''),
+                        s.get('catalog_id', '')
                     ])
         except Exception as e:
             print(f"Error writing CSV: {e}")
@@ -494,7 +601,11 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
             s['vsx_type'] = s.get('vsx_type', '')
         return 0
         
-    # Dynamic Bounding Radius: ensure radius_arcmin covers all stars in final_stats
+    # =========================================================================
+    # DYNAMIC SEARCH RADIUS
+    # =========================================================================
+    # Calculate how wide the search radius needs to be to encompass the 
+    # furthest detected star in the field of view. 
     try:
         from astropy.coordinates import SkyCoord
         import astropy.units as u
@@ -516,6 +627,7 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
         if radius_arcmin is None:
             radius_arcmin = 30.0
     
+    # Query VSX locally or fetch from online catalog
     vsx_stars = get_vsx_stars(center_ra, center_dec, radius_arcmin=radius_arcmin, verbose=verbose)
     
     if not vsx_stars:
@@ -524,6 +636,7 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
             s['vsx_type'] = s.get('vsx_type', '')
         return 0
     
+    # Cross-match using astropy's fast match_to_catalog_sky function
     vsx_coords = SkyCoord(
         ra=[v['ra_deg'] for v in vsx_stars] * u.deg,
         dec=[v['dec_deg'] for v in vsx_stars] * u.deg
@@ -555,3 +668,73 @@ def cross_match_vsx_suspects(final_stats, center_ra, center_dec, radius_arcmin=3
             s['vsx_type'] = s.get('vsx_type', '')
     
     return known_count
+
+def cross_match_deep_catalog(final_stats, center_ra, center_dec, radius_arcmin=None, catalog_name="GAIA_DR3", verbose=False):
+    """
+    Cross-matches the pipeline's detections with a deep catalog (e.g., GAIA)
+    to confirm if the detected source exists in reality, helping filter out
+    hot pixels or cosmic rays.
+    """
+    if not final_stats or center_ra is None or center_dec is None:
+        for s in final_stats:
+            s['catalog_match'] = False
+        return 0
+        
+    try:
+        from photometry.calibration import get_cached_catalog, fetch_online_catalog, save_to_cache
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+    except ImportError as e:
+        if verbose: print(f"Error importing catalog modules: {e}")
+        return 0
+        
+    # Compute dynamic radius
+    try:
+        center_coord = SkyCoord(ra=center_ra * u.deg, dec=center_dec * u.deg)
+        star_coords = SkyCoord(
+            ra=[s['ra_deg'] for s in final_stats] * u.deg,
+            dec=[s['dec_deg'] for s in final_stats] * u.deg
+        )
+        seps = center_coord.separation(star_coords)
+        max_sep = float(seps.arcmin.max())
+        dynamic_radius = min(max_sep + 5.0, 90.0)
+        if radius_arcmin is None:
+            radius_arcmin = max(30.0, dynamic_radius)
+        else:
+            radius_arcmin = max(radius_arcmin, dynamic_radius)
+    except Exception as e:
+        if radius_arcmin is None: radius_arcmin = 30.0
+
+    # Fetch deep catalog for FOV
+    cat_stars = get_cached_catalog(center_ra, center_dec, radius_arcmin, catalog_name, verbose=verbose)
+    if not cat_stars:
+        if verbose: print(f"Fetching {catalog_name} for deep cross-match...")
+        cat_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin=radius_arcmin, catalog_name=catalog_name, verbose=verbose)
+        if cat_stars:
+            save_to_cache(cat_stars, center_ra, center_dec, radius_arcmin, catalog_name, verbose=verbose)
+            
+    if not cat_stars:
+        if verbose: print("No deep catalog stars found for cross-match.")
+        for s in final_stats:
+            s['catalog_match'] = False
+        return 0
+        
+    # Cross match
+    cat_coords = SkyCoord(
+        ra=[v['ra_deg'] for v in cat_stars] * u.deg,
+        dec=[v['dec_deg'] for v in cat_stars] * u.deg
+    )
+    
+    idx, d2d, _ = star_coords.match_to_catalog_sky(cat_coords)
+    
+    match_count = 0
+    for i, s in enumerate(final_stats):
+        if d2d[i].arcsec < 5.0:  # 5 arcseconds tolerance
+            s['catalog_match'] = True
+            s['catalog_id'] = cat_stars[idx[i]].get('cat_id', '')
+            match_count += 1
+        else:
+            s['catalog_match'] = False
+            s['catalog_id'] = ''
+            
+    return match_count

@@ -985,9 +985,38 @@ class FITSViewer:
             bg = np.nanmedian(d_fit)
             d_fit_sub = d_fit - bg
             
-            # Find peak for initial guess
-            y_init, x_init = np.unravel_index(np.argmax(d_fit_sub), d_fit_sub.shape)
-            g_init = models.Gaussian2D(amplitude=np.max(d_fit_sub), x_mean=x_init, y_mean=y_init, x_stddev=2.0, y_stddev=2.0, theta=0)
+            # The exact clicked coordinate translated to the cutout's reference frame
+            x_click_cutout, y_click_cutout = cutout.to_cutout_position((x, y))
+            
+            # Apply a Gaussian weight window (sigma=4.0) centered on the click.
+            # This allows the initial guess to "snap" to a bright star if you click within 
+            # 3-4 pixels of it, but strongly suppresses bright stars 10-20 pixels away.
+            yy, xx = np.mgrid[:size, :size]
+            window = np.exp(-((xx - x_click_cutout)**2 + (yy - y_click_cutout)**2) / (2.0 * 4.0**2))
+            d_weighted = d_fit_sub * window
+            
+            # Find the peak in the weighted data to use as our initial guess
+            y_init, x_init = np.unravel_index(np.argmax(d_weighted), d_weighted.shape)
+            x_init, y_init = float(x_init), float(y_init)
+            
+            # Estimate amplitude at the guessed location (with a fallback)
+            try:
+                amp_guess = d_fit_sub[int(round(y_init)), int(round(x_init))]
+                if amp_guess <= 0: amp_guess = np.max(d_fit_sub)
+            except:
+                amp_guess = np.max(d_fit_sub)
+                
+            # Bound the centroid to stay within ±3 pixels of the click.
+            # This forces the fitter to fit the exact object the user clicked on.
+            g_init = models.Gaussian2D(
+                amplitude=amp_guess, 
+                x_mean=x_init, y_mean=y_init, 
+                x_stddev=2.0, y_stddev=2.0, theta=0,
+                bounds={
+                    'x_mean': (x_init - 3.0, x_init + 3.0),
+                    'y_mean': (y_init - 3.0, y_init + 3.0)
+                }
+            )
             fitter = fitting.LevMarLSQFitter()
             yy, xx = np.mgrid[:size, :size]
             g_fit = fitter(g_init, xx, yy, d_fit_sub)

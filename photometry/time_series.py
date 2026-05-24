@@ -116,10 +116,19 @@ def measure_star(image_data, wcs, ra, dec, aperture_radius, annulus_inner, annul
         cutout = image_data[y_int-size:y_int+size, x_int-size:x_int+size]
         # Subtract local background for centroiding
         _, median, _ = sigma_clipped_stats(cutout)
-        x_rel, y_rel = centroid_2dg(cutout - median)
         
-        x_refined = x_int - size + x_rel
-        y_refined = y_int - size + y_rel
+        import warnings
+        from astropy.utils.exceptions import AstropyWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            warnings.simplefilter("ignore", category=AstropyWarning)
+            x_rel, y_rel = centroid_2dg(cutout - median)
+        
+        if np.isnan(x_rel) or np.isnan(y_rel):
+            x_refined, y_refined = float(x_init), float(y_init)
+        else:
+            x_refined = x_int - size + x_rel
+            y_refined = y_int - size + y_rel
         
         # 3. Aperture Photometry
         pos = (x_refined, y_refined)
