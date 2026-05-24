@@ -4383,6 +4383,143 @@ def run_config_gui(pipeline_callback=None):
         vals = dm_tree.item(selected[0], 'values')
         show_mini_lightcurve(vals[0])
         
+    def show_dm_context_menu(item, x_root, y_root, star_stat=None):
+        if item is not None:
+            dm_tree.selection_set(item)
+            vals = dm_tree.item(item, 'values')
+        else:
+            if not star_stat: return
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            c = SkyCoord(ra=star_stat['ra_deg']*u.deg, dec=star_stat['dec_deg']*u.deg)
+            ra_hms = c.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+            dec_dms = c.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+            flag = "SUSPECT" if star_stat.get('is_suspect') else "NOISY" if star_stat.get('is_noisy') else ""
+            vals = (
+                star_stat['id'], ra_hms, dec_dms, f"{star_stat['ra_deg']:.5f}", f"{star_stat['dec_deg']:.5f}",
+                f"{star_stat['mean_mag']:.3f}", f"{star_stat['rms']:.4f}", f"{star_stat['excess_rms']:.4f}",
+                f"{star_stat.get('n_valid', 0)}", flag, star_stat.get('vsx_name', ''), star_stat.get('vsx_type', ''), star_stat.get('catalog_id', '')
+            )
+
+        menu = tk.Menu(root, tearoff=0)
+        ra, dec = vals[3], vals[4]
+        
+        menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
+        
+        def local_send_to_lc():
+            vars_dict["ts_target_ra"][0].set(vals[1])
+            vars_dict["ts_target_dec"][0].set(vals[2])
+            vars_dict["ts_target_mode"][0].set("manual")
+            ts_target_name_var.set(f"Star_{vals[0]}")
+            switch_tab("ts")
+            
+        menu.add_command(label="Send to Light Curves", command=local_send_to_lc)
+        
+        def open_in_viewer():
+            selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+            if not selected_iids:
+                messagebox.showwarning("No Selection", "Please check a FITS file in the File Manager to view it.")
+                return
+            file_path = loaded_files[int(selected_iids[0])]['path']
+            
+            star_id = vals[0]
+            target_stat = None
+            if hasattr(dm_tree, 'final_stats'):
+                for s in dm_tree.final_stats:
+                    if str(s['id']) == str(star_id):
+                        target_stat = s
+                        break
+            
+            if target_stat:
+                viewer_win = tk.Toplevel(root)
+                from photometry.fits_viewer import FITSViewer
+                
+                viewer_config = {
+                    'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
+                    'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
+                    'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
+                    'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
+                    'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
+                    'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
+                    'annulus_width': float(vars_dict["annulus_width"][0].get())
+                }
+                
+                FITSViewer(viewer_win, file_path, config=viewer_config,
+                           initial_stars={'variable': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id, 'zoom': True}, 'check': None, 'refs': []})
+        
+        menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
+        
+        def copy_csv():
+            root.clipboard_clear()
+            root.clipboard_append(",".join(map(str, vals)))
+            
+        def remove_suspect():
+            star_id = vals[0]
+            if hasattr(dm_tree, 'final_stats'):
+                for s in dm_tree.final_stats:
+                    if str(s['id']) == str(star_id):
+                        s['is_suspect'] = False
+                        break
+                populate_dm_tree()
+                
+                # Refresh plot and banner
+                if not hasattr(dm_tree, 'ax') or not dm_tree.ax: return
+                ax = dm_tree.ax
+                ax.clear()
+                dm_tree.highlight_artists = []
+                
+                final_stats = dm_tree.final_stats
+                stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
+                suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
+                
+                mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
+                rms_stable = np.array([s['rms'] for s in stable_stars_list])
+                
+                mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
+                rms_sus = np.array([s['rms'] for s in suspect_stars_list])
+                
+                mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
+                rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
+                
+                if len(mags_stable) > 0:
+                    sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
+                    sc_stable.star_list = stable_stars_list
+                if len(mags_sus) > 0:
+                    sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                    sc_suspect.star_list = suspect_stars_list
+                if len(mags_noisy) > 0:
+                    sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
+                    sc_noisy.star_list = noisy_stars_list
+                    
+                ax.set_xlabel("Mean Instrumental Mag")
+                ax.set_ylabel("RMS (std dev)")
+                ax.set_title("Stellar Variability Diagram")
+                ax.legend()
+                if not ax.xaxis_inverted():
+                    ax.invert_xaxis()
+                dm_canvas.draw()
+                
+                # Update summary banner
+                n_suspects = len(suspect_stars_list)
+                n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
+                n_new = max(0, n_suspects - n_known)
+                
+                dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
+                dm_summary_labels["known_vsx"].config(text=str(n_known))
+
+        if "SUSPECT" in vals[9]:
+            menu.add_command(label="Remove from Suspects", command=remove_suspect)
+        menu.add_command(label="Copy Row as CSV", command=copy_csv)
+        
+        menu.post(x_root, y_root)
+
+    def on_dm_right_click(event):
+        item = dm_tree.identify_row(event.y)
+        if item:
+            show_dm_context_menu(item, event.x_root, event.y_root)
+            
     # Task 4: Pick event callback for matplotlib canvas click
     def on_canvas_pick(event):
         col = event.artist
@@ -4392,126 +4529,22 @@ def run_config_gui(pipeline_callback=None):
             star_id = star['id']
             
             found = False
+            item_id = None
             for item in dm_tree.get_children():
                 if str(dm_tree.item(item, 'values')[0]) == str(star_id):
                     dm_tree.selection_set(item)
                     dm_tree.see(item)
                     found = True
+                    item_id = item
                     break
                     
             highlight_star_in_plot(star)
             
-    def on_dm_right_click(event):
-        item = dm_tree.identify_row(event.y)
-        if item:
-            dm_tree.selection_set(item)
-            menu = tk.Menu(root, tearoff=0)
-            
-            vals = dm_tree.item(item, 'values')
-            ra, dec = vals[3], vals[4]
-            
-            menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
-            menu.add_command(label="Send to Light Curves", command=on_send_suspect)
-            
-            def open_in_viewer():
-                selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
-                if not selected_iids:
-                    messagebox.showwarning("No Selection", "Please check a FITS file in the File Manager to view it.")
-                    return
-                file_path = loaded_files[int(selected_iids[0])]['path']
-                
-                star_id = vals[0]
-                target_stat = None
-                if hasattr(dm_tree, 'final_stats'):
-                    for s in dm_tree.final_stats:
-                        if str(s['id']) == str(star_id):
-                            target_stat = s
-                            break
-                
-                if target_stat:
-                    viewer_win = tk.Toplevel(root)
-                    from photometry.fits_viewer import FITSViewer
-                    
-                    viewer_config = {
-                        'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
-                        'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
-                        'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
-                        'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
-                        'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
-                        'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
-                        'annulus_width': float(vars_dict["annulus_width"][0].get())
-                    }
-                    
-                    FITSViewer(viewer_win, file_path, config=viewer_config,
-                               initial_stars={'variable': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id, 'zoom': True}, 'check': None, 'refs': []})
-            
-            menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
-            
-            def copy_csv():
-                root.clipboard_clear()
-                root.clipboard_append(",".join(map(str, vals)))
-                
-            def remove_suspect():
-                star_id = vals[0]
-                if hasattr(dm_tree, 'final_stats'):
-                    for s in dm_tree.final_stats:
-                        if str(s['id']) == str(star_id):
-                            s['is_suspect'] = False
-                            break
-                    populate_dm_tree()
-                    
-                    # Refresh plot and banner
-                    if not hasattr(dm_tree, 'ax') or not dm_tree.ax: return
-                    ax = dm_tree.ax
-                    ax.clear()
-                    dm_tree.highlight_artists = []
-                    
-                    final_stats = dm_tree.final_stats
-                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
-                    suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
-                    noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
-                    
-                    mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
-                    rms_stable = np.array([s['rms'] for s in stable_stars_list])
-                    
-                    mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
-                    rms_sus = np.array([s['rms'] for s in suspect_stars_list])
-                    
-                    mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
-                    rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
-                    
-                    if len(mags_stable) > 0:
-                        sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
-                        sc_stable.star_list = stable_stars_list
-                    if len(mags_sus) > 0:
-                        sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
-                        sc_suspect.star_list = suspect_stars_list
-                    if len(mags_noisy) > 0:
-                        sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
-                        sc_noisy.star_list = noisy_stars_list
-                        
-                    ax.set_xlabel("Mean Instrumental Mag")
-                    ax.set_ylabel("RMS (std dev)")
-                    ax.set_title("Stellar Variability Diagram")
-                    ax.legend()
-                    if not ax.xaxis_inverted():
-                        ax.invert_xaxis()
-                    dm_canvas.draw()
-                    
-                    # Update summary banner
-                    n_suspects = len(suspect_stars_list)
-                    n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
-                    n_new = max(0, n_suspects - n_known)
-                    
-                    dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
-                    dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
-                    dm_summary_labels["known_vsx"].config(text=str(n_known))
-
-            if "SUSPECT" in vals[9]:
-                menu.add_command(label="Remove from Suspects", command=remove_suspect)
-            menu.add_command(label="Copy Row as CSV", command=copy_csv)
-            
-            menu.post(event.x_root, event.y_root)
+            if getattr(event.mouseevent, 'button', 1) == 3:
+                # Get screen coordinates for the right click from the mouse event
+                x_root = event.mouseevent.guiEvent.x_root
+                y_root = event.mouseevent.guiEvent.y_root
+                show_dm_context_menu(item_id, x_root, y_root, star_stat=star)
             
     dm_tree.final_stats = []
     dm_tree.sort_col = "Excess"
