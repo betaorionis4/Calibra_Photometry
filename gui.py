@@ -707,7 +707,6 @@ def run_config_gui(pipeline_callback=None):
                         vars_dict["ts_target_dec"][0].set(c.dec.to_string(unit='degree', sep=':', precision=2, alwayssign=True))
                         
                         # Use exported mag/bv if available to skip re-fetch
-                        if v.get('mag') is not None: vars_dict["ts_target_mag"][0].set(v['mag'])
                         if v.get('bv') is not None: vars_dict["ts_target_bv"][0].set(v['bv'])
                     
                     # Check & Refs
@@ -3633,12 +3632,6 @@ def run_config_gui(pipeline_callback=None):
                     vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
             
             # Clear check star
-            vars_dict["ts_check_use"][0].set(False)
-            vars_dict["ts_check_name"][0].set("")
-            vars_dict["ts_check_mag"][0].set(0.0)
-            vars_dict["ts_check_bv"][0].set(0.0)
-            vars_dict["ts_check_ra"][0].set(0.0)
-            vars_dict["ts_check_dec"][0].set(0.0)
             ts_check_star_idx_var.set(-1)
             
             # Reset target defaults if needed
@@ -3723,11 +3716,54 @@ def run_config_gui(pipeline_callback=None):
     lf_dm_config = tk.LabelFrame(dm_container, text="Data Mining Configuration", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
     lf_dm_config.pack(fill="x", pady=5)
     
-    add_entry(lf_dm_config, "Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0)
-    add_entry(lf_dm_config, "Saturation Limit (ADU):", "dm_saturation", 55000, 1, vtype=int)
-    add_entry(lf_dm_config, "Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, vtype=int)
-    add_entry(lf_dm_config, "Min Valid Frames Fraction (0.0 - 1.0):", "dm_min_valid_pct", 0.7, 3)
-    add_check(lf_dm_config, "Fast Test Mode (limit ensemble to top 100 stars)", "dm_fast_test", True, 4)
+    def show_quiet_tooltip(title, msg):
+        top = tk.Toplevel(root)
+        top.title(title)
+        top.geometry("350x140")
+        top.resizable(False, False)
+        x = root.winfo_rootx() + root.winfo_width()//2 - 175
+        y = root.winfo_rooty() + root.winfo_height()//2 - 70
+        top.geometry(f"+{x}+{y}")
+        tk.Label(top, text=msg, wraplength=310, justify="left", font=("Segoe UI", 10)).pack(padx=20, pady=(15, 10))
+        tk.Button(top, text="OK", command=top.destroy, width=8, bg="#e0e0e0").pack(pady=5)
+        top.transient(root)
+        top.grab_set()
+
+    def add_dm_setting(label_text, var_name, default_val, row, col, tooltip, vtype=float):
+        if var_name in vars_dict:
+            var = vars_dict[var_name][0]
+        else:
+            if vtype == str:
+                var = tk.StringVar(value=str(default_val))
+            elif vtype == int:
+                var = tk.IntVar(value=int(default_val))
+            else:
+                var = tk.DoubleVar(value=float(default_val))
+            vars_dict[var_name] = (var, vtype)
+        
+        ttk.Label(lf_dm_config, text=label_text).grid(row=row, column=col, sticky=tk.W, padx=10, pady=5)
+        ttk.Entry(lf_dm_config, textvariable=var, width=15).grid(row=row, column=col+1, sticky=tk.W, padx=10, pady=5)
+        
+        btn = tk.Button(lf_dm_config, text="?", relief="flat", fg="#1a3a5f", bg="#e0e0e0", 
+                        command=lambda msg=tooltip, t=label_text: show_quiet_tooltip(t, msg),
+                        font=("Arial", 8, "bold"), padx=5, pady=0)
+        btn.grid(row=row, column=col+2, padx=(0, 20), sticky="w")
+
+    # Column 1
+    add_dm_setting("Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0, 0, "How many times above the background noise a star must be to be detected.")
+    add_dm_setting("Detection FWHM (px):", "dm_fwhm", 3.5, 1, 0, "The assumed Full Width at Half Maximum of stars in pixels for the DAOStarFinder algorithm.")
+    add_dm_setting("Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, 0, "Ignore stars closer to the image edge than this many pixels.", vtype=int)
+    add_dm_setting("Min Valid Frames Fraction:", "dm_min_valid_pct", 0.7, 3, 0, "A star must be successfully measured in at least this fraction (0.0 - 1.0) of frames to be kept.")
+    
+    # Column 2
+    add_dm_setting("Ensemble Size (Stars):", "dm_ensemble_size", 100, 0, 3, "Number of brightest, most stable stars to use for calculating frame-to-frame zero-point offsets.", vtype=int)
+    add_dm_setting("Suspect Sigma Threshold:", "dm_suspect_sigma", 3.0, 1, 3, "A star's RMS scatter must be this many times higher than the expected noise floor to be flagged as a Suspect.")
+    add_dm_setting("Suspect Minimum Excess (Mag):", "dm_suspect_excess", 0.03, 2, 3, "A star's absolute RMS must exceed the expected noise floor by at least this many magnitudes to be flagged as a Suspect. Prevents flagging micro-variations in ultra-bright stars.")
+    
+    # Fast Test Mode Checkbox (placed under Column 2)
+    var_fast = tk.BooleanVar(value=True)
+    vars_dict["dm_fast_test"] = (var_fast, bool)
+    ttk.Checkbutton(lf_dm_config, text="Fast Test Mode (limit tracking to top 100 stars)", variable=var_fast).grid(row=3, column=3, columnspan=3, sticky=tk.W, padx=10, pady=5)
     
     dm_status_var = tk.StringVar(value="Ready to discover.")
     tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
@@ -3770,10 +3806,14 @@ def run_config_gui(pipeline_callback=None):
         fits_files = [loaded_files[int(iid)]['path'] for iid in selected_iids]
         ref_file = fits_files[0]
         
-        detect_sig = vars_dict["dm_detect_sigma"][0].get()
-        sat_limit = vars_dict["dm_saturation"][0].get()
-        edge_buf = vars_dict["dm_edge_buffer"][0].get()
-        min_pct = vars_dict["dm_min_valid_pct"][0].get()
+        detect_sig = float(vars_dict["dm_detect_sigma"][0].get())
+        dm_fwhm_val = float(vars_dict["dm_fwhm"][0].get())
+        sat_limit = int(vars_dict["saturation_limit"][0].get())
+        edge_buf = int(vars_dict["dm_edge_buffer"][0].get())
+        min_pct = float(vars_dict["dm_min_valid_pct"][0].get())
+        ens_size = int(vars_dict["dm_ensemble_size"][0].get())
+        susp_sig = float(vars_dict["dm_suspect_sigma"][0].get())
+        susp_exc = float(vars_dict["dm_suspect_excess"][0].get())
         is_fast = vars_dict["dm_fast_test"][0].get()
         
         # Aperture settings are shared with general config
@@ -3793,8 +3833,19 @@ def run_config_gui(pipeline_callback=None):
         
         def dm_thread():
             try:
+                # Fetch DAOStarFinder parameters from the Settings tab
+                fwhm_val = dm_fwhm_val
+                sharplo_val = float(vars_dict["dao_sharplo"][0].get())
+                sharphi_val = float(vars_dict["dao_sharphi"][0].get())
+                roundlo_val = float(vars_dict["dao_roundlo"][0].get())
+                roundhi_val = float(vars_dict["dao_roundhi"][0].get())
+                
                 dm_status_var.set("Phase 1/3: Detecting stars in reference frame...")
-                master_cat = detect_all_stars(ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf)
+                master_cat = detect_all_stars(
+                    ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf,
+                    fwhm=fwhm_val, sharplo=sharplo_val, sharphi=sharphi_val, 
+                    roundlo=roundlo_val, roundhi=roundhi_val
+                )
                 
                 if cancel_event.is_set(): return
                 
@@ -3838,7 +3889,11 @@ def run_config_gui(pipeline_callback=None):
                 dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
                 
                 out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
-                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct, center_ra=center_ra_dm, center_dec=center_dec_dm)
+                final_stats, exp_func = calibrate_and_analyze(
+                    track_res, master_cat, out_csv, min_valid_fraction=min_pct, 
+                    ensemble_size=ens_size, center_ra=center_ra_dm, center_dec=center_dec_dm,
+                    suspect_sigma=susp_sig, min_excess=susp_exc
+                )
                 
                 if not final_stats:
                     dm_status_var.set("Analysis complete, but no valid stars survived filters.")
@@ -3854,13 +3909,18 @@ def run_config_gui(pipeline_callback=None):
                     # Reset sorting column text highlights (removing / adding arrows)
                     col_headers = {
                         "ID": "ID",
-                        "RA": "RA (deg)",
-                        "Dec": "Dec (deg)",
+                        "RA (hms)": "RA (hms)",
+                        "Dec (dms)": "Dec (dms)",
+                        "RA (deg)": "RA (deg)",
+                        "Dec (deg)": "Dec (deg)",
                         "Mean Mag": "Mean Mag",
                         "RMS": "RMS",
                         "Excess": "Excess RMS",
                         "Valid": "Valid",
-                        "Flag": "Flag"
+                        "Flag": "Flag",
+                        "VSX Name": "VSX Name",
+                        "VSX Type": "VSX Type",
+                        "Catalog ID": "Catalog ID"
                     }
                     for c_id, base_text in col_headers.items():
                         if c_id == dm_tree.sort_col:
@@ -3966,7 +4026,7 @@ def run_config_gui(pipeline_callback=None):
             messagebox.showwarning("No Selection", "Please select a star from the table first.")
             return
         vals = dm_tree.item(selected[0], 'values')
-        ra_deg, dec_deg = float(vals[1]), float(vals[2])
+        ra_deg, dec_deg = float(vals[3]), float(vals[4])
         
         from astropy.coordinates import SkyCoord
         import astropy.units as u
@@ -4104,8 +4164,8 @@ def run_config_gui(pipeline_callback=None):
     
     show_non_suspects_var = tk.BooleanVar(value=False)
     
-    # Task 2: Added "Valid" column to columns tuple
-    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA", "Dec", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type"), show='headings', height=8)
+    # Task 2: Added "Valid" and "Catalog ID" column to columns tuple
+    dm_tree = ttk.Treeview(lf_dm_table, columns=("ID", "RA (hms)", "Dec (dms)", "RA (deg)", "Dec (deg)", "Mean Mag", "RMS", "Excess", "Valid", "Flag", "VSX Name", "VSX Type", "Catalog ID"), show='headings', height=8)
     
     # Configure row tags for coloring
     dm_tree.tag_configure("suspect", background="#ffcccc")
@@ -4137,9 +4197,9 @@ def run_config_gui(pipeline_callback=None):
                     
             if col == "ID":
                 stats_to_show.sort(key=lambda x: try_numeric(x['id']), reverse=rev)
-            elif col == "RA":
+            elif col == "RA (deg)":
                 stats_to_show.sort(key=lambda x: x['ra_deg'], reverse=rev)
-            elif col == "Dec":
+            elif col == "Dec (deg)":
                 stats_to_show.sort(key=lambda x: x['dec_deg'], reverse=rev)
             elif col == "Mean Mag":
                 stats_to_show.sort(key=lambda x: x['mean_mag'], reverse=rev)
@@ -4156,26 +4216,39 @@ def run_config_gui(pipeline_callback=None):
                 stats_to_show.sort(key=lambda x: x.get('vsx_name', ''), reverse=rev)
             elif col == "VSX Type":
                 stats_to_show.sort(key=lambda x: x.get('vsx_type', ''), reverse=rev)
+            elif col == "Catalog ID":
+                stats_to_show.sort(key=lambda x: x.get('catalog_id', ''), reverse=rev)
                 
         for s in stats_to_show:
             flag = "SUSPECT" if s.get('is_suspect') else ("NOISY" if s.get('is_noisy') else "")
+            if s.get('high_bg_var'):
+                flag = flag + " (High Bg Var)" if flag else "(High Bg Var)"
+                
             vsx_name = s.get('vsx_name', '')
             vsx_type = s.get('vsx_type', '')
             
             # Row coloring based on flag
             tag = ""
-            if flag == "SUSPECT":
+            if "SUSPECT" in flag:
                 tag = "suspect"
-            elif flag == "NOISY":
+            elif "NOISY" in flag:
                 tag = "noisy"
             elif s['excess_rms'] > 0.02 and s['rms'] > 2.0 * s.get('expected_rms', 0):
                 tag = "borderline"
                 
-            # Task 2: Populate Valid count
+            # Populate Valid count and Catalog ID
+            catalog_id = s.get('catalog_id', '')
+            
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            c = SkyCoord(ra=s['ra_deg']*u.deg, dec=s['dec_deg']*u.deg)
+            ra_hms = c.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+            dec_dms = c.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+            
             dm_tree.insert("", tk.END, values=(
-                s['id'], f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
+                s['id'], ra_hms, dec_dms, f"{s['ra_deg']:.5f}", f"{s['dec_deg']:.5f}",
                 f"{s['mean_mag']:.3f}", f"{s['rms']:.4f}", f"{s['excess_rms']:.4f}",
-                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type
+                f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type, catalog_id
             ), tags=(tag,) if tag else ())
             
     def sort_column(col):
@@ -4187,15 +4260,18 @@ def run_config_gui(pipeline_callback=None):
             
         col_headers = {
             "ID": "ID",
-            "RA": "RA (deg)",
-            "Dec": "Dec (deg)",
+            "RA (hms)": "RA (hms)",
+            "Dec (dms)": "Dec (dms)",
+            "RA (deg)": "RA (deg)",
+            "Dec (deg)": "Dec (deg)",
             "Mean Mag": "Mean Mag",
             "RMS": "RMS",
             "Excess": "Excess RMS",
             "Valid": "Valid",
             "Flag": "Flag",
             "VSX Name": "VSX Name",
-            "VSX Type": "VSX Type"
+            "VSX Type": "VSX Type",
+            "Catalog ID": "Catalog ID"
         }
         for c_id, base_text in col_headers.items():
             if c_id == col:
@@ -4307,6 +4383,143 @@ def run_config_gui(pipeline_callback=None):
         vals = dm_tree.item(selected[0], 'values')
         show_mini_lightcurve(vals[0])
         
+    def show_dm_context_menu(item, x_root, y_root, star_stat=None):
+        if item is not None:
+            dm_tree.selection_set(item)
+            vals = dm_tree.item(item, 'values')
+        else:
+            if not star_stat: return
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            c = SkyCoord(ra=star_stat['ra_deg']*u.deg, dec=star_stat['dec_deg']*u.deg)
+            ra_hms = c.ra.to_string(unit=u.hourangle, sep=':', precision=2)
+            dec_dms = c.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
+            flag = "SUSPECT" if star_stat.get('is_suspect') else "NOISY" if star_stat.get('is_noisy') else ""
+            vals = (
+                star_stat['id'], ra_hms, dec_dms, f"{star_stat['ra_deg']:.5f}", f"{star_stat['dec_deg']:.5f}",
+                f"{star_stat['mean_mag']:.3f}", f"{star_stat['rms']:.4f}", f"{star_stat['excess_rms']:.4f}",
+                f"{star_stat.get('n_valid', 0)}", flag, star_stat.get('vsx_name', ''), star_stat.get('vsx_type', ''), star_stat.get('catalog_id', '')
+            )
+
+        menu = tk.Menu(root, tearoff=0)
+        ra, dec = vals[3], vals[4]
+        
+        menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
+        
+        def local_send_to_lc():
+            vars_dict["ts_target_ra"][0].set(vals[1])
+            vars_dict["ts_target_dec"][0].set(vals[2])
+            vars_dict["ts_target_mode"][0].set("manual")
+            ts_target_name_var.set(f"Star_{vals[0]}")
+            switch_tab("ts")
+            
+        menu.add_command(label="Send to Light Curves", command=local_send_to_lc)
+        
+        def open_in_viewer():
+            selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+            if not selected_iids:
+                messagebox.showwarning("No Selection", "Please check a FITS file in the File Manager to view it.")
+                return
+            file_path = loaded_files[int(selected_iids[0])]['path']
+            
+            star_id = vals[0]
+            target_stat = None
+            if hasattr(dm_tree, 'final_stats'):
+                for s in dm_tree.final_stats:
+                    if str(s['id']) == str(star_id):
+                        target_stat = s
+                        break
+            
+            if target_stat:
+                viewer_win = tk.Toplevel(root)
+                from photometry.fits_viewer import FITSViewer
+                
+                viewer_config = {
+                    'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
+                    'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
+                    'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
+                    'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
+                    'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
+                    'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
+                    'annulus_width': float(vars_dict["annulus_width"][0].get())
+                }
+                
+                FITSViewer(viewer_win, file_path, config=viewer_config,
+                           initial_stars={'variable': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id, 'zoom': True}, 'check': None, 'refs': []})
+        
+        menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
+        
+        def copy_csv():
+            root.clipboard_clear()
+            root.clipboard_append(",".join(map(str, vals)))
+            
+        def remove_suspect():
+            star_id = vals[0]
+            if hasattr(dm_tree, 'final_stats'):
+                for s in dm_tree.final_stats:
+                    if str(s['id']) == str(star_id):
+                        s['is_suspect'] = False
+                        break
+                populate_dm_tree()
+                
+                # Refresh plot and banner
+                if not hasattr(dm_tree, 'ax') or not dm_tree.ax: return
+                ax = dm_tree.ax
+                ax.clear()
+                dm_tree.highlight_artists = []
+                
+                final_stats = dm_tree.final_stats
+                stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
+                suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
+                
+                mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
+                rms_stable = np.array([s['rms'] for s in stable_stars_list])
+                
+                mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
+                rms_sus = np.array([s['rms'] for s in suspect_stars_list])
+                
+                mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
+                rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
+                
+                if len(mags_stable) > 0:
+                    sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
+                    sc_stable.star_list = stable_stars_list
+                if len(mags_sus) > 0:
+                    sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                    sc_suspect.star_list = suspect_stars_list
+                if len(mags_noisy) > 0:
+                    sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
+                    sc_noisy.star_list = noisy_stars_list
+                    
+                ax.set_xlabel("Mean Instrumental Mag")
+                ax.set_ylabel("RMS (std dev)")
+                ax.set_title("Stellar Variability Diagram")
+                ax.legend()
+                if not ax.xaxis_inverted():
+                    ax.invert_xaxis()
+                dm_canvas.draw()
+                
+                # Update summary banner
+                n_suspects = len(suspect_stars_list)
+                n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
+                n_new = max(0, n_suspects - n_known)
+                
+                dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
+                dm_summary_labels["known_vsx"].config(text=str(n_known))
+
+        if "SUSPECT" in vals[9]:
+            menu.add_command(label="Remove from Suspects", command=remove_suspect)
+        menu.add_command(label="Copy Row as CSV", command=copy_csv)
+        
+        menu.post(x_root, y_root)
+
+    def on_dm_right_click(event):
+        item = dm_tree.identify_row(event.y)
+        if item:
+            show_dm_context_menu(item, event.x_root, event.y_root)
+            
     # Task 4: Pick event callback for matplotlib canvas click
     def on_canvas_pick(event):
         col = event.artist
@@ -4316,34 +4529,22 @@ def run_config_gui(pipeline_callback=None):
             star_id = star['id']
             
             found = False
+            item_id = None
             for item in dm_tree.get_children():
                 if str(dm_tree.item(item, 'values')[0]) == str(star_id):
                     dm_tree.selection_set(item)
                     dm_tree.see(item)
                     found = True
+                    item_id = item
                     break
                     
             highlight_star_in_plot(star)
             
-    def on_dm_right_click(event):
-        item = dm_tree.identify_row(event.y)
-        if item:
-            dm_tree.selection_set(item)
-            menu = tk.Menu(root, tearoff=0)
-            
-            vals = dm_tree.item(item, 'values')
-            ra, dec = vals[1], vals[2]
-            
-            menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
-            menu.add_command(label="Send to Light Curves", command=on_send_suspect)
-            
-            def copy_csv():
-                root.clipboard_clear()
-                root.clipboard_append(",".join(map(str, vals)))
-                
-            menu.add_command(label="Copy Row as CSV", command=copy_csv)
-            
-            menu.post(event.x_root, event.y_root)
+            if getattr(event.mouseevent, 'button', 1) == 3:
+                # Get screen coordinates for the right click from the mouse event
+                x_root = event.mouseevent.guiEvent.x_root
+                y_root = event.mouseevent.guiEvent.y_root
+                show_dm_context_menu(item_id, x_root, y_root, star_stat=star)
             
     dm_tree.final_stats = []
     dm_tree.sort_col = "Excess"
@@ -4362,8 +4563,10 @@ def run_config_gui(pipeline_callback=None):
 
     # Task 2: Setup Table Headings
     dm_tree.heading("ID", text="ID", command=lambda: sort_column("ID"))
-    dm_tree.heading("RA", text="RA (deg)", command=lambda: sort_column("RA"))
-    dm_tree.heading("Dec", text="Dec (deg)", command=lambda: sort_column("Dec"))
+    dm_tree.heading("RA (hms)", text="RA (hms)")
+    dm_tree.heading("Dec (dms)", text="Dec (dms)")
+    dm_tree.heading("RA (deg)", text="RA (deg)", command=lambda: sort_column("RA (deg)"))
+    dm_tree.heading("Dec (deg)", text="Dec (deg)", command=lambda: sort_column("Dec (deg)"))
     dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_column("Mean Mag"))
     dm_tree.heading("RMS", text="RMS", command=lambda: sort_column("RMS"))
     dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
@@ -4371,11 +4574,14 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
     dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_column("VSX Name"))
     dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_column("VSX Type"))
+    dm_tree.heading("Catalog ID", text="Catalog ID", command=lambda: sort_column("Catalog ID"))
     
     # Task 2: Setup Column Widths
     dm_tree.column("ID", width=70, anchor=tk.CENTER)
-    dm_tree.column("RA", width=80, anchor=tk.CENTER)
-    dm_tree.column("Dec", width=80, anchor=tk.CENTER)
+    dm_tree.column("RA (hms)", width=90, anchor=tk.CENTER)
+    dm_tree.column("Dec (dms)", width=90, anchor=tk.CENTER)
+    dm_tree.column("RA (deg)", width=80, anchor=tk.CENTER)
+    dm_tree.column("Dec (deg)", width=80, anchor=tk.CENTER)
     dm_tree.column("Mean Mag", width=70, anchor=tk.CENTER)
     dm_tree.column("RMS", width=70, anchor=tk.CENTER)
     dm_tree.column("Excess", width=70, anchor=tk.CENTER)
@@ -4383,6 +4589,7 @@ def run_config_gui(pipeline_callback=None):
     dm_tree.column("Flag", width=70, anchor=tk.CENTER)
     dm_tree.column("VSX Name", width=120, anchor=tk.W)
     dm_tree.column("VSX Type", width=80, anchor=tk.W)
+    dm_tree.column("Catalog ID", width=120, anchor=tk.CENTER)
     
     # Bindings
     dm_tree.bind("<<TreeviewSelect>>", on_dm_tree_select)

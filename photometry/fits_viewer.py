@@ -985,9 +985,38 @@ class FITSViewer:
             bg = np.nanmedian(d_fit)
             d_fit_sub = d_fit - bg
             
-            # Find peak for initial guess
-            y_init, x_init = np.unravel_index(np.argmax(d_fit_sub), d_fit_sub.shape)
-            g_init = models.Gaussian2D(amplitude=np.max(d_fit_sub), x_mean=x_init, y_mean=y_init, x_stddev=2.0, y_stddev=2.0, theta=0)
+            # The exact clicked coordinate translated to the cutout's reference frame
+            x_click_cutout, y_click_cutout = cutout.to_cutout_position((x, y))
+            
+            # Apply a Gaussian weight window (sigma=4.0) centered on the click.
+            # This allows the initial guess to "snap" to a bright star if you click within 
+            # 3-4 pixels of it, but strongly suppresses bright stars 10-20 pixels away.
+            yy, xx = np.mgrid[:size, :size]
+            window = np.exp(-((xx - x_click_cutout)**2 + (yy - y_click_cutout)**2) / (2.0 * 4.0**2))
+            d_weighted = d_fit_sub * window
+            
+            # Find the peak in the weighted data to use as our initial guess
+            y_init, x_init = np.unravel_index(np.argmax(d_weighted), d_weighted.shape)
+            x_init, y_init = float(x_init), float(y_init)
+            
+            # Estimate amplitude at the guessed location (with a fallback)
+            try:
+                amp_guess = d_fit_sub[int(round(y_init)), int(round(x_init))]
+                if amp_guess <= 0: amp_guess = np.max(d_fit_sub)
+            except:
+                amp_guess = np.max(d_fit_sub)
+                
+            # Bound the centroid to stay within ±3 pixels of the click.
+            # This forces the fitter to fit the exact object the user clicked on.
+            g_init = models.Gaussian2D(
+                amplitude=amp_guess, 
+                x_mean=x_init, y_mean=y_init, 
+                x_stddev=2.0, y_stddev=2.0, theta=0,
+                bounds={
+                    'x_mean': (x_init - 3.0, x_init + 3.0),
+                    'y_mean': (y_init - 3.0, y_init + 3.0)
+                }
+            )
             fitter = fitting.LevMarLSQFitter()
             yy, xx = np.mgrid[:size, :size]
             g_fit = fitter(g_init, xx, yy, d_fit_sub)
@@ -1114,7 +1143,11 @@ class FITSViewer:
         # 1. Target Variable
         v = self.initial_stars.get('variable')
         if v and v.get('ra') is not None:
-            self._mark_by_coord(v['ra'], v['dec'], "Variable")
+            res = self._mark_by_coord(v['ra'], v['dec'], "Variable")
+            if res and v.get('zoom'):
+                x, y = res
+                self.ax.set_xlim(x - 400, x + 400)
+                self.ax.set_ylim(y - 400, y + 400)
             
         # 2. Check Star
         c = self.initial_stars.get('check')
@@ -1142,15 +1175,17 @@ class FITSViewer:
             x, y = self.wcs.world_to_pixel(SkyCoord(ra, dec, unit='deg'))
             # Bounds check
             if x < 0 or x >= self.data.shape[1] or y < 0 or y >= self.data.shape[0]:
-                return
+                return None
             
             # Simulate a click position for role handlers
             self._last_click_pos = (x, y)
             if role == "Variable": self._add_variable_star()
             elif role == "Check": self._add_check_star()
             elif role == "Reference": self._add_on_the_spot_ref()
+            return x, y
         except Exception as e:
             print(f"Auto-mark failed for {role} at {ra}, {dec}: {e}")
+            return None
 
     def _on_export_click(self, quiet=False):
         """Export all currently marked star coordinates and names to the main app."""

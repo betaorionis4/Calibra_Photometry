@@ -116,10 +116,24 @@ def measure_star(image_data, wcs, ra, dec, aperture_radius, annulus_inner, annul
         cutout = image_data[y_int-size:y_int+size, x_int-size:x_int+size]
         # Subtract local background for centroiding
         _, median, _ = sigma_clipped_stats(cutout)
-        x_rel, y_rel = centroid_2dg(cutout - median)
         
-        x_refined = x_int - size + x_rel
-        y_refined = y_int - size + y_rel
+        import warnings
+        from astropy.utils.exceptions import AstropyWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            warnings.simplefilter("ignore", category=AstropyWarning)
+            x_rel, y_rel = centroid_2dg(cutout - median)
+        
+        if np.isnan(x_rel) or np.isnan(y_rel):
+            x_refined, y_refined = float(x_init), float(y_init)
+        else:
+            # Prevent snapping to a nearby bright star by limiting max shift
+            dist_shift = np.sqrt((x_rel - size)**2 + (y_rel - size)**2)
+            if dist_shift > 4.0:
+                x_refined, y_refined = float(x_init), float(y_init)
+            else:
+                x_refined = x_int - size + x_rel
+                y_refined = y_int - size + y_rel
         
         # 3. Aperture Photometry
         pos = (x_refined, y_refined)
@@ -304,7 +318,8 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                 res = get_cached_measurement(fpath, s['ra'], s['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain)
                 if res and not np.isnan(res['mag_inst']):
                     m_inst_corr = res['mag_inst'] - (k_coeff * airmass)
-                    zv_i = s['mag_std'] - (m_inst_corr + coeff_term * s['bv_std'])
+                    safe_ens_bv = s['bv_std'] if s.get('bv_std') is not None and not np.isnan(s.get('bv_std', 0.0)) else 0.0
+                    zv_i = s['mag_std'] - (m_inst_corr + coeff_term * safe_ens_bv)
                     ensemble_res.append({
                         'name': s['name'],
                         'zv': zv_i,
@@ -324,9 +339,12 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                 zv_std = np.std(zvs, ddof=1) if len(zvs) > 1 else 0.0
                 zv_err = zv_std / np.sqrt(len(zvs)) if len(zvs) > 1 else 0.01 # Fallback 0.01 if only 1 star
                 
+                # Safely handle NaN in B-V values which would propagate even if coeff_term is 0
+                safe_target_bv = target_bv if target_bv is not None and not np.isnan(target_bv) else 0.0
+                
                 # Target Calibration
                 v_target_corr = target_res['mag_inst'] - (k_coeff * airmass)
-                v_target_std = v_target_corr + coeff_term * target_bv + zv_avg
+                v_target_std = v_target_corr + coeff_term * safe_target_bv + zv_avg
                 
                 # Total uncertainty
                 total_mag_err = np.sqrt(target_res['mag_err']**2 + zv_err**2)
@@ -346,7 +364,8 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                     check_res = get_cached_measurement(fpath, check_star['ra'], check_star['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain)
                     if check_res and not np.isnan(check_res['mag_inst']):
                         c_inst_corr = check_res['mag_inst'] - (k_coeff * airmass)
-                        check_mag_std = c_inst_corr + coeff_term * check_star['bv_std'] + zv_avg
+                        safe_check_bv = check_star['bv_std'] if check_star.get('bv_std') is not None and not np.isnan(check_star.get('bv_std', 0.0)) else 0.0
+                        check_mag_std = c_inst_corr + coeff_term * safe_check_bv + zv_avg
 
                 results.append({
                     'file': os.path.basename(fpath),
