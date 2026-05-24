@@ -3716,11 +3716,54 @@ def run_config_gui(pipeline_callback=None):
     lf_dm_config = tk.LabelFrame(dm_container, text="Data Mining Configuration", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
     lf_dm_config.pack(fill="x", pady=5)
     
-    add_entry(lf_dm_config, "Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0)
-    add_entry(lf_dm_config, "Saturation Limit (ADU):", "dm_saturation", 55000, 1, vtype=int)
-    add_entry(lf_dm_config, "Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, vtype=int)
-    add_entry(lf_dm_config, "Min Valid Frames Fraction (0.0 - 1.0):", "dm_min_valid_pct", 0.7, 3)
-    add_check(lf_dm_config, "Fast Test Mode (limit ensemble to top 100 stars)", "dm_fast_test", True, 4)
+    def show_quiet_tooltip(title, msg):
+        top = tk.Toplevel(root)
+        top.title(title)
+        top.geometry("350x140")
+        top.resizable(False, False)
+        x = root.winfo_rootx() + root.winfo_width()//2 - 175
+        y = root.winfo_rooty() + root.winfo_height()//2 - 70
+        top.geometry(f"+{x}+{y}")
+        tk.Label(top, text=msg, wraplength=310, justify="left", font=("Segoe UI", 10)).pack(padx=20, pady=(15, 10))
+        tk.Button(top, text="OK", command=top.destroy, width=8, bg="#e0e0e0").pack(pady=5)
+        top.transient(root)
+        top.grab_set()
+
+    def add_dm_setting(label_text, var_name, default_val, row, col, tooltip, vtype=float):
+        if var_name in vars_dict:
+            var = vars_dict[var_name][0]
+        else:
+            if vtype == str:
+                var = tk.StringVar(value=str(default_val))
+            elif vtype == int:
+                var = tk.IntVar(value=int(default_val))
+            else:
+                var = tk.DoubleVar(value=float(default_val))
+            vars_dict[var_name] = (var, vtype)
+        
+        ttk.Label(lf_dm_config, text=label_text).grid(row=row, column=col, sticky=tk.W, padx=10, pady=5)
+        ttk.Entry(lf_dm_config, textvariable=var, width=15).grid(row=row, column=col+1, sticky=tk.W, padx=10, pady=5)
+        
+        btn = tk.Button(lf_dm_config, text="?", relief="flat", fg="#1a3a5f", bg="#e0e0e0", 
+                        command=lambda msg=tooltip, t=label_text: show_quiet_tooltip(t, msg),
+                        font=("Arial", 8, "bold"), padx=5, pady=0)
+        btn.grid(row=row, column=col+2, padx=(0, 20), sticky="w")
+
+    # Column 1
+    add_dm_setting("Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0, 0, "How many times above the background noise a star must be to be detected.")
+    add_dm_setting("Detection FWHM (px):", "dm_fwhm", 3.5, 1, 0, "The assumed Full Width at Half Maximum of stars in pixels for the DAOStarFinder algorithm.")
+    add_dm_setting("Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, 0, "Ignore stars closer to the image edge than this many pixels.", vtype=int)
+    add_dm_setting("Min Valid Frames Fraction:", "dm_min_valid_pct", 0.7, 3, 0, "A star must be successfully measured in at least this fraction (0.0 - 1.0) of frames to be kept.")
+    
+    # Column 2
+    add_dm_setting("Ensemble Size (Stars):", "dm_ensemble_size", 100, 0, 3, "Number of brightest, most stable stars to use for calculating frame-to-frame zero-point offsets.", vtype=int)
+    add_dm_setting("Suspect Sigma Threshold:", "dm_suspect_sigma", 3.0, 1, 3, "A star's RMS scatter must be this many times higher than the expected noise floor to be flagged as a Suspect.")
+    add_dm_setting("Suspect Minimum Excess (Mag):", "dm_suspect_excess", 0.03, 2, 3, "A star's absolute RMS must exceed the expected noise floor by at least this many magnitudes to be flagged as a Suspect. Prevents flagging micro-variations in ultra-bright stars.")
+    
+    # Fast Test Mode Checkbox (placed under Column 2)
+    var_fast = tk.BooleanVar(value=True)
+    vars_dict["dm_fast_test"] = (var_fast, bool)
+    ttk.Checkbutton(lf_dm_config, text="Fast Test Mode (limit tracking to top 100 stars)", variable=var_fast).grid(row=3, column=3, columnspan=3, sticky=tk.W, padx=10, pady=5)
     
     dm_status_var = tk.StringVar(value="Ready to discover.")
     tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
@@ -3763,10 +3806,14 @@ def run_config_gui(pipeline_callback=None):
         fits_files = [loaded_files[int(iid)]['path'] for iid in selected_iids]
         ref_file = fits_files[0]
         
-        detect_sig = vars_dict["dm_detect_sigma"][0].get()
-        sat_limit = vars_dict["dm_saturation"][0].get()
-        edge_buf = vars_dict["dm_edge_buffer"][0].get()
-        min_pct = vars_dict["dm_min_valid_pct"][0].get()
+        detect_sig = float(vars_dict["dm_detect_sigma"][0].get())
+        dm_fwhm_val = float(vars_dict["dm_fwhm"][0].get())
+        sat_limit = int(vars_dict["saturation_limit"][0].get())
+        edge_buf = int(vars_dict["dm_edge_buffer"][0].get())
+        min_pct = float(vars_dict["dm_min_valid_pct"][0].get())
+        ens_size = int(vars_dict["dm_ensemble_size"][0].get())
+        susp_sig = float(vars_dict["dm_suspect_sigma"][0].get())
+        susp_exc = float(vars_dict["dm_suspect_excess"][0].get())
         is_fast = vars_dict["dm_fast_test"][0].get()
         
         # Aperture settings are shared with general config
@@ -3786,8 +3833,19 @@ def run_config_gui(pipeline_callback=None):
         
         def dm_thread():
             try:
+                # Fetch DAOStarFinder parameters from the Settings tab
+                fwhm_val = dm_fwhm_val
+                sharplo_val = float(vars_dict["dao_sharplo"][0].get())
+                sharphi_val = float(vars_dict["dao_sharphi"][0].get())
+                roundlo_val = float(vars_dict["dao_roundlo"][0].get())
+                roundhi_val = float(vars_dict["dao_roundhi"][0].get())
+                
                 dm_status_var.set("Phase 1/3: Detecting stars in reference frame...")
-                master_cat = detect_all_stars(ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf)
+                master_cat = detect_all_stars(
+                    ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf,
+                    fwhm=fwhm_val, sharplo=sharplo_val, sharphi=sharphi_val, 
+                    roundlo=roundlo_val, roundhi=roundhi_val
+                )
                 
                 if cancel_event.is_set(): return
                 
@@ -3831,7 +3889,11 @@ def run_config_gui(pipeline_callback=None):
                 dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
                 
                 out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
-                final_stats, exp_func = calibrate_and_analyze(track_res, master_cat, out_csv, min_valid_fraction=min_pct, center_ra=center_ra_dm, center_dec=center_dec_dm)
+                final_stats, exp_func = calibrate_and_analyze(
+                    track_res, master_cat, out_csv, min_valid_fraction=min_pct, 
+                    ensemble_size=ens_size, center_ra=center_ra_dm, center_dec=center_dec_dm,
+                    suspect_sigma=susp_sig, min_excess=susp_exc
+                )
                 
                 if not final_stats:
                     dm_status_var.set("Analysis complete, but no valid stars survived filters.")
@@ -4369,8 +4431,19 @@ def run_config_gui(pipeline_callback=None):
                 if target_stat:
                     viewer_win = tk.Toplevel(root)
                     from photometry.fits_viewer import FITSViewer
-                    FITSViewer(viewer_win, file_path, 
-                               initial_stars={'target': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id}, 'check': None, 'refs': []})
+                    
+                    viewer_config = {
+                        'aperture_radius': float(vars_dict["aperture_radius"][0].get()),
+                        'annulus_inner': float(vars_dict["annulus_inner"][0].get()),
+                        'annulus_outer': float(vars_dict["annulus_outer"][0].get()),
+                        'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
+                        'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
+                        'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
+                        'annulus_width': float(vars_dict["annulus_width"][0].get())
+                    }
+                    
+                    FITSViewer(viewer_win, file_path, config=viewer_config,
+                               initial_stars={'variable': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id, 'zoom': True}, 'check': None, 'refs': []})
             
             menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
             
@@ -4378,6 +4451,64 @@ def run_config_gui(pipeline_callback=None):
                 root.clipboard_clear()
                 root.clipboard_append(",".join(map(str, vals)))
                 
+            def remove_suspect():
+                star_id = vals[0]
+                if hasattr(dm_tree, 'final_stats'):
+                    for s in dm_tree.final_stats:
+                        if str(s['id']) == str(star_id):
+                            s['is_suspect'] = False
+                            break
+                    populate_dm_tree()
+                    
+                    # Refresh plot and banner
+                    if not hasattr(dm_tree, 'ax') or not dm_tree.ax: return
+                    ax = dm_tree.ax
+                    ax.clear()
+                    dm_tree.highlight_artists = []
+                    
+                    final_stats = dm_tree.final_stats
+                    stable_stars_list = [s for s in final_stats if not s.get('is_suspect') and not s.get('is_noisy')]
+                    suspect_stars_list = [s for s in final_stats if s.get('is_suspect')]
+                    noisy_stars_list = [s for s in final_stats if s.get('is_noisy')]
+                    
+                    mags_stable = np.array([s['mean_mag'] for s in stable_stars_list])
+                    rms_stable = np.array([s['rms'] for s in stable_stars_list])
+                    
+                    mags_sus = np.array([s['mean_mag'] for s in suspect_stars_list])
+                    rms_sus = np.array([s['rms'] for s in suspect_stars_list])
+                    
+                    mags_noisy = np.array([s['mean_mag'] for s in noisy_stars_list])
+                    rms_noisy = np.array([s['rms'] for s in noisy_stars_list])
+                    
+                    if len(mags_stable) > 0:
+                        sc_stable = ax.scatter(mags_stable, rms_stable, c='blue', alpha=0.5, s=10, label='Stable', picker=5)
+                        sc_stable.star_list = stable_stars_list
+                    if len(mags_sus) > 0:
+                        sc_suspect = ax.scatter(mags_sus, rms_sus, c='red', alpha=0.9, s=40, label='Suspect', marker='*', picker=5)
+                        sc_suspect.star_list = suspect_stars_list
+                    if len(mags_noisy) > 0:
+                        sc_noisy = ax.scatter(mags_noisy, rms_noisy, c='#ff9100', alpha=0.8, s=30, label='Noisy (outliers)', marker='^', picker=5)
+                        sc_noisy.star_list = noisy_stars_list
+                        
+                    ax.set_xlabel("Mean Instrumental Mag")
+                    ax.set_ylabel("RMS (std dev)")
+                    ax.set_title("Stellar Variability Diagram")
+                    ax.legend()
+                    if not ax.xaxis_inverted():
+                        ax.invert_xaxis()
+                    dm_canvas.draw()
+                    
+                    # Update summary banner
+                    n_suspects = len(suspect_stars_list)
+                    n_known = sum(1 for s in final_stats if s.get('is_suspect') and s.get('vsx_name'))
+                    n_new = max(0, n_suspects - n_known)
+                    
+                    dm_summary_labels["total_suspects"].config(text=str(n_suspects), fg="#d32f2f" if n_suspects > 0 else "#1a3a5f")
+                    dm_summary_labels["new_discoveries"].config(text=str(n_new), fg="#e65100" if n_new > 0 else "#1a3a5f")
+                    dm_summary_labels["known_vsx"].config(text=str(n_known))
+
+            if "SUSPECT" in vals[9]:
+                menu.add_command(label="Remove from Suspects", command=remove_suspect)
             menu.add_command(label="Copy Row as CSV", command=copy_csv)
             
             menu.post(event.x_root, event.y_root)

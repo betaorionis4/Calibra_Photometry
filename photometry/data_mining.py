@@ -137,8 +137,13 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                     if np.isnan(x_rel) or np.isnan(y_rel):
                         x_ref, y_ref = x_init, y_init
                     else:
-                        x_ref = x_int - size + x_rel
-                        y_ref = y_int - size + y_rel
+                        # Prevent snapping to a nearby bright star by limiting max shift
+                        dist_shift = np.sqrt((x_rel - size)**2 + (y_rel - size)**2)
+                        if dist_shift > 4.0:
+                            x_ref, y_ref = x_init, y_init
+                        else:
+                            x_ref = x_int - size + x_rel
+                            y_ref = y_int - size + y_rel
                 except Exception:
                     x_ref, y_ref = x_init, y_init
                     
@@ -200,7 +205,8 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
             
     return results, warnings_list
 
-def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_buffer=50):
+def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_buffer=50,
+                     fwhm=3.5, sharplo=0.2, sharphi=1.0, roundlo=-1.0, roundhi=1.0):
     """
     Detects all stars in a reference frame, rejecting saturated stars and stars near the edge.
     Returns a list of dictionaries containing star coordinates and initial fluxes.
@@ -237,13 +243,13 @@ def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_b
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=AstropyWarning)
             try:
-                daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
-                                        sharpness_range=(0.2, 1.0), 
-                                        roundness_range=(-1.0, 1.0))
+                daofind = DAOStarFinder(fwhm=fwhm, threshold=detect_sigma * std_bg,
+                                        sharpness_range=(sharplo, sharphi), 
+                                        roundness_range=(roundlo, roundhi))
             except TypeError:
-                daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
-                                        sharplo=0.2, sharphi=1.0, 
-                                        roundlo=-1.0, roundhi=1.0)
+                daofind = DAOStarFinder(fwhm=fwhm, threshold=detect_sigma * std_bg,
+                                        sharplo=sharplo, sharphi=sharphi, 
+                                        roundlo=roundlo, roundhi=roundhi)
                                         
         sources = daofind(data - median_bg)
         if sources is None:
@@ -297,7 +303,8 @@ def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_b
         print(f"Error in detect_all_stars for {fits_path}: {e}")
         return []
 
-def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid_fraction=0.7, ensemble_size=100, center_ra=None, center_dec=None):
+def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid_fraction=0.7, ensemble_size=100, 
+                          center_ra=None, center_dec=None, suspect_sigma=3.0, min_excess=0.03):
     """
     Performs the 2-Pass Global Differential Calibration and Statistical Analysis.
     
@@ -503,7 +510,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         # 1. The scatter must be at least 3x the expected noise floor (Sigma detection).
         # 2. The absolute scatter must be > 0.03 mag to avoid flagging micro-variations 
         #    in ultra-bright stars where the theoretical noise floor approaches zero.
-        is_suspect = s['rms'] > 3.0 * exp_rms and excess_rms > 0.03
+        is_suspect = s['rms'] > suspect_sigma * exp_rms and excess_rms > min_excess
         s['is_noisy'] = False
         
         if is_suspect:
@@ -729,7 +736,7 @@ def cross_match_deep_catalog(final_stats, center_ra, center_dec, radius_arcmin=N
     
     match_count = 0
     for i, s in enumerate(final_stats):
-        if d2d[i].arcsec < 5.0:  # 5 arcseconds tolerance
+        if d2d[i].arcsec < 10.0:  # 10 arcseconds tolerance
             s['catalog_match'] = True
             s['catalog_id'] = cat_stars[idx[i]].get('cat_id', '')
             match_count += 1

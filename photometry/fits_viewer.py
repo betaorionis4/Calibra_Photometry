@@ -1143,7 +1143,11 @@ class FITSViewer:
         # 1. Target Variable
         v = self.initial_stars.get('variable')
         if v and v.get('ra') is not None:
-            self._mark_by_coord(v['ra'], v['dec'], "Variable")
+            res = self._mark_by_coord(v['ra'], v['dec'], "Variable")
+            if res and v.get('zoom'):
+                x, y = res
+                self.ax.set_xlim(x - 400, x + 400)
+                self.ax.set_ylim(y - 400, y + 400)
             
         # 2. Check Star
         c = self.initial_stars.get('check')
@@ -1171,15 +1175,17 @@ class FITSViewer:
             x, y = self.wcs.world_to_pixel(SkyCoord(ra, dec, unit='deg'))
             # Bounds check
             if x < 0 or x >= self.data.shape[1] or y < 0 or y >= self.data.shape[0]:
-                return
+                return None
             
             # Simulate a click position for role handlers
             self._last_click_pos = (x, y)
             if role == "Variable": self._add_variable_star()
             elif role == "Check": self._add_check_star()
             elif role == "Reference": self._add_on_the_spot_ref()
+            return x, y
         except Exception as e:
             print(f"Auto-mark failed for {role} at {ra}, {dec}: {e}")
+            return None
 
     def _on_export_click(self, quiet=False):
         """Export all currently marked star coordinates and names to the main app."""
