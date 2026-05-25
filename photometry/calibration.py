@@ -596,6 +596,7 @@ def resolve_auid(auid, target_hint=None, verbose=True):
     
     try:
         import urllib.request
+        import urllib.parse
         import re
         from astropy.coordinates import SkyCoord
         import astropy.units as u
@@ -634,25 +635,23 @@ def resolve_auid(auid, target_hint=None, verbose=True):
             except Exception as e:
                 if verbose: print(f"  VSP Table lookup failed: {e}")
 
-        # 2. Fallback: Try general VSX details page
-        if verbose: print("  Falling back to general VSX detail search...")
-        url = f"https://vsx.aavso.org/index.php?view=detail.top&ident={auid}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        
-        with urllib.request.urlopen(req, timeout=15) as response:
-            html = response.read().decode('utf-8', errors='ignore')
-            
-        name_match = re.search(r'Name:</td>\s*<td class="formfield">(.*?)</td>', html)
-        name = name_match.group(1).strip() if name_match else auid
-        
-        coord_match = re.search(r'Coords \(J2000\):</td>\s*<td class="formfield">.*?\(([-\d.]+)\s+([-\d.]+)\)</td>', html, re.DOTALL)
-        if coord_match:
-            return {'ra': float(coord_match.group(1)), 'dec': float(coord_match.group(2)), 'name': name}
-        else:
-            hms_match = re.search(r'Coords \(J2000\):</td>\s*<td class="formfield">([\d\s:.+-]+)</td>', html, re.DOTALL)
-            if hms_match:
-                c = SkyCoord(hms_match.group(1).strip(), unit=(u.hourangle, u.deg))
-                return {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': name}
+        # 2. Fallback: Try VizieR VSX catalog directly by Name
+        if verbose: print("  Falling back to VizieR VSX name search...")
+        from astroquery.vizier import Vizier
+        v = Vizier(columns=['OID', 'Name', '_RAJ2000', '_DEJ2000'], row_limit=1)
+        try:
+            result = v.query_constraints(catalog='B/vsx/vsx', Name=auid)
+            if result and len(result) > 0:
+                table = result[0]
+                if len(table) > 0:
+                    ra_deg = float(table['_RAJ2000'][0])
+                    dec_deg = float(table['_DEJ2000'][0])
+                    name = str(table['Name'][0])
+                    if verbose:
+                        print(f"  Found {name} in VSX VizieR at RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
+                    return {'ra': ra_deg, 'dec': dec_deg, 'name': name}
+        except Exception as e:
+            if verbose: print(f"  VizieR VSX lookup failed: {e}")
                 
     except Exception as e:
         if verbose:

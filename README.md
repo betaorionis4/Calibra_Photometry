@@ -17,7 +17,9 @@ The code was created with lots of help from Google Antigravity (various agents),
 - **VSX Name Resolution Fallback**: If standard name resolution (Simbad) fails for a Target or Reference Star, Calibra now automatically falls back to searching the AAVSO Variable Star Index (VSX) database by name to resolve coordinates (e.g., for `NSVS 4892894`).
 - **Data Mining Context Integration**: Sent suspects from the Data Mining module to the Time-Series tab now automatically extract their official VSX names or Catalog IDs, resorting to `DM_xxxx` only if entirely unknown.
 - **Context Viewer Configuration Inheritance**: Fixed a bug where launching the FITS Viewer from the Suspects context menu failed to inherit GUI settings, causing the viewer to fallback to hardcoded default aperture sizes (8/15/20).
-
+- **Robust Time-Series Outlier Rejection**: Replaced the static global 3-sigma rejection algorithm with a Rolling Median and MAD-based robust outlier detector. This correctly preserves true stellar variability (like large amplitude eclipses) while still flagging sudden anomalous spikes.
+- **Interactive Flag Toggling**: Added a right-click context menu to the Time-Series Numerical Results table, empowering users to manually toggle the `SUSPECT` / `OK` status of any data point, instantly updating the plot.
+- **AAVSO Sequence Persistence & Viewer Toggles**: Fixed a session loading bug where AUIDs were overwritten by Gaia IDs upon restart by fully persisting the AAVSO Sequence Cache. Added interactive visibility toggles in the FITS Viewer for both AAVSO Sequence Stars and User-Selected Stars (Target/Ref/Check) to allow an unobstructed view of raw image data.
 ---
 
 ## What's New in v4.1
