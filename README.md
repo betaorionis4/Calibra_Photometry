@@ -1,10 +1,22 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 4.1 — 2026-05-22
+**Version:** 4.12 — 2026-05-25
 **Description:** 
 An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformation coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. Calibra features **Ensemble Differential Photometry** with multiple comparison stars, **Time-Series Light Curve** generation with AAVSO-format reporting, an **Interactive FITS Viewer** with role-based star marking, real-time PSF analysis, and bidirectional synchronization with the photometry pipeline. It integrates **AAVSO VSX** cross-matching to automatically exclude known variable stars from calibration sets.
 
 The code was created with lots of help from Google Antigravity (various agents), guided, tested and debugged by me. I have made several tests to verify the results and ensure the results are reasonable. This code is far from what codes like, e.g., AIJ, ASTAP or Tycho Tracker can do. The purpose is simply to have a playground for understanding the principles of CCD/CMOS based photometry and having a tool to compare to what AIJ, ASTAP or Tycho Tracker provide as fluxes, zero points, etc. However, I have used the code to produce reports for AAVSO (time-series) with my observations as I am quite happy with the results so far.
+
+---
+
+## What's New in v4.12
+
+- **Data Mining Centroid Accuracy**: Implemented a hard distance threshold (max 4.0 pixel shift) for the 2D Gaussian centroiding algorithm across both Data Mining and Time-Series modules. This effectively prevents the tracking pipeline from incorrectly "snapping" to nearby bright neighbor stars when analyzing very faint targets, greatly reducing the false-positive "noisy" star count.
+- **Interactive Scatter Plot Context Menus**: Enhanced the Stellar Variability scatter plot. Users can now right-click any star directly on the plot to summon the context menu (with options to "Send to Light Curves" or "Open in FITS Viewer"), fully supporting hidden non-suspect stars.
+- **Advanced Light Curve Customization**: The Time-Series module now features interactive inline visibility toggles and a dedicated "Advanced Plot Customizer" window. Users can dynamically toggle the target star, check star, and individual reference stars, set custom plot titles, axis labels, manual Y-axis limits, edit legend labels, and change colors/marker symbols. The plot redraws instantly, and customized plots can be exported to high-resolution images.
+- **Reference Star Statistics**: The Time-Series Analysis Summary now includes a scrollable detailed breakdown of statistical metrics (bias, standard deviation, and precision) for every individual reference star in the ensemble, alongside the check star.
+- **VSX Name Resolution Fallback**: If standard name resolution (Simbad) fails for a Target or Reference Star, Calibra now automatically falls back to searching the AAVSO Variable Star Index (VSX) database by name to resolve coordinates (e.g., for `NSVS 4892894`).
+- **Data Mining Context Integration**: Sent suspects from the Data Mining module to the Time-Series tab now automatically extract their official VSX names or Catalog IDs, resorting to `DM_xxxx` only if entirely unknown.
+- **Context Viewer Configuration Inheritance**: Fixed a bug where launching the FITS Viewer from the Suspects context menu failed to inherit GUI settings, causing the viewer to fallback to hardcoded default aperture sizes (8/15/20).
 
 ---
 
