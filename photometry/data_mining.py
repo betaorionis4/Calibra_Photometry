@@ -24,6 +24,7 @@ import os
 def track_and_measure(fits_files, master_catalog, aperture_radius=5.0, 
                       annulus_inner=7.0, annulus_outer=13.0, 
                       saturation_limit=55000, edge_buffer=50, 
+                      centroid_tracking_shift=4.0,
                       cancel_event=None, progress_callback=None):
     """
     Tracks and measures all stars in the master_catalog across all FITS files.
@@ -139,7 +140,7 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
                     else:
                         # Prevent snapping to a nearby bright star by limiting max shift
                         dist_shift = np.sqrt((x_rel - size)**2 + (y_rel - size)**2)
-                        if dist_shift > 4.0:
+                        if dist_shift > centroid_tracking_shift:
                             x_ref, y_ref = x_init, y_init
                         else:
                             x_ref = x_int - size + x_rel

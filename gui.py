@@ -3763,6 +3763,8 @@ def run_config_gui(pipeline_callback=None):
                 filter_name=ts_filter_var.get(),
                 site_lat=ts_lat_var.get(),
                 site_long=ts_lon_var.get(),
+                centroid_initial_radius=vars_dict.get('centroid_initial_radius', [None])[0].get() if 'centroid_initial_radius' in vars_dict else 15.0,
+                centroid_tracking_shift=vars_dict.get('centroid_tracking_shift', [None])[0].get() if 'centroid_tracking_shift' in vars_dict else 4.0,
                 cancel_event=cancel_event,
                 update_progress=update_prog,
                 use_flexible_aperture=bool(vars_dict["use_flexible_aperture"][0].get()),
@@ -4182,6 +4184,7 @@ def run_config_gui(pipeline_callback=None):
                     fits_files, master_cat, 
                     aperture_radius=ap_rad, annulus_inner=ann_in, annulus_outer=ann_out,
                     saturation_limit=sat_limit, edge_buffer=edge_buf,
+                    centroid_tracking_shift=vars_dict.get('centroid_tracking_shift', [None])[0].get() if 'centroid_tracking_shift' in vars_dict else 4.0,
                     cancel_event=cancel_event, progress_callback=update_prog
                 )
                 
@@ -4960,6 +4963,11 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_det, "Roundness Low:", "dao_roundlo", -1.2, 2, col_offset=0)
     add_entry(lf_det, "Roundness High:", "dao_roundhi", 1.2, 2, col_offset=1)
 
+    # Centroid Tracking
+    lf_centroid = tk.LabelFrame(sub_phot, text="Centroid Tracking")
+    lf_centroid.pack(fill="x", padx=10, pady=10)
+    add_entry(lf_centroid, "Initial Search Radius (px):", "centroid_initial_radius", 15.0, 0, col_offset=0)
+    add_entry(lf_centroid, "Max Tracking Shift (px):", "centroid_tracking_shift", 4.0, 0, col_offset=1)
 
     # Aperture Photometry (from old TAB 3)
     lf_ap = tk.LabelFrame(sub_phot, text="Aperture Photometry")

@@ -100,7 +100,7 @@ def get_hjd(time_str, ra, dec, header, site_lat=0.0, site_long=0.0):
         print(f"Warning: Could not calculate HJD: {e}")
         return None
 
-def measure_star(image_data, wcs, ra, dec, aperture_radius, annulus_inner, annulus_outer, gain=1.0):
+def measure_star(image_data, wcs, ra, dec, aperture_radius, annulus_inner, annulus_outer, gain=1.0, max_shift=4.0):
     """ Performs targeted aperture photometry on a specific RA/Dec. """
     try:
         # 1. Convert RA/Dec to pixel coordinates using WCS
@@ -129,7 +129,7 @@ def measure_star(image_data, wcs, ra, dec, aperture_radius, annulus_inner, annul
         else:
             # Prevent snapping to a nearby bright star by limiting max shift
             dist_shift = np.sqrt((x_rel - size)**2 + (y_rel - size)**2)
-            if dist_shift > 4.0:
+            if dist_shift > max_shift:
                 x_refined, y_refined = float(x_init), float(y_init)
             else:
                 x_refined = x_int - size + x_rel
@@ -181,7 +181,8 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                                cancel_event=None, update_progress=None,
                                use_flexible_aperture=False, 
                                aperture_fwhm_factor=2.0, annulus_inner_gap=2.0, annulus_width=5.0,
-                               print_psf_fitting=False):
+                               print_psf_fitting=False,
+                               centroid_initial_radius=15.0, centroid_tracking_shift=4.0):
     """
     Main loop for time-series photometry.
     """
@@ -190,7 +191,10 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
     
     from astropy.wcs import WCS
     from photometry.psf_fitting import refine_coordinates_psf
-    from astropy.coordinates import SkyCoord
+    target_locked = False
+    if check_star: check_star['locked'] = False
+    for s in ensemble_stars: s['locked'] = False
+    
     import astropy.units as u
     import warnings
     from astropy.utils.exceptions import AstropyWarning
@@ -301,22 +305,36 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                     else:
                         curr_ap, curr_ann_in, curr_ann_out = aperture_radius, annulus_inner, annulus_outer
 
-            def get_cached_measurement(fpath, ra, dec, ap, ann_in, ann_out, data, wcs, gain):
+            def get_cached_measurement(fpath, ra, dec, ap, ann_in, ann_out, data, wcs, gain, max_shift=4.0):
                 nonlocal cache_hits
                 key = (fpath, round(ra, 6), round(dec, 6), round(ap, 2), round(ann_in, 2), round(ann_out, 2))
                 if key in _SESSION_PHOT_CACHE:
                     cache_hits += 1
                     return _SESSION_PHOT_CACHE[key]
                 if data is None: return None
-                res = measure_star(data, wcs, ra, dec, ap, ann_in, ann_out, gain)
+                res = measure_star(data, wcs, ra, dec, ap, ann_in, ann_out, gain, max_shift)
                 _SESSION_PHOT_CACHE[key] = res
                 return res
 
-            target_res = get_cached_measurement(fpath, target_ra, target_dec, curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain)
+            # Measure Target
+            t_max_shift = centroid_tracking_shift if target_locked else centroid_initial_radius
+            target_res = get_cached_measurement(fpath, target_ra, target_dec, curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain, max_shift=t_max_shift)
+            if target_res and not np.isnan(target_res['mag_inst']) and not target_locked and data is not None:
+                c = wcs.pixel_to_world(target_res['x'], target_res['y'])
+                target_ra, target_dec = float(c.ra.deg), float(c.dec.deg)
+                target_locked = True
+                
+            # Measure Ensemble
             ensemble_res = []
             for s in ensemble_stars:
-                res = get_cached_measurement(fpath, s['ra'], s['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain)
+                s_max_shift = centroid_tracking_shift if s.get('locked') else centroid_initial_radius
+                res = get_cached_measurement(fpath, s['ra'], s['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain, max_shift=s_max_shift)
                 if res and not np.isnan(res['mag_inst']):
+                    if not s.get('locked') and data is not None:
+                        c = wcs.pixel_to_world(res['x'], res['y'])
+                        s['ra'], s['dec'] = float(c.ra.deg), float(c.dec.deg)
+                        s['locked'] = True
+                        
                     m_inst_corr = res['mag_inst'] - (k_coeff * airmass)
                     safe_ens_bv = s['bv_std'] if s.get('bv_std') is not None and not np.isnan(s.get('bv_std', 0.0)) else 0.0
                     zv_i = s['mag_std'] - (m_inst_corr + coeff_term * safe_ens_bv)
@@ -362,8 +380,14 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                 # 5. Check Star Calibration
                 check_mag_std = np.nan
                 if check_star:
-                    check_res = get_cached_measurement(fpath, check_star['ra'], check_star['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain)
+                    c_max_shift = centroid_tracking_shift if check_star.get('locked') else centroid_initial_radius
+                    check_res = get_cached_measurement(fpath, check_star['ra'], check_star['dec'], curr_ap, curr_ann_in, curr_ann_out, data, wcs, gain, max_shift=c_max_shift)
                     if check_res and not np.isnan(check_res['mag_inst']):
+                        if not check_star.get('locked') and data is not None:
+                            c = wcs.pixel_to_world(check_res['x'], check_res['y'])
+                            check_star['ra'], check_star['dec'] = float(c.ra.deg), float(c.dec.deg)
+                            check_star['locked'] = True
+                            
                         c_inst_corr = check_res['mag_inst'] - (k_coeff * airmass)
                         safe_check_bv = check_star['bv_std'] if check_star.get('bv_std') is not None and not np.isnan(check_star.get('bv_std', 0.0)) else 0.0
                         check_mag_std = c_inst_corr + coeff_term * safe_check_bv + zv_avg
