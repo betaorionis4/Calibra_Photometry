@@ -8,7 +8,7 @@ The code can identify stars, perform PSF fitting to extract fluxes (using apertu
 
 Make sure that the code uses the right filter. I use Johnson V and B filters, that are labled 'V_mag' and 'B_mag' by my imaging software - I use N.I.N.A. - in the FITS header.
 
-Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems. Version 4.0 has a reworked GUI which integrates dedicated **"Open Selected FITS in Viewer"** launcher buttons, and extensive interactive quick-help educational popup panels across all processing tabs.
+Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems. Version 4.0 has a reworked GUI which integrates dedicated **"Open Selected FITS in Viewer"** launcher buttons, and extensive interactive quick-help educational popup panels across all processing tabs. Version 4.12 (May 25, 2026) has improved data mining accuracy by implementing centroid shift constraints for faint stars, adds right-click context menus to scatter plots, and properly passes configuration to the FITS viewer from suspects,and introduces dynamic target naming when sending suspects to the Light Curves tab, prioritizing VSX Name, then Catalog ID, and falling back to a generic DM identifier.
 
 Useful background information is provided by the AAVSO Guide to CCD/CMOS Photometry (available for free via aavso.org).
 
@@ -252,7 +252,16 @@ where:
 
 When only a single comparison star is used ($N=1$), a floor value of $\sigma_{\overline{ZP}} = 0.01$ mag is applied to prevent unrealistically small error bars that would hide the inherent uncertainty of using a single calibrator.
 
-### 6.4 Output
+### 6.4 Advanced Plot Customization
+The Light Curve module provides highly interactive visualization tools:
+- **Inline Visibility Toggles**: Checkboxes beneath the preview instantly toggle the visibility of the Target, Check Star, and individual Reference Stars without requiring a re-run of the pipeline.
+- **Advanced Plot Customizer**: Clicking the `[ ⚙️ Customize Plot ]` button opens a dedicated window for creating publication-ready plots.
+  - Set manual Y-Axis bounds to zoom in on specific variations.
+  - Provide custom legend labels (e.g., `Ref 1` instead of `Ref: Gaia DR3 12345`).
+  - Override default colors (e.g., `darkblue`, `green`, `red`) and marker symbols (`o`, `x`, `s`, `*`, etc.) for every single data series.
+  - Automatically exports customized views to high-resolution PNG, PDF, or SVG files.
+
+### 6.5 Output
 
 The module produces three files in `photometry_output/`:
 

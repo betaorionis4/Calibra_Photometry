@@ -100,12 +100,171 @@ class ScrollableFrame(ttk.Frame):
         if self.scrollable_frame.winfo_height() <= self.canvas.winfo_height():
             self.canvas.yview_moveto(0)
 
+class AdvancedPlotWindow(tk.Toplevel):
+    def __init__(self, parent, results, target_name, filter_name, check_name="Check Star"):
+        super().__init__(parent)
+        self.title(f"Advanced Plot Customizer: {target_name}")
+        self.geometry("1100x700")
+        self.minsize(900, 600)
+        
+        self.results = results
+        self.target_name = target_name
+        self.filter_name = filter_name
+        
+        self.visibility_state = {"Target": tk.BooleanVar(value=True), "Check Star": tk.BooleanVar(value=True)}
+        
+        all_refs = set()
+        for r in results:
+            if 'ref_mags' in r:
+                all_refs.update(r['ref_mags'].keys())
+                
+        for ref in sorted(all_refs):
+            self.visibility_state[f"Ref: {ref}"] = tk.BooleanVar(value=False)
+            
+        self.custom_label_vars = {}
+        for key in self.visibility_state.keys():
+            val = target_name if key == "Target" else check_name if key == "Check Star" else key
+            self.custom_label_vars[key] = tk.StringVar(value=val)
+            
+        self.custom_color_vars = {}
+        self.custom_symbol_vars = {}
+        
+        def_colors = ['orange', 'purple', 'cyan', 'magenta', 'brown', 'pink', 'olive', 'gray']
+        r_idx = 0
+        for key in self.visibility_state.keys():
+            if key == "Target":
+                c, s = "darkblue", "o"
+            elif key == "Check Star":
+                c, s = "green", "o"
+            else:
+                c, s = def_colors[r_idx % len(def_colors)], "x"
+                r_idx += 1
+            self.custom_color_vars[key] = tk.StringVar(value=c)
+            self.custom_symbol_vars[key] = tk.StringVar(value=s)
+            
+        self.plot_options = {
+            "title": tk.StringVar(value=f"{target_name} ({filter_name} Filter)"),
+            "xlabel": tk.StringVar(value=""), 
+            "ylabel": tk.StringVar(value="Magnitude"),
+            "y_min": tk.StringVar(value=""),
+            "y_max": tk.StringVar(value=""),
+            "invert_y": tk.BooleanVar(value=True)
+        }
+        
+        self.build_ui()
+        self.redraw_plot()
+        
+    def build_ui(self):
+        left_panel = tk.Frame(self, width=420, bg="#f8f9fa", padx=10, pady=10)
+        left_panel.pack(side="left", fill="y")
+        left_panel.pack_propagate(False)
+        
+        right_panel = tk.Frame(self, bg="white")
+        right_panel.pack(side="right", fill="both", expand=True)
+        
+        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right_panel)
+        self.toolbar.update()
+        
+        lf_vis = tk.LabelFrame(left_panel, text="Visibility, Labels & Styles", bg="#f8f9fa", padx=5, pady=5)
+        lf_vis.pack(fill="both", expand=True, pady=(0, 10))
+        
+        vis_sf = ScrollableFrame(lf_vis)
+        vis_sf.pack(fill="both", expand=True)
+        
+        keys = ["Target", "Check Star"] + sorted([k for k in self.visibility_state.keys() if k.startswith("Ref:")])
+        
+        colors = ['darkblue', 'green', 'red', 'orange', 'purple', 'cyan', 'magenta', 'brown', 'pink', 'olive', 'gray', 'black']
+        symbols = ['o', 'x', 's', '^', 'v', '<', '>', 'D', '*', 'p', 'h', '+']
+        
+        for r_idx, k in enumerate(keys):
+            f = tk.Frame(vis_sf.scrollable_frame, bg="#f8f9fa")
+            f.pack(fill="x", pady=2)
+            ttk.Checkbutton(f, text="", variable=self.visibility_state[k], command=self.redraw_plot).pack(side="left")
+            e = ttk.Entry(f, textvariable=self.custom_label_vars[k], width=15)
+            e.pack(side="left", fill="x", expand=True, padx=2)
+            e.bind("<Return>", lambda e: self.redraw_plot())
+            
+            cb_color = ttk.Combobox(f, textvariable=self.custom_color_vars[k], values=colors, width=8, state="readonly")
+            cb_color.pack(side="left", padx=1)
+            cb_color.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
+            
+            cb_sym = ttk.Combobox(f, textvariable=self.custom_symbol_vars[k], values=symbols, width=3, state="readonly")
+            cb_sym.pack(side="left", padx=1)
+            cb_sym.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
+            
+        lf_axes = tk.LabelFrame(left_panel, text="Axis Settings", bg="#f8f9fa", padx=5, pady=5)
+        lf_axes.pack(fill="x", pady=(0, 10))
+        
+        tk.Label(lf_axes, text="Y-Axis Min:", bg="#f8f9fa").grid(row=0, column=0, sticky="w", pady=2)
+        e_ymin = ttk.Entry(lf_axes, textvariable=self.plot_options["y_min"], width=10)
+        e_ymin.grid(row=0, column=1, sticky="w", pady=2)
+        e_ymin.bind("<Return>", lambda e: self.redraw_plot())
+        
+        tk.Label(lf_axes, text="Y-Axis Max:", bg="#f8f9fa").grid(row=1, column=0, sticky="w", pady=2)
+        e_ymax = ttk.Entry(lf_axes, textvariable=self.plot_options["y_max"], width=10)
+        e_ymax.grid(row=1, column=1, sticky="w", pady=2)
+        e_ymax.bind("<Return>", lambda e: self.redraw_plot())
+        
+        ttk.Checkbutton(lf_axes, text="Invert Y-Axis (Mag)", variable=self.plot_options["invert_y"], command=self.redraw_plot).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+        
+        lf_labels = tk.LabelFrame(left_panel, text="Labels & Title", bg="#f8f9fa", padx=5, pady=5)
+        lf_labels.pack(fill="x", pady=(0, 10))
+        
+        tk.Label(lf_labels, text="Title:", bg="#f8f9fa").pack(anchor="w")
+        e_title = ttk.Entry(lf_labels, textvariable=self.plot_options["title"], width=25)
+        e_title.pack(anchor="w", pady=(0, 5))
+        e_title.bind("<Return>", lambda e: self.redraw_plot())
+        
+        tk.Label(lf_labels, text="X Label (blank=auto):", bg="#f8f9fa").pack(anchor="w")
+        e_xlabel = ttk.Entry(lf_labels, textvariable=self.plot_options["xlabel"], width=25)
+        e_xlabel.pack(anchor="w", pady=(0, 5))
+        e_xlabel.bind("<Return>", lambda e: self.redraw_plot())
+        
+        tk.Label(lf_labels, text="Y Label:", bg="#f8f9fa").pack(anchor="w")
+        e_ylabel = ttk.Entry(lf_labels, textvariable=self.plot_options["ylabel"], width=25)
+        e_ylabel.pack(anchor="w", pady=(0, 10))
+        e_ylabel.bind("<Return>", lambda e: self.redraw_plot())
+        
+        btn_apply = tk.Button(left_panel, text="Apply & Redraw", command=self.redraw_plot, bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), pady=5)
+        btn_apply.pack(fill="x", pady=(10, 5))
+        
+        btn_export = tk.Button(left_panel, text="Save High-Res Image", command=self.export_plot, bg="#2e7d32", fg="white", font=("Arial", 10), pady=5)
+        btn_export.pack(fill="x")
+        
+    def redraw_plot(self):
+        from photometry.time_series import plot_light_curve
+        v_state = {k: v.get() for k, v in self.visibility_state.items()}
+        opts = {k: v.get() for k, v in self.plot_options.items()}
+        
+        opts["custom_labels"] = {k: v.get() for k, v in self.custom_label_vars.items()}
+        opts["custom_colors"] = {k: v.get() for k, v in self.custom_color_vars.items()}
+        opts["custom_symbols"] = {k: v.get() for k, v in self.custom_symbol_vars.items()}
+        
+        if not str(opts["xlabel"]).strip():
+            del opts["xlabel"]
+            
+        plot_light_curve(self.results, self.target_name, "", ax=self.ax, visibility_state=v_state, plot_options=opts)
+        self.canvas.draw()
+        
+    def export_plot(self):
+        from tkinter import filedialog
+        filepath = filedialog.asksaveasfilename(defaultextension=".png", 
+                                                initialfile=f"custom_plot_{self.target_name.replace(' ','_')}.png",
+                                                filetypes=[("PNG Image", "*.png"), ("PDF Document", "*.pdf"), ("SVG Graphics", "*.svg")])
+        if filepath:
+            self.fig.savefig(filepath, dpi=300, bbox_inches='tight')
+            messagebox.showinfo("Saved", f"Plot saved to:\n{filepath}")
+
 def run_config_gui(pipeline_callback=None):
     """
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "4.1"
+    APP_VERSION = "4.12"
     root = tk.Tk()
     root.title(f"Calibra v{APP_VERSION} - Astro Analysis & Photometry Suite")
     root.geometry("1100x750")
@@ -2579,16 +2738,24 @@ def run_config_gui(pipeline_callback=None):
         
         def resolve_thread():
             from astropy.coordinates import SkyCoord
-            from astropy.coordinates.name_resolve import NameResolveError
+            from photometry.calibration import resolve_auid
+            c = None
             try:
                 c = SkyCoord.from_name(star_name)
+            except Exception:
+                pass
+                
+            if not c:
+                res = resolve_auid(star_name, verbose=False)
+                if res:
+                    c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+            
+            if c:
                 ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
                 dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
                 root.after(0, lambda: name_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
-            except NameResolveError:
-                root.after(0, lambda: name_resolve_status_var.set("Not found in Simbad."))
-            except Exception:
-                root.after(0, lambda: name_resolve_status_var.set("Error connecting."))
+            else:
+                root.after(0, lambda: name_resolve_status_var.set("Not found in Simbad or VSX."))
         
         import threading
         threading.Thread(target=resolve_thread, daemon=True).start()
@@ -2672,16 +2839,24 @@ def run_config_gui(pipeline_callback=None):
         
         def resolve_thread():
             from astropy.coordinates import SkyCoord
-            from astropy.coordinates.name_resolve import NameResolveError
+            from photometry.calibration import resolve_auid
+            c = None
             try:
                 c = SkyCoord.from_name(star_name)
+            except Exception:
+                pass
+                
+            if not c:
+                res = resolve_auid(star_name, verbose=False)
+                if res:
+                    c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+            
+            if c:
                 ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
                 dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
                 root.after(0, lambda: target_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
-            except NameResolveError:
-                root.after(0, lambda: target_resolve_status_var.set("Not found in Simbad."))
-            except Exception:
-                root.after(0, lambda: target_resolve_status_var.set("Error connecting."))
+            else:
+                root.after(0, lambda: target_resolve_status_var.set("Not found in Simbad or VSX."))
         
         import threading
         threading.Thread(target=resolve_thread, daemon=True).start()
@@ -3031,6 +3206,55 @@ def run_config_gui(pipeline_callback=None):
     ts_canvas.get_tk_widget().pack(fill="both", expand=True)
     ts_toolbar = NavigationToolbar2Tk(ts_canvas, lf_ts_plot)
     ts_toolbar.update()
+    
+    # Inline Toggles Frame
+    ts_inline_toggles_frame = tk.Frame(lf_ts_plot)
+    ts_inline_toggles_frame.pack(fill="x", padx=5, pady=2)
+    
+    vars_dict["ts_visibility_vars"] = {}
+    vars_dict["ts_last_results"] = []
+    
+    def on_inline_toggle():
+        from photometry.time_series import plot_light_curve
+        v_state = {k: v.get() for k, v in vars_dict["ts_visibility_vars"].items()}
+        plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter)"
+        plot_light_curve(vars_dict["ts_last_results"], plot_title, "", ax=ts_ax, visibility_state=v_state)
+        ts_canvas.draw()
+        
+    def open_advanced_plot_window():
+        check_name = "Check Star"
+        c_idx = ts_check_star_idx_var.get()
+        if c_idx >= 0:
+            if hasattr(vars_dict.get(f"ts_ref_{c_idx}_name"), "__getitem__"):
+                check_name = vars_dict[f"ts_ref_{c_idx}_name"][0].get()
+        AdvancedPlotWindow(root, vars_dict["ts_last_results"], ts_target_name_var.get(), ts_filter_var.get(), check_name)
+        
+    def rebuild_inline_toggles(results):
+        vars_dict["ts_last_results"] = results
+        for widget in ts_inline_toggles_frame.winfo_children():
+            widget.destroy()
+            
+        vars_dict["ts_visibility_vars"].clear()
+        v_vars = vars_dict["ts_visibility_vars"]
+        
+        v_vars["Target"] = tk.BooleanVar(value=True)
+        v_vars["Check Star"] = tk.BooleanVar(value=True)
+        
+        ttk.Checkbutton(ts_inline_toggles_frame, text="Target", variable=v_vars["Target"], command=on_inline_toggle).pack(side="left", padx=5)
+        ttk.Checkbutton(ts_inline_toggles_frame, text="Check Star", variable=v_vars["Check Star"], command=on_inline_toggle).pack(side="left", padx=5)
+        
+        all_refs = set()
+        for r in results:
+            if 'ref_mags' in r:
+                all_refs.update(r['ref_mags'].keys())
+                
+        for ref in sorted(all_refs):
+            key = f"Ref: {ref}"
+            v_vars[key] = tk.BooleanVar(value=False)
+            ttk.Checkbutton(ts_inline_toggles_frame, text=key, variable=v_vars[key], command=on_inline_toggle).pack(side="left", padx=5)
+            
+        btn = tk.Button(ts_inline_toggles_frame, text="⚙️ Customize Plot", command=open_advanced_plot_window, bg="#1a3a5f", fg="white", font=("Arial", 9, "bold"))
+        btn.pack(side="right", padx=10, pady=2)
 
     # Target Star
     lf_ts_target = tk.LabelFrame(ts_container, text="Target Star (Variable)")
@@ -3064,15 +3288,18 @@ def run_config_gui(pipeline_callback=None):
             import re
             
             c = None
-            if re.match(r'^[0-9A-Za-z]{3}-[0-9A-Za-z]{3}-[0-9A-Za-z]{3}$', name):
-                res = resolve_auid(name)
+            try:
+                c = SkyCoord.from_name(name)
+            except Exception:
+                pass
+                
+            if not c:
+                res = resolve_auid(name, verbose=False)
                 if res:
                     c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
                 else:
-                    ts_status_var.set(f"AUID {name} not found in VSX.")
+                    ts_status_var.set(f"Could not resolve '{name}' via Simbad or VSX.")
                     return
-            else:
-                c = SkyCoord.from_name(name)
             
             if c:
                 ra_hms = c.ra.to_string(unit='hour', sep=':', precision=1)
@@ -3358,8 +3585,18 @@ def run_config_gui(pipeline_callback=None):
     # Analysis Summary Panel (Persistent)
     lf_ts_summary = tk.LabelFrame(ts_container, text="Analysis Summary")
     lf_ts_summary.pack(fill="x", padx=10, pady=5)
-    ts_summary_var = tk.StringVar(value="No analysis data yet. Run 'Generate Light Curve' to see results.")
-    tk.Label(lf_ts_summary, textvariable=ts_summary_var, font=("Arial", 10), justify=tk.LEFT, anchor="w", fg="#2c3e50").pack(fill="x", padx=15, pady=10)
+    
+    ts_summary_scroll = ttk.Scrollbar(lf_ts_summary)
+    ts_summary_scroll.pack(side="right", fill="y")
+    
+    ts_summary_text = tk.Text(lf_ts_summary, height=8, font=("Courier", 9), bg="#f0f2f5", fg="#2c3e50", wrap="word", relief="flat", yscrollcommand=ts_summary_scroll.set)
+    ts_summary_text.pack(side="left", fill="both", expand=True, padx=(15, 0), pady=10)
+    ts_summary_scroll.config(command=ts_summary_text.yview)
+    
+    ts_summary_text.insert("1.0", "No analysis data yet. Run 'Generate Light Curve' to see results.")
+    ts_summary_text.config(state="disabled")
+    
+    add_copy_context_menu(ts_summary_text)
 
     cancel_event = threading.Event()
     
@@ -3538,21 +3775,34 @@ def run_config_gui(pipeline_callback=None):
                                   comments=report_comments,
                                   notes=report_notes)
                 
-                # Calculate Check Star Stats if available
+                # Calculate Stats for Check Star & Reference Stars
                 check_stats = ""
                 check_mags = [r['check_mag'] for r in results if isinstance(r.get('check_mag'), (int, float)) and not np.isnan(r['check_mag'])]
                 if check_mags and check_star_data:
                     avg_check = np.mean(check_mags)
                     std_check = np.std(check_mags)
                     bias = avg_check - check_star_data['mag_std']
-                    check_stats = f"Check Star Stats ({check_star_data['name']}):\n"
-                    check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_check:.3f} mag"
+                    check_stats += f"Check Star Stats ({check_star_data['name']}):\n"
+                    check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_check:.3f} mag\n\n"
+                    
+                for ref_star in resolved_ensemble:
+                    ref_name = ref_star['name']
+                    cat_mag = ref_star['mag_std']
+                    mags = [r['ref_mags'][ref_name] for r in results if 'ref_mags' in r and ref_name in r['ref_mags'] and not np.isnan(r['ref_mags'][ref_name])]
+                    if mags:
+                        avg_mag = np.mean(mags)
+                        std_mag = np.std(mags)
+                        bias = avg_mag - cat_mag
+                        check_stats += f"Reference Star Stats ({ref_name}):\n"
+                        check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_mag:.3f} mag\n\n"
+                
+                check_stats = check_stats.strip()
                 
                 # Update embedded plot
                 plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter)"
                 def update_viz():
-                    plot_light_curve(results, plot_title, out_plot, ax=ts_ax)
-                    ts_canvas.draw()
+                    rebuild_inline_toggles(results)
+                    on_inline_toggle()
                 root.after(0, update_viz)
                 
                 # Update table
@@ -3581,10 +3831,13 @@ def run_config_gui(pipeline_callback=None):
                 summary_text += f"AAVSO Report: {os.path.abspath(out_aavso)}\n"
                 if check_stats:
                     summary_text += f"--------------------------------------------------------------------------------\n"
-                    summary_text += check_stats.strip()
+                    summary_text += check_stats
                 
                 def update_summary():
-                    ts_summary_var.set(summary_text)
+                    ts_summary_text.config(state="normal")
+                    ts_summary_text.delete("1.0", tk.END)
+                    ts_summary_text.insert("1.0", summary_text)
+                    ts_summary_text.config(state="disabled")
                 root.after(0, update_summary)
                 
                 ts_status_var.set(f"Complete! Results saved.")
@@ -4037,7 +4290,18 @@ def run_config_gui(pipeline_callback=None):
         vars_dict["ts_target_ra"][0].set(ra_hms)
         vars_dict["ts_target_dec"][0].set(dec_dms)
         vars_dict["ts_target_mode"][0].set("manual")
-        ts_target_name_var.set(f"Suspect_{vals[0]}")
+        
+        vsx_name = str(vals[10]).strip() if len(vals) > 10 else ""
+        cat_id = str(vals[12]).strip() if len(vals) > 12 else ""
+        
+        if vsx_name:
+            target_name = vsx_name
+        elif cat_id:
+            target_name = cat_id
+        else:
+            target_name = f"DM_{vals[0]}"
+            
+        ts_target_name_var.set(target_name)
         messagebox.showinfo("Sent", f"Target {vals[0]} coordinates sent to Light Curves tab!")
         switch_tab("ts")
 
@@ -4410,7 +4674,18 @@ def run_config_gui(pipeline_callback=None):
             vars_dict["ts_target_ra"][0].set(vals[1])
             vars_dict["ts_target_dec"][0].set(vals[2])
             vars_dict["ts_target_mode"][0].set("manual")
-            ts_target_name_var.set(f"Star_{vals[0]}")
+            
+            vsx_name = str(vals[10]).strip() if len(vals) > 10 else ""
+            cat_id = str(vals[12]).strip() if len(vals) > 12 else ""
+            
+            if vsx_name:
+                target_name = vsx_name
+            elif cat_id:
+                target_name = cat_id
+            else:
+                target_name = f"DM_{vals[0]}"
+                
+            ts_target_name_var.set(target_name)
             switch_tab("ts")
             
         menu.add_command(label="Send to Light Curves", command=local_send_to_lc)

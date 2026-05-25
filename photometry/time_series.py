@@ -322,6 +322,7 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                     zv_i = s['mag_std'] - (m_inst_corr + coeff_term * safe_ens_bv)
                     ensemble_res.append({
                         'name': s['name'],
+                        'mag_std': s['mag_std'],
                         'zv': zv_i,
                         'snr': res['snr'],
                         'mag_err': res['mag_err']
@@ -367,6 +368,11 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                         safe_check_bv = check_star['bv_std'] if check_star.get('bv_std') is not None and not np.isnan(check_star.get('bv_std', 0.0)) else 0.0
                         check_mag_std = c_inst_corr + coeff_term * safe_check_bv + zv_avg
 
+                # 6. Reference Stars Calibration (for stats)
+                ref_mags = {}
+                for r in ensemble_res:
+                    ref_mags[r['name']] = r['mag_std'] - r['zv'] + zv_avg
+
                 results.append({
                     'file': os.path.basename(fpath),
                     'jd': jd,
@@ -379,7 +385,8 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
                     'fwhm': median_fwhm if median_fwhm else np.nan,
                     'zp_avg': zv_avg,
                     'zp_err': zv_err,
-                    'n_ensemble': len(ensemble_res)
+                    'n_ensemble': len(ensemble_res),
+                    'ref_mags': ref_mags
                 })
             else:
                 if not target_res: print(f"  - {os.path.basename(fpath)}: Target star could not be centroided.")
@@ -459,9 +466,11 @@ def save_aavso_report(results, output_path, target_name, filter_name, obs_code,
         print(f"Error saving AAVSO report: {e}")
         return False
 
-def plot_light_curve(results, target_name, output_path, ax=None):
+def plot_light_curve(results, target_name, output_path, ax=None, visibility_state=None, plot_options=None):
     """ Plots the light curve. If ax is provided, plots to that axes. """
     if not results: return
+    if visibility_state is None: visibility_state = {}
+    if plot_options is None: plot_options = {}
     
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -472,8 +481,6 @@ def plot_light_curve(results, target_name, output_path, ax=None):
         ax = fig.add_subplot(111)
         is_standalone = False
     
-    # print(f"DEBUG: Plotting light curve with {len(results)} points for '{target_name}'")
-    
     times = np.array([r['hjd'] for r in results])
     mags = np.array([r['mag'] for r in results])
     errs = np.array([r['mag_err'] for r in results])
@@ -483,33 +490,82 @@ def plot_light_curve(results, target_name, output_path, ax=None):
     t0 = int(min(times))
     times_rel = times - t0
     
-    # Plot OK points
-    ok_mask = (flags == 'OK')
-    if np.any(ok_mask):
-        ax.errorbar(times_rel[ok_mask], mags[ok_mask], yerr=errs[ok_mask], 
-                     fmt='o', color='darkblue', ecolor='gray', capsize=2, markersize=4, label='Target')
+    show_target = visibility_state.get("Target", True)
+    show_check = visibility_state.get("Check Star", True)
+    custom_labels = plot_options.get("custom_labels", {})
+    custom_colors = plot_options.get("custom_colors", {})
+    custom_symbols = plot_options.get("custom_symbols", {})
     
-    # Plot SUSPECT points
-    suspect_mask = (flags == 'SUSPECT')
-    if np.any(suspect_mask):
-        ax.errorbar(times_rel[suspect_mask], mags[suspect_mask], yerr=errs[suspect_mask], 
-                     fmt='o', color='none', markeredgecolor='red', ecolor='red', capsize=2, markersize=6, label='Target (SUSPECT)')
+    if show_target:
+        # Plot OK points
+        ok_mask = (flags == 'OK')
+        t_label = custom_labels.get("Target", "Target")
+        t_color = custom_colors.get("Target", "darkblue")
+        t_sym = custom_symbols.get("Target", "o")
+        if np.any(ok_mask):
+            ax.errorbar(times_rel[ok_mask], mags[ok_mask], yerr=errs[ok_mask], 
+                         fmt=t_sym, color=t_color, ecolor='gray', capsize=2, markersize=4, label=t_label)
+        
+        # Plot SUSPECT points
+        suspect_mask = (flags == 'SUSPECT')
+        if np.any(suspect_mask):
+            ax.errorbar(times_rel[suspect_mask], mags[suspect_mask], yerr=errs[suspect_mask], 
+                         fmt=t_sym, color='none', markeredgecolor='red', ecolor='red', capsize=2, markersize=6, label=f"{t_label} (SUSPECT)")
 
-    # Plot Check Star
-    check_mags = np.array([r.get('check_mag', np.nan) for r in results])
-    valid_check = ~np.isnan(check_mags)
-    if np.any(valid_check):
-        ax.errorbar(times_rel[valid_check], check_mags[valid_check], 
-                     fmt='o', color='green', alpha=0.6, markersize=4, label='Check Star')
-                     
-    if not ax.yaxis_inverted():
+    if show_check:
+        # Plot Check Star
+        check_mags = np.array([r.get('check_mag', np.nan) for r in results])
+        valid_check = ~np.isnan(check_mags)
+        if np.any(valid_check):
+            c_label = custom_labels.get("Check Star", "Check Star")
+            c_color = custom_colors.get("Check Star", "green")
+            c_sym = custom_symbols.get("Check Star", "o")
+            ax.errorbar(times_rel[valid_check], check_mags[valid_check], 
+                         fmt=c_sym, color=c_color, alpha=0.6, markersize=4, label=c_label)
+                         
+    # Plot Reference Stars
+    all_refs = set()
+    for r in results:
+        if 'ref_mags' in r:
+            all_refs.update(r['ref_mags'].keys())
+
+    def_colors = ['orange', 'purple', 'cyan', 'magenta', 'brown', 'pink', 'olive', 'gray']
+    for idx, ref_name in enumerate(sorted(all_refs)):
+        key = f"Ref: {ref_name}"
+        if visibility_state.get(key, False):
+            ref_mags = np.array([r.get('ref_mags', {}).get(ref_name, np.nan) for r in results])
+            valid_ref = ~np.isnan(ref_mags)
+            if np.any(valid_ref):
+                r_label = custom_labels.get(key, key)
+                r_color = custom_colors.get(key, def_colors[idx % len(def_colors)])
+                r_sym = custom_symbols.get(key, "x")
+                ax.errorbar(times_rel[valid_ref], ref_mags[valid_ref], 
+                             fmt=r_sym, color=r_color, alpha=0.5, markersize=4, label=r_label)
+
+    invert_y = plot_options.get('invert_y', True)
+    if invert_y and not ax.yaxis_inverted():
         ax.invert_yaxis()
+    elif not invert_y and ax.yaxis_inverted():
+        ax.invert_yaxis()
+
+    y_min_val = plot_options.get('y_min', "")
+    y_max_val = plot_options.get('y_max', "")
+    if str(y_min_val).strip() and str(y_max_val).strip():
+        try:
+            y_min, y_max = float(y_min_val), float(y_max_val)
+            if invert_y:
+                ax.set_ylim(max(y_min, y_max), min(y_min, y_max))
+            else:
+                ax.set_ylim(min(y_min, y_max), max(y_min, y_max))
+        except ValueError:
+            pass
     
-    ax.set_title(f"Light Curve: {target_name}")
-    ax.set_xlabel(f"HJD - {t0}")
-    ax.set_ylabel("Magnitude")
+    ax.set_title(plot_options.get('title', f"Light Curve: {target_name}"))
+    ax.set_xlabel(plot_options.get('xlabel', f"HJD - {t0}"))
+    ax.set_ylabel(plot_options.get('ylabel', "Magnitude"))
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(loc='upper right', bbox_to_anchor=(1.05, 1.0), framealpha=1.0, edgecolor='black')
+    fig.tight_layout()
     
     if is_standalone:
         plt.savefig(output_path)
