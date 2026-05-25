@@ -185,6 +185,19 @@ class FITSViewer:
             self.export_btn = ttk.Button(self.ref_frame, text="Export Stars to LC Tab", command=self._on_export_click)
             self.export_btn.pack(side=tk.BOTTOM, fill=tk.X, pady=2)
             
+        self.show_user_markers_var = tk.BooleanVar(value=True)
+        self.user_markers_toggle = ttk.Checkbutton(self.ref_frame, text="Show Ref/Check/Target Stars", 
+                                                   variable=self.show_user_markers_var, command=self._toggle_user_markers)
+        self.user_markers_toggle.pack(side=tk.BOTTOM, anchor=tk.W, pady=2)
+        
+        self.show_aavso_var = tk.BooleanVar(value=True)
+        self.aavso_patches = []
+        self.aavso_texts = []
+        if self.aavso_stars:
+            self.aavso_toggle = ttk.Checkbutton(self.ref_frame, text="Show AAVSO Sequence Stars", 
+                                                variable=self.show_aavso_var, command=self._draw_aavso_markers)
+            self.aavso_toggle.pack(side=tk.BOTTOM, anchor=tk.W, pady=2)
+            
         # Aperture Controls: Linked to tkinter variables
         self.ap_var = tk.DoubleVar(value=self.config.get('aperture_radius', 8.0))
         self.ann_in_var = tk.DoubleVar(value=self.config.get('annulus_inner', 15.0))
@@ -292,6 +305,21 @@ class FITSViewer:
         if not self.has_wcs or not self.aavso_stars:
             return
             
+        # Clean up existing AAVSO sequence markers
+        for p in self.aavso_patches:
+            try: p.remove()
+            except: pass
+        for t in self.aavso_texts:
+            try: t.remove()
+            except: pass
+        self.aavso_patches.clear()
+        self.aavso_texts.clear()
+        
+        # If toggled off, just redraw and return
+        if not self.show_aavso_var.get():
+            self.canvas.draw_idle()
+            return
+            
         # Determine filter from header to show relevant magnitude
         header_filt = str(self.header.get('FILTER', 'V')).upper()
         mag_key = 'V_mag' if 'V' in header_filt else 'B_mag'
@@ -308,16 +336,38 @@ class FITSViewer:
                     # Draw a distinct yellow circle for sequence stars
                     circ = patches.Circle((px, py), radius=15, edgecolor='yellow', facecolor='none', linewidth=1.5, alpha=0.7)
                     self.ax.add_patch(circ)
+                    self.aavso_patches.append(circ)
                     
                     # Add text label with AUID and Magnitude
                     mag = star.get(mag_key, np.nan)
                     mag_label = f"{mag:.2f}" if not np.isnan(mag) else "na"
                     label = f"{star['auid']}\n({mag_label})"
-                    self.ax.text(px + 18, py, label, color='yellow', fontsize=8, fontweight='bold', alpha=0.9,
+                    t = self.ax.text(px + 18, py, label, color='yellow', fontsize=8, fontweight='bold', alpha=0.9,
                                  bbox=dict(facecolor='black', alpha=0.3, edgecolor='none', pad=1))
+                    self.aavso_texts.append(t)
             except Exception as e:
                 print(f"Error marking AAVSO star {star.get('auid')}: {e}")
         
+        self.canvas.draw_idle()
+        
+        self.canvas.draw_idle()
+
+    def _toggle_user_markers(self):
+        """Toggle the visibility of user-selected star markers (Target, Ref, Check)."""
+        visible = self.show_user_markers_var.get()
+        
+        if self.variable_star:
+            for m in self.variable_star.get('markers', []):
+                m.set_visible(visible)
+        
+        if self.check_star:
+            for m in self.check_star.get('markers', []):
+                m.set_visible(visible)
+                
+        for r in self.on_the_spot_refs:
+            for m in r.get('markers', []):
+                m.set_visible(visible)
+                
         self.canvas.draw_idle()
 
     def on_close(self):

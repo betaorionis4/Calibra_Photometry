@@ -409,22 +409,37 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
         status = "Cancelled." if cancel_event and cancel_event.is_set() else "No data successfully processed."
         return None, status
         
-    # Outlier Flagging (3-sigma)
-    mags = [r['mag'] for r in results]
+    # Sort by time FIRST so we can do temporal outlier rejection
+    results.sort(key=lambda x: x['hjd'])
+    
+    # Outlier Flagging (Rolling Median of 5 to preserve true stellar variations)
+    mags = np.array([r['mag'] for r in results])
     if len(mags) > 5:
-        median_mag = np.median(mags)
-        std_mag = np.std(mags, ddof=1)
-        for r in results:
-            if abs(r['mag'] - median_mag) > 3 * std_mag:
+        # Pad with edge values for the rolling window
+        padded = np.pad(mags, (2, 2), mode='edge')
+        rolling_median = np.array([np.median(padded[i:i+5]) for i in range(len(mags))])
+        diffs = mags - rolling_median
+        
+        # Calculate robust standard deviation using Median Absolute Deviation (MAD)
+        mad = np.median(np.abs(diffs - np.median(diffs)))
+        robust_std = 1.4826 * mad
+        
+        # Fallback to standard deviation if MAD is too small (e.g., perfectly flat light curve)
+        if robust_std < 0.005:
+            robust_std = np.std(diffs, ddof=1)
+            
+        # Minimum threshold to avoid over-flagging very clean data
+        # We require at least a 3-sigma deviation AND a minimum of 0.05 mag absolute jump
+        threshold = max(3 * robust_std, 0.05)
+        
+        for i, r in enumerate(results):
+            if abs(diffs[i]) > threshold:
                 r['flag'] = 'SUSPECT'
             else:
                 r['flag'] = 'OK'
     else:
         for r in results:
             r['flag'] = 'OK'
-
-    # Sort by time
-    results.sort(key=lambda x: x['hjd'])
     
     return results, "Success"
 

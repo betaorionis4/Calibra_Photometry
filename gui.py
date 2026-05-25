@@ -1402,6 +1402,15 @@ def run_config_gui(pipeline_callback=None):
         # Add loaded file paths
         data['loaded_file_paths'] = [f['path'] for f in loaded_files]
         
+        # Add AAVSO sequence cache
+        try:
+            if hasattr(on_get_aavso_refs, 'cache'):
+                data['aavso_cache'] = on_get_aavso_refs.cache
+                data['aavso_last_target'] = getattr(on_get_aavso_refs, 'last_target', "")
+                data['aavso_last_cat'] = getattr(on_get_aavso_refs, 'last_cat', "")
+        except NameError:
+            pass # on_get_aavso_refs not bound yet
+        
         try:
             with open("calibra_session.json", "w") as f:
                 json.dump(data, f, indent=4)
@@ -1434,6 +1443,16 @@ def run_config_gui(pipeline_callback=None):
                             var.set(value)
                     except:
                         # Silently skip errors (e.g. type mismatch if session file is old)
+                        pass
+                else:
+                    try:
+                        if key == 'aavso_cache':
+                            on_get_aavso_refs.cache = value
+                        elif key == 'aavso_last_target':
+                            on_get_aavso_refs.last_target = value
+                        elif key == 'aavso_last_cat':
+                            on_get_aavso_refs.last_cat = value
+                    except NameError:
                         pass
             print("Session loaded from calibra_session.json")
         except Exception as e:
@@ -2962,7 +2981,14 @@ def run_config_gui(pipeline_callback=None):
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         if mode == "name":
-            return SkyCoord.from_name(name)
+            try:
+                return SkyCoord.from_name(name)
+            except Exception:
+                from photometry.calibration import resolve_auid
+                res = resolve_auid(name, verbose=False)
+                if res:
+                    return SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+                raise Exception(f"Could not resolve '{name}' via Simbad or VSX.")
         else:
             return SkyCoord(f"{ra_s} {dec_s}", unit=(u.hourangle, u.deg))
 
@@ -3693,7 +3719,15 @@ def run_config_gui(pipeline_callback=None):
                         s['ra'] = s['ra_man']
                         s['dec'] = s['dec_man']
                     else:
-                        c = SkyCoord.from_name(s['name'])
+                        try:
+                            c = SkyCoord.from_name(s['name'])
+                        except Exception:
+                            from photometry.calibration import resolve_auid
+                            res = resolve_auid(s['name'], verbose=False)
+                            if res:
+                                c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+                            else:
+                                raise Exception(f"Could not resolve '{s['name']}' via Simbad or VSX.")
                         s['ra'] = c.ra.deg
                         s['dec'] = c.dec.deg
                     
@@ -3956,6 +3990,36 @@ def run_config_gui(pipeline_callback=None):
     
     ts_tree.pack(side=tk.LEFT, fill="both", expand=True)
     ts_vsb.pack(side=tk.RIGHT, fill="y")
+    
+    def on_ts_tree_right_click(event):
+        region = ts_tree.identify("region", event.x, event.y)
+        if region != "cell": return
+        row_id = ts_tree.identify_row(event.y)
+        if not row_id: return
+        if row_id not in ts_tree.selection():
+            ts_tree.selection_set(row_id)
+        
+        menu = tk.Menu(root, tearoff=0)
+        menu.add_command(label="Toggle SUSPECT / OK Flag", command=toggle_ts_flag)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def toggle_ts_flag():
+        selected = ts_tree.selection()
+        if not selected: return
+        results = vars_dict.get("ts_last_results", [])
+        for item in selected:
+            idx = ts_tree.index(item)
+            if idx < len(results):
+                r = results[idx]
+                new_flag = 'OK' if r.get('flag', 'OK') == 'SUSPECT' else 'SUSPECT'
+                r['flag'] = new_flag
+                vals = list(ts_tree.item(item, 'values'))
+                vals[7] = new_flag
+                ts_tree.item(item, values=vals)
+        on_inline_toggle()
+
+    ts_tree.bind("<Button-3>", on_ts_tree_right_click)
+
 
     # =========================================================================
     # --- TAB 5: DATA MINING ---
