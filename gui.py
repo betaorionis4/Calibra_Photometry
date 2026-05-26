@@ -3577,6 +3577,11 @@ def run_config_gui(pipeline_callback=None):
     vars_dict["ts_lon"] = (ts_lon_var, float)
     ttk.Entry(lf_ts_coeff, textvariable=ts_lon_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=2)
 
+    tk.Label(lf_ts_coeff, text="AAVSO Chart ID:").grid(row=3, column=2, sticky=tk.W, padx=10, pady=2)
+    ts_chart_var = tk.StringVar(value="na")
+    vars_dict["ts_chart"] = (ts_chart_var, str)
+    ttk.Entry(lf_ts_coeff, textvariable=ts_chart_var, width=10).grid(row=3, column=3, sticky=tk.W, padx=2)
+
     def load_ts_coefficients():
         import json
         json_path = os.path.join("photometry_output", "color_coefficients.json")
@@ -3809,7 +3814,8 @@ def run_config_gui(pipeline_callback=None):
                                   check_name=check_name, check_mag=check_mag,
                                   trans=is_trans, software_version=APP_VERSION,
                                   comments=report_comments,
-                                  notes=report_notes)
+                                  notes=report_notes,
+                                  chart=ts_chart_var.get())
                 
                 # Calculate Stats for Check Star & Reference Stars
                 check_stats = ""

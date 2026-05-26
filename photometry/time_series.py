@@ -469,10 +469,12 @@ def run_time_series_photometry(fits_files, target_ra, target_dec,
 
 def save_aavso_report(results, output_path, target_name, filter_name, obs_code, 
                       comp_name="ENSEMBLE", comp_mag="na", check_name="na", check_mag="na",
-                      trans="NO", software_version="4.0", comments="na", notes="na"):
+                      trans="NO", software_version="4.0", comments="na", notes="na", chart="na"):
     """ Generates a report in AAVSO Extended Format. """
     try:
         def fmt_mag(val, precision=3):
+            if val is None or val == "" or str(val).lower() in ("none", "nan"):
+                return "na"
             if isinstance(val, (int, float)) and not np.isnan(val):
                 return f"{val:.{precision}f}"
             return str(val)
@@ -486,8 +488,10 @@ def save_aavso_report(results, output_path, target_name, filter_name, obs_code,
             f.write(f"#OBSTYPE=CCD\n")
             f.write(f"#TRANS={trans}\n")
             f.write(f"#COMMENTS={comments}\n")
-            f.write("NAME,DATE,MAG,MERR,FILT,TRANS,MTYPE,CNAME,CMAG,KNAME,KMAG,AMASS,GROUP,CHART,NOTES\n")
+            f.write("#NAME,DATE,MAG,MERR,FILT,TRANS,MTYPE,CNAME,CMAG,KNAME,KMAG,AMASS,GROUP,CHART,NOTES\n")
             
+            chart_val = chart if chart and str(chart).strip() else "na"
+
             for r in results:
                 # Format: Name, Date, Mag, Merr, Filt, Trans, Mtype, Cname, Cmag, Kname, Kmag, Amass, Group, Chart, Notes
                 # Date: 5 digits, Mag: 3 digits, Merr: 4 digits
@@ -495,10 +499,15 @@ def save_aavso_report(results, output_path, target_name, filter_name, obs_code,
                 err_str = f"{r['mag_err']:.4f}"
                 date_str = f"{r['hjd']:.5f}"
                 c_mag_str = fmt_mag(comp_mag, 3)
-                k_mag_str = fmt_mag(check_mag, 3)
+                
+                # Use frame-specific measured check magnitude if available, otherwise catalog mag fallback
+                k_val = r.get('check_mag', np.nan)
+                if k_val is None or not isinstance(k_val, (int, float)) or np.isnan(k_val):
+                    k_val = check_mag
+                k_mag_str = fmt_mag(k_val, 3)
                 
                 line = f"{target_name},{date_str},{mag_str},{err_str},{filter_name},{trans},STD,"
-                line += f"{comp_name},{c_mag_str},{check_name},{k_mag_str},{r['airmass']:.3f},na,na,{notes}\n"
+                line += f"{comp_name},{c_mag_str},{check_name},{k_mag_str},{r['airmass']:.3f},na,{chart_val},{notes}\n"
                 f.write(line)
         return True
     except Exception as e:
