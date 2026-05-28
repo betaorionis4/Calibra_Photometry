@@ -1,6 +1,6 @@
 # Calibra: Automated Photometric Analysis & Calibration Toolkit
 
-**Version:** 4.12 — 2026-05-25
+**Version:** 4.13 — 2026-05-28
 **Description:** 
 An automated, highly robust Python toolkit for extracting scientific-grade photometry, calibrating zero points, obtaining color transformation coefficients for V and B filters, and estimating formal CCD/CMOS errors from astronomical monochrome FITS images. Calibra features **Ensemble Differential Photometry** with multiple comparison stars, **Time-Series Light Curve** generation with AAVSO-format reporting, an **Interactive FITS Viewer** with role-based star marking, real-time PSF analysis, and bidirectional synchronization with the photometry pipeline. It integrates **AAVSO VSX** cross-matching to automatically exclude known variable stars from calibration sets.
 
@@ -8,7 +8,15 @@ The code was created with lots of help from Google Antigravity (various agents),
 
 ---
 
-## What's New in v4.12
+## What's New in v4.13 (2026-05-28)
+
+- **VSX Magnitude Limit Filter**: Added a `Max Mag (mag)` spinbox filter in the FITS Viewer sidebar (defaulting to `15.0`) to dynamically hide/show variable stars based on their peak magnitude limit.
+- **VSX Amplitude Filter**: Added a `Min Amp (mag)` spinbox filter to show only variables with a variability amplitude above a specified threshold (e.g. `0.2` mag), decluttering the FITS canvas.
+- **Immediate WCS Projection in FITS Viewer**: Variable stars are now plotted immediately using their WCS projected coordinates upon loading a FITS image (without requiring previous pipeline photometry results). They automatically refine to centroid coordinates if matching pipeline detections are present.
+
+---
+
+## What's New in v4.12 (2026-05-25)
 
 - **Configurable Centroid Tracking**: Added user-configurable settings under a new "Centroid Tracking" block in the Settings tab, allowing customization of the Initial Search Radius (default 15.0 px) and Max Tracking Shift (default 4.0 px) to handle wide fields or distorted optics at FOV boundaries.
 - **AAVSO Chart ID & Check Star Magnitudes**: Added an "AAVSO Chart ID" input field in the Light Curve tab to include the CHART keyword (Sequence ID) in AAVSO reports. Fixed the check star magnitude in AAVSO reports (`KMAG`) to output the dynamic frame-by-frame measured magnitude instead of repeating a static catalog magnitude.

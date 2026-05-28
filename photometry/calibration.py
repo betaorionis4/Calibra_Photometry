@@ -155,8 +155,17 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
                         cat_id = f"ATLAS {row['objID']}"
                     elif catalog_name == "LANDOLT" and 'Star' in cols:
                         cat_id = str(row['Star'])
-                    elif catalog_name == "APASS" and 'recno' in cols:
-                        cat_id = f"APASS {row['recno']}"
+                    elif catalog_name == "APASS":
+                        if 'recno' in cols:
+                            cat_id = f"APASS {row['recno']}"
+                        else:
+                            try:
+                                c_coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg)
+                                ra_str = c_coord.ra.to_string(unit='hour', sep='', precision=2, pad=True)
+                                dec_str = c_coord.dec.to_string(unit='degree', sep='', precision=1, pad=True, alwayssign=True).replace(' ', '')
+                                cat_id = f"APASS J{ra_str}{dec_str}"
+                            except:
+                                cat_id = f"APASS_{len(ref_stars)}"
                     
                     ref_stars.append({
                         'id': f"online_{len(ref_stars)}",
@@ -174,9 +183,86 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
             except:
                 continue
 
+    if ref_stars:
+        # Cross match with GAIA DR3 if not already GAIA_DR3
+        if catalog_name != "GAIA_DR3":
+            cross_match_with_gaia(ref_stars, ra_deg, dec_deg, radius_arcmin, verbose=verbose)
+        else:
+            for s in ref_stars:
+                s['gaia_id'] = s.get('cat_id', '')
+                
+        # Cross match with local AUIDs
+        cross_match_with_local_auids(ref_stars, verbose=verbose)
+
     if verbose:
         print(f"Successfully retrieved {len(ref_stars)} stars from {catalog_name}.")
     return ref_stars
+
+def cross_match_with_gaia(ref_stars, ra_deg, dec_deg, radius_arcmin, verbose=True):
+    if not ref_stars:
+        return
+    for s in ref_stars:
+        s['gaia_id'] = ""
+    try:
+        from astroquery.vizier import Vizier
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        if verbose:
+            print(f"Querying GAIA DR3 for cross-matching near RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
+        v = Vizier(columns=['Source', '_RAJ2000', '_DEJ2000'], row_limit=-1)
+        coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
+        result = v.query_region(coord, radius=(radius_arcmin * 1.1) * u.arcmin, catalog="I/355")
+        
+        if not result or len(result) == 0:
+            if verbose:
+                print("No Gaia stars found for cross-matching.")
+            return
+            
+        gaia_table = result[0]
+        gaia_coords = SkyCoord(ra=gaia_table['_RAJ2000'], dec=gaia_table['_DEJ2000'], unit=u.deg)
+        star_coords = SkyCoord(ra=[s['ra_deg'] for s in ref_stars], dec=[s['dec_deg'] for s in ref_stars], unit=u.deg)
+        
+        idx, d2d, _ = star_coords.match_to_catalog_sky(gaia_coords)
+        for i, star in enumerate(ref_stars):
+            dist_arcsec = d2d[i].arcsec
+            if dist_arcsec < 2.0:
+                star['gaia_id'] = f"Gaia {gaia_table[idx[i]]['Source']}"
+        if verbose:
+            matched_count = sum(1 for s in ref_stars if s.get('gaia_id'))
+            print(f"Cross-matched {matched_count}/{len(ref_stars)} stars with GAIA DR3.")
+    except Exception as e:
+        print(f"Error cross-matching with Gaia: {e}")
+
+def cross_match_with_local_auids(ref_stars, local_csv_path="photometry_refstars/reference_stars.csv", verbose=True):
+    if not ref_stars:
+        return
+    for s in ref_stars:
+        s['auid'] = ""
+        
+    if not os.path.exists(local_csv_path):
+        return
+    try:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        local_stars = read_reference_catalog(local_csv_path)
+        if not local_stars:
+            return
+            
+        local_coords = SkyCoord(ra=[s['ra_deg'] for s in local_stars], dec=[s['dec_deg'] for s in local_stars], unit=u.deg)
+        star_coords = SkyCoord(ra=[s['ra_deg'] for s in ref_stars], dec=[s['dec_deg'] for s in ref_stars], unit=u.deg)
+        
+        idx, d2d, _ = star_coords.match_to_catalog_sky(local_coords)
+        for i, star in enumerate(ref_stars):
+            dist_arcsec = d2d[i].arcsec
+            if dist_arcsec < 2.0:
+                star['auid'] = local_stars[idx[i]]['id']
+        if verbose:
+            matched_count = sum(1 for s in ref_stars if s.get('auid'))
+            print(f"Cross-matched {matched_count}/{len(ref_stars)} stars with local AUIDs.")
+    except Exception as e:
+        print(f"Error cross-matching with local AUIDs: {e}")
 
 def get_cached_catalog(ra, dec, radius, catalog_name, cache_dir="photometry_refstars/cache", verbose=True):
     """
@@ -185,7 +271,7 @@ def get_cached_catalog(ra, dec, radius, catalog_name, cache_dir="photometry_refs
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
         
-    cache_file = os.path.join(cache_dir, f"{catalog_name}_{ra:.4f}_{dec:.4f}_{radius}.csv")
+    cache_file = os.path.join(cache_dir, f"{catalog_name}_{ra:.3f}_{dec:.3f}_{float(radius):.1f}.csv")
     
     if os.path.exists(cache_file):
         if verbose:
@@ -193,14 +279,27 @@ def get_cached_catalog(ra, dec, radius, catalog_name, cache_dir="photometry_refs
         ref_stars = []
         with open(cache_file, 'r') as f:
             reader = csv.DictReader(f)
+            # Treat files without the newer columns as cache misses to regenerate them
+            if not reader.fieldnames or 'cat_id' not in reader.fieldnames or 'gaia_id' not in reader.fieldnames or 'auid' not in reader.fieldnames or 'vsx_name' not in reader.fieldnames:
+                if verbose:
+                    print(f"Cache file {cache_file} is outdated. Treating as cache miss.")
+                return None
             for row in reader:
                 ref_stars.append({
                     'id': row['id'],
                     'cat_id': row.get('cat_id', ''),
+                    'gaia_id': row.get('gaia_id', ''),
+                    'auid': row.get('auid', ''),
+                    'vsx_name': row.get('vsx_name', ''),
                     'ra_deg': float(row['ra_deg']),
                     'dec_deg': float(row['dec_deg']),
                     'V_mag': float(row['V_mag']),
-                    'B_mag': float(row['B_mag'])
+                    'B_mag': float(row['B_mag']),
+                    'raw_g': float(row['raw_g']) if row.get('raw_g') and row['raw_g'] != 'nan' else np.nan,
+                    'raw_r': float(row['raw_r']) if row.get('raw_r') and row['raw_r'] != 'nan' else np.nan,
+                    'raw_G': float(row['raw_G']) if row.get('raw_G') and row['raw_G'] != 'nan' else np.nan,
+                    'raw_BP': float(row['raw_BP']) if row.get('raw_BP') and row['raw_BP'] != 'nan' else np.nan,
+                    'raw_RP': float(row['raw_RP']) if row.get('raw_RP') and row['raw_RP'] != 'nan' else np.nan
                 })
         return ref_stars
     return None
@@ -209,8 +308,8 @@ def save_to_cache(ref_stars, ra, dec, radius, catalog_name, cache_dir="photometr
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
     
-    cache_file = os.path.join(cache_dir, f"{catalog_name}_{ra:.3f}_{dec:.3f}_{radius}.csv")
-    fieldnames = ['id', 'cat_id', 'ra_deg', 'dec_deg', 'V_mag', 'B_mag', 'raw_g', 'raw_r', 'raw_G', 'raw_BP', 'raw_RP']
+    cache_file = os.path.join(cache_dir, f"{catalog_name}_{ra:.3f}_{dec:.3f}_{float(radius):.1f}.csv")
+    fieldnames = ['id', 'cat_id', 'gaia_id', 'auid', 'vsx_name', 'ra_deg', 'dec_deg', 'V_mag', 'B_mag', 'raw_g', 'raw_r', 'raw_G', 'raw_BP', 'raw_RP']
     with open(cache_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -287,10 +386,10 @@ def get_ref_stars(ref_catalog_file, center_ra=None, center_dec=None, radius_arcm
         if not ref_stars:
             ref_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
             if ref_stars:
+                mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=verbose)
                 save_to_cache(ref_stars, center_ra, center_dec, radius_arcmin, cat_name, verbose=verbose)
-        
-        # Mark variables in the returned set
-        mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=verbose)
+        else:
+            mark_variable_stars(ref_stars, center_ra, center_dec, radius_arcmin, verbose=verbose)
     else:
         ref_stars = read_reference_catalog(ref_catalog_file)
     return ref_stars
@@ -302,7 +401,7 @@ def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
     from astropy.utils.data import Conf
     Conf.remote_timeout.set(60)
     
-    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', '_RAJ2000', '_DEJ2000', 'Type'], row_limit=-1)
+    v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', '_RAJ2000', '_DEJ2000', 'Type', 'max', 'min', 'f_min', 'Period'], row_limit=-1)
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
     
     try:
@@ -320,11 +419,24 @@ def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
     vsx_stars = []
     for row in table:
         try:
+            max_val = float(row['max']) if 'max' in row.colnames and not np.ma.is_masked(row['max']) else np.nan
+            min_val = float(row['min']) if 'min' in row.colnames and not np.ma.is_masked(row['min']) else np.nan
+            f_min_val = str(row['f_min']).strip().upper() if 'f_min' in row.colnames and not np.ma.is_masked(row['f_min']) else ''
+            
+            # If minimum magnitude column is actually the amplitude (f_min is Y or ( or min_val < max_val)
+            if not np.isnan(max_val) and not np.isnan(min_val):
+                is_amp = (f_min_val in ['Y', '(']) or (min_val < max_val)
+                if is_amp:
+                    min_val = max_val + min_val
+                    
             vsx_stars.append({
                 'id': str(row['Name']),
                 'ra_deg': float(row['_RAJ2000']),
                 'dec_deg': float(row['_DEJ2000']),
-                'Type': str(row['Type']) if 'Type' in row.colnames and not np.ma.is_masked(row['Type']) else ''
+                'Type': str(row['Type']) if 'Type' in row.colnames and not np.ma.is_masked(row['Type']) else '',
+                'max': max_val,
+                'min': min_val,
+                'Period': float(row['Period']) if 'Period' in row.colnames and not np.ma.is_masked(row['Period']) else np.nan
             })
         except:
             continue
@@ -339,24 +451,68 @@ def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refst
         
     cache_file = os.path.join(cache_dir, f"VSX_{ra_deg:.4f}_{dec_deg:.4f}_{radius_arcmin}.csv")
     
-    vsx_stars = []
+    # Check if a cache file for this query or one covering it exists
+    best_cache_file = None
     if os.path.exists(cache_file):
+        best_cache_file = cache_file
+    else:
+        # Scan cache directory for a file with close coordinates and a larger or equal radius
         try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
+            for fname in os.listdir(cache_dir):
+                if fname.startswith("VSX_") and fname.endswith(".csv"):
+                    parts = fname[:-4].split("_")
+                    if len(parts) == 4:
+                        try:
+                            c_ra = float(parts[1])
+                            c_dec = float(parts[2])
+                            c_rad = float(parts[3])
+                            
+                            # Check if the center is within 0.05 degrees (3 arcmin)
+                            dist_deg = np.sqrt((c_ra - ra_deg)**2 + (c_dec - dec_deg)**2)
+                            if dist_deg < 0.05:
+                                # Check if cached radius adjusted for the offset covers the requested radius (with a 2 arcmin tolerance)
+                                if (c_rad - dist_deg * 60.0) >= (radius_arcmin - 2.0):
+                                    if verbose:
+                                        print(f"VSX Cache: Reusing {fname} (covers requested region)")
+                                    best_cache_file = os.path.join(cache_dir, fname)
+                                    break
+                        except ValueError:
+                            continue
+        except Exception as e:
+            if verbose: print(f"Error scanning VSX cache directory: {e}")
+
+    vsx_stars = []
+    if best_cache_file and os.path.exists(best_cache_file):
+        try:
+            with open(best_cache_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                # If Type column is missing, invalidate cache to get CST data
-                if 'Type' not in reader.fieldnames:
-                    if verbose: print(f"VSX Cache is old (missing Type). Re-fetching...")
+                # Allow loading old cached files that don't have the Period column yet (using nan fallback)
+                is_old = 'Period' not in reader.fieldnames
+                if is_old:
+                    if verbose: print(f"VSX Cache: Reusing old cache (missing Period).")
                 else:
-                    if verbose: print(f"Loading cached VSX catalog from {cache_file}")
-                    for row in reader:
+                    if verbose: print(f"Loading cached VSX catalog from {best_cache_file}")
+                
+                for row in reader:
+                    # Only keep stars within the requested radius of the requested center
+                    star_ra = float(row['ra_deg'])
+                    star_dec = float(row['dec_deg'])
+                    dist_arcmin = np.sqrt((star_ra - ra_deg)**2 + (star_dec - dec_deg)**2) * 60.0
+                    if dist_arcmin <= radius_arcmin:
+                        max_val = float(row['max']) if row.get('max') and row['max'] != 'nan' else np.nan
+                        min_val = float(row['min']) if row.get('min') and row['min'] != 'nan' else np.nan
+                        if not np.isnan(max_val) and not np.isnan(min_val) and min_val < max_val:
+                            min_val = max_val + min_val
                         vsx_stars.append({
                             'id': row['id'],
-                            'ra_deg': float(row['ra_deg']),
-                            'dec_deg': float(row['dec_deg']),
-                            'Type': row.get('Type', '')
+                            'ra_deg': star_ra,
+                            'dec_deg': star_dec,
+                            'Type': row.get('Type', ''),
+                            'max': max_val,
+                            'min': min_val,
+                            'Period': float(row['Period']) if (not is_old and row.get('Period') and row['Period'] != 'nan') else np.nan
                         })
-                    return vsx_stars
+                return vsx_stars
         except Exception as e:
             if verbose: print(f"Error reading VSX cache: {e}")
             vsx_stars = []
@@ -365,10 +521,12 @@ def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refst
     
     if vsx_stars:
         with open(cache_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['id', 'ra_deg', 'dec_deg', 'Type'])
+            fieldnames = ['id', 'ra_deg', 'dec_deg', 'Type', 'max', 'min', 'Period']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for s in vsx_stars:
-                writer.writerow(s)
+                row = {k: s.get(k, np.nan) for k in fieldnames}
+                writer.writerow(row)
     return vsx_stars
 
 def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose=True):
@@ -403,9 +561,13 @@ def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose
     for i, s in enumerate(star_list):
         is_close = (d2d[i].arcsec < 10.0)  # Relaxed from 5.0 to 10.0 to handle boundary WCS distortions
         matched_vsx = vsx_stars[idx[i]]
+        if is_close:
+            s['vsx_name'] = matched_vsx['id']
+        else:
+            s['vsx_name'] = ""
         # AAVSO sometimes includes constant stars in VSX for reference. Don't flag them as variable.
         var_type = matched_vsx.get('Type', '')
-        if is_close and var_type and 'CST' not in str(var_type).upper():
+        if is_close and 'CST' not in str(var_type or '').upper():
             s['is_variable'] = True
             s['var_type'] = var_type
         else:

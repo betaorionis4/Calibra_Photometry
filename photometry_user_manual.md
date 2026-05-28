@@ -8,7 +8,14 @@ The code can identify stars, perform PSF fitting to extract fluxes (using apertu
 
 Make sure that the code uses the right filter. I use Johnson V and B filters, that are labled 'V_mag' and 'B_mag' by my imaging software - I use N.I.N.A. - in the FITS header.
 
-Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems. Version 4.0 has a reworked GUI which integrates dedicated **"Open Selected FITS in Viewer"** launcher buttons, and extensive interactive quick-help educational popup panels across all processing tabs. Version 4.12 (May 25, 2026) has improved data mining accuracy by implementing centroid shift constraints for faint stars, adds right-click context menus to scatter plots, and properly passes configuration to the FITS viewer from suspects,and introduces dynamic target naming when sending suspects to the Light Curves tab, prioritizing VSX Name, then Catalog ID, and falling back to a generic DM identifier.
+Since v1.5, Calibra supports automated color transformation calibration using paired B/V images. 
+In v2.0, ensemble time-series photometry with multiple comparison stars and AAVSO-format light curve reporting were added. 
+Version 3.0 introduces a centralized FITS File Manager, integrated Plate Solving via ASTAP, and a unified, logically flowing Analysis & Calibration tab. 
+Version 3.1 adds the **Interactive FITS Viewer** with role-based star marking, real-time radial profile analysis, in-viewer aperture tuning, and full bidirectional synchronization between the viewer and the Light Curves pipeline. 
+Version 3.2 implements full AAVSO-compliant Sequence retrieval (AUID caching) and automated Extended Format report generation, ensuring compatibility with AAVSO submission systems. 
+Version 4.0 has a reworked GUI which integrates dedicated **"Open Selected FITS in Viewer"** launcher buttons, and extensive interactive quick-help educational popup panels across all processing tabs. 
+Version 4.12 (May 25, 2026) has improved data mining accuracy by implementing centroid shift constraints for faint stars, adds right-click context menus to scatter plots, and properly passes configuration to the FITS viewer from suspects, and introduces dynamic target naming when sending suspects to the Light Curves tab. 
+Version 4.13 (May 28, 2026) implements immediate WCS projected variable star markings in the FITS Viewer, adds dynamic Max Mag magnitude limits and Min Amp filters to FITS Viewer variable markings.
 
 Useful background information is provided by the AAVSO Guide to CCD/CMOS Photometry (available for free via aavso.org).
 
@@ -353,6 +360,9 @@ The FITS Viewer is a powerful, integrated inspection and configuration tool. It 
 6.  **Bidirectional Aperture Synchronization**: Click **"Export Aps to Settings"** to write the viewer's current aperture and annulus values back to the main Settings tab, ensuring the pipeline uses the same radii you visually verified.
 
 7.  **Image Display**: The FITS rendering uses `ZScaleInterval` with the display floor set to the image median, producing a dark background with high star contrast. Zoom in/out with the scroll wheel; pan by clicking and dragging.
+
+8.  **Variable Star Marking**: Known variable stars from the VSX catalog are plotted immediately as red squares using WCS coordinates. Clicking near a marker displays selectable details in a non-modal popup window.
+    - **Min Amp (mag)** and **Max Mag (mag)**: Dynamic filters in the sidebar allow users to restrict markers based on amplitude or magnitude thresholds.
 
 ### 8.2 Processing Tabs
 1.  **About**: Version information and a summary of Calibra's capabilities.

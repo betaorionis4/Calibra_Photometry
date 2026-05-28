@@ -82,6 +82,13 @@ class FITSViewer:
         self.results_tree = None
         self._load_results()
         
+        self.show_vsx_var = tk.BooleanVar(value=True)
+        self.vsx_patches = []
+        self.vsx_texts = []
+        self.matched_vsx_stars = []
+        if self.has_wcs:
+            self._load_vsx_variables()
+        
         # UI Setup
         self.parent.title(f"FITS Viewer: {os.path.basename(fits_path)}")
         
@@ -198,6 +205,34 @@ class FITSViewer:
                                                 variable=self.show_aavso_var, command=self._draw_aavso_markers)
             self.aavso_toggle.pack(side=tk.BOTTOM, anchor=tk.W, pady=2)
             
+        self.vsx_mag_var = tk.DoubleVar(value=15.0)
+        self.vsx_mag_frame = ttk.Frame(self.ref_frame)
+        self.vsx_mag_frame.pack(side=tk.BOTTOM, anchor=tk.W, fill="x", pady=2)
+        
+        tk.Label(self.vsx_mag_frame, text="Max Mag (mag):", font=("Arial", 8)).pack(side=tk.LEFT, padx=(20, 2))
+        self.vsx_mag_spin = ttk.Spinbox(self.vsx_mag_frame, from_=0.0, to=30.0, increment=0.5, 
+                                        textvariable=self.vsx_mag_var, width=5,
+                                        command=self._draw_vsx_markers)
+        self.vsx_mag_spin.pack(side=tk.LEFT, padx=2)
+        self.vsx_mag_spin.bind("<Return>", lambda e: self._draw_vsx_markers())
+        self.vsx_mag_spin.bind("<FocusOut>", lambda e: self._draw_vsx_markers())
+
+        self.vsx_amp_var = tk.DoubleVar(value=0.0)
+        self.vsx_amp_frame = ttk.Frame(self.ref_frame)
+        self.vsx_amp_frame.pack(side=tk.BOTTOM, anchor=tk.W, fill="x", pady=2)
+        
+        tk.Label(self.vsx_amp_frame, text="Min Amp (mag):", font=("Arial", 8)).pack(side=tk.LEFT, padx=(20, 2))
+        self.vsx_amp_spin = ttk.Spinbox(self.vsx_amp_frame, from_=0.0, to=5.0, increment=0.05, 
+                                        textvariable=self.vsx_amp_var, width=5,
+                                        command=self._draw_vsx_markers)
+        self.vsx_amp_spin.pack(side=tk.LEFT, padx=2)
+        self.vsx_amp_spin.bind("<Return>", lambda e: self._draw_vsx_markers())
+        self.vsx_amp_spin.bind("<FocusOut>", lambda e: self._draw_vsx_markers())
+
+        self.vsx_toggle = ttk.Checkbutton(self.ref_frame, text="Show VSX Variables (Red Sq)", 
+                                          variable=self.show_vsx_var, command=self._draw_vsx_markers)
+        self.vsx_toggle.pack(side=tk.BOTTOM, anchor=tk.W, pady=2)
+            
         # Aperture Controls: Linked to tkinter variables
         self.ap_var = tk.DoubleVar(value=self.config.get('aperture_radius', 8.0))
         self.ann_in_var = tk.DoubleVar(value=self.config.get('annulus_inner', 15.0))
@@ -283,6 +318,9 @@ class FITSViewer:
         # Draw AAVSO sequence markers if provided
         if self.aavso_stars:
             self.parent.after(800, self._draw_aavso_markers)
+            
+        if self.has_wcs:
+            self.parent.after(900, self._draw_vsx_markers)
         
         # Right-click Context Menu for star role assignment
         self.context_menu = tk.Menu(self.parent, tearoff=0)
@@ -349,8 +387,214 @@ class FITSViewer:
                 print(f"Error marking AAVSO star {star.get('auid')}: {e}")
         
         self.canvas.draw_idle()
+
+    def _load_vsx_variables(self):
+        """
+        Query AAVSO VSX catalog for variables in the FITS frame,
+        and cross-match them with detected stars in self.results_data.
+        """
+        if not self.has_wcs:
+            print("FITS Viewer: WCS celestial coordinates not found in this image. VSX variable star markers (red squares) will not be shown.")
+            return
+            
+        try:
+            ny, nx = self.data.shape
+            center_sky = self.wcs.pixel_to_world(nx / 2, ny / 2)
+            corner_sky = self.wcs.pixel_to_world(0, 0)
+            radius_arcmin = center_sky.separation(corner_sky).arcmin
+            
+            # Clamp search radius between 5 and 45 arcminutes for safety to align with pipeline defaults
+            radius_arcmin = max(5.0, min(45.0, radius_arcmin))
+            
+            # Fetch from catalog (uses caching internally)
+            vsx_list = get_vsx_stars(center_sky.ra.deg, center_sky.dec.deg, radius_arcmin=radius_arcmin, verbose=False)
+            if not vsx_list:
+                print(f"FITS Viewer: No VSX stars found in this region (radius {radius_arcmin:.1f} arcmin).")
+                return
+                
+            print(f"FITS Viewer: Retrieved {len(vsx_list)} VSX stars in this region (radius {radius_arcmin:.1f} arcmin).")
+            self.matched_vsx_stars = []
+            
+            for v_star in vsx_list:
+                # Exclude constant stars (CST)
+                star_type = str(v_star.get('Type', '')).upper().strip()
+                if 'CST' in star_type:
+                    continue
+                try:
+                    # Project VSX coordinate to 0-based pixel coordinate
+                    v_sky = SkyCoord(ra=v_star['ra_deg']*u.deg, dec=v_star['dec_deg']*u.deg)
+                    px, py = self.wcs.world_to_pixel(v_sky)
+                    
+                    # Verify if the star falls within the image bounds
+                    if 0 <= px < nx and 0 <= py < ny:
+                        # Find the closest detected star in results_data
+                        matched_row = None
+                        if self.results_tree:
+                            # query using 1-based coordinates
+                            dist, idx = self.results_tree.query([px + 1, py + 1], distance_upper_bound=10.0)
+                            if dist < 10.0:
+                                matched_row = self.results_data[idx]
+                                
+                        # Project using refined coordinates if matched, otherwise use projected WCS coordinates
+                        if matched_row is not None:
+                            x_pos = float(matched_row['refined_x']) - 1
+                            y_pos = float(matched_row['refined_y']) - 1
+                            det_id = matched_row['id']
+                            snr_val = matched_row.get('snr', 'N/A')
+                            mag_cal = matched_row.get('mag_calibrated', 'N/A')
+                        else:
+                            x_pos = float(px)
+                            y_pos = float(py)
+                            det_id = "N/A"
+                            snr_val = "N/A"
+                            mag_cal = "N/A"
+                            
+                        self.matched_vsx_stars.append({
+                            'id': v_star['id'],
+                            'Type': v_star.get('Type', ''),
+                            'max': v_star.get('max', np.nan),
+                            'min': v_star.get('min', np.nan),
+                            'Period': v_star.get('Period', np.nan),
+                            'ra_deg': v_star['ra_deg'],
+                            'dec_deg': v_star['dec_deg'],
+                            'x_0based': x_pos,
+                            'y_0based': y_pos,
+                            'detected_id': det_id,
+                            'snr': snr_val,
+                            'mag_calibrated': mag_cal
+                        })
+                except Exception as e:
+                    print(f"Error processing VSX variable {v_star.get('id')}: {e}")
+            
+            print(f"FITS Viewer: Plotted {len(self.matched_vsx_stars)} VSX stars within the image frame boundaries.")
+                    
+        except Exception as e:
+            print(f"Error loading VSX variables: {e}")
+
+    def _draw_vsx_markers(self):
+        """
+        Draw red squares for all known VSX variable stars matched in self.results_data.
+        """
+        if not self.has_wcs or not self.matched_vsx_stars:
+            return
+            
+        # Clean up existing VSX markers
+        for p in self.vsx_patches:
+            try: p.remove()
+            except: pass
+        for t in self.vsx_texts:
+            try: t.remove()
+            except: pass
+        self.vsx_patches.clear()
+        self.vsx_texts.clear()
         
+        # If toggled off, just redraw and return
+        if not self.show_vsx_var.get():
+            self.canvas.draw_idle()
+            return
+            
+        # Draw a red square marker for each matched VSX star
+        size = 25.0
+        try:
+            min_amp = float(self.vsx_amp_var.get())
+        except:
+            min_amp = 0.0
+            
+        try:
+            max_mag_limit = float(self.vsx_mag_var.get())
+        except:
+            max_mag_limit = 15.0
+            
+        for star in self.matched_vsx_stars:
+            try:
+                # Filter by magnitude
+                max_mag = star.get('max', np.nan)
+                if not np.isnan(max_mag) and max_mag > max_mag_limit:
+                    continue
+                    
+                # Filter by amplitude if min_amp > 0.0
+                if min_amp > 0.0:
+                    min_mag = star.get('min', np.nan)
+                    amp = np.nan
+                    if not np.isnan(max_mag) and not np.isnan(min_mag):
+                        amp = min_mag - max_mag
+                    if np.isnan(amp) or amp < min_amp:
+                        continue
+                        
+                px = star['x_0based']
+                py = star['y_0based']
+                
+                # Draw a distinct red square centered on the star
+                rect = patches.Rectangle((px - size/2, py - size/2), width=size, height=size,
+                                         edgecolor='red', facecolor='none', linewidth=1.5, alpha=0.7)
+                self.ax.add_patch(rect)
+                self.vsx_patches.append(rect)
+            except Exception as e:
+                print(f"Error marking VSX star {star.get('id')}: {e}")
+                
         self.canvas.draw_idle()
+
+    def _show_vsx_star_info(self, star, event):
+        """
+        Show a custom non-modal popup with the VSX variable star catalog details.
+        """
+        pop = tk.Toplevel(self.parent)
+        pop.title(f"VSX Variable: {star['id']}")
+        pop.geometry("380x220")
+        pop.transient(self.parent)
+        
+        # Position popup near mouse cursor
+        x_root = event.guiEvent.x_root
+        y_root = event.guiEvent.y_root
+        pop.geometry(f"+{x_root + 10}+{y_root + 10}")
+        
+        if hasattr(self, 'vsx_info_popup') and self.vsx_info_popup:
+            try: self.vsx_info_popup.destroy()
+            except: pass
+        self.vsx_info_popup = pop
+        
+        main_frame = ttk.Frame(pop, padding=10)
+        main_frame.pack(fill="both", expand=True)
+        
+        detail_text = tk.Text(main_frame, font=("Consolas", 10), bg="#f8f9fa", fg="#1a3a5f", relief="flat", wrap="word")
+        detail_text.pack(fill="both", expand=True, pady=(0, 10))
+        
+        # Format values
+        max_mag = star.get('max', np.nan)
+        min_mag = star.get('min', np.nan)
+        period = star.get('Period', np.nan)
+        
+        max_str = f"{max_mag:.2f}" if not np.isnan(max_mag) else "N/A"
+        min_str = f"{min_mag:.2f}" if not np.isnan(min_mag) else "N/A"
+        period_str = f"{period:.5f} days" if not np.isnan(period) else "N/A"
+        
+        if not np.isnan(max_mag) and not np.isnan(min_mag):
+            amp_str = f"{min_mag - max_mag:.2f} mag"
+        else:
+            amp_str = "N/A"
+            
+        try:
+            c = SkyCoord(ra=star['ra_deg']*u.deg, dec=star['dec_deg']*u.deg)
+            ra_str = c.ra.to_string(unit='hour', sep=':', precision=2, pad=True)
+            dec_str = c.dec.to_string(unit='degree', sep=':', precision=1, pad=True, alwayssign=True)
+        except:
+            ra_str = f"{star['ra_deg']:.5f}"
+            dec_str = f"{star['dec_deg']:.5f}"
+            
+        msg = f"VSX Name:   {star['id']}\n"
+        msg += f"Type:       {star['Type']}\n"
+        msg += f"Coords:     RA {ra_str} / Dec {dec_str}\n"
+        msg += f"Magnitudes: Max {max_str} / Min {min_str}\n"
+        msg += f"Amplitude:  {amp_str}\n"
+        msg += f"Period:     {period_str}\n"
+        msg += f"Pipeline:   ID {star['detected_id']} (SNR: {star['snr']}, V_cal: {star['mag_calibrated']})"
+        
+        detail_text.insert("1.0", msg)
+        detail_text.config(state="disabled")
+        add_copy_context_menu(detail_text)
+        
+        btn_close = ttk.Button(main_frame, text="Close", command=pop.destroy)
+        btn_close.pack(anchor="e")
 
     def _toggle_user_markers(self):
         """Toggle the visibility of user-selected star markers (Target, Ref, Check)."""
@@ -396,8 +640,11 @@ class FITSViewer:
         csv_path = os.path.join(project_root, 'photometry_output', f'targets_auto_{self.base_name}.csv')
         
         if not os.path.exists(csv_path):
+            print(f"FITS Viewer: No photometry results CSV found at: {csv_path}\n"
+                  f"             VSX variable star markers (red squares) require running the pipeline analysis first.")
             return
         
+        print(f"FITS Viewer: Loading pipeline results from {csv_path}...")
         results = []
         try:
             with open(csv_path, 'r', encoding='utf-8') as f:
@@ -413,13 +660,14 @@ class FITSViewer:
             
             if results:
                 self.results_data = results
+                print(f"FITS Viewer: Loaded {len(results)} detected stars from photometry results.")
                 # Build cKDTree for O(log n) lookups (Fix #6)
                 # Note: CSV results are 1-based, tree matches these directly
                 coords = np.array([[s['refined_x'], s['refined_y']] for s in results])
                 self.results_tree = cKDTree(coords)
                 
         except Exception as e:
-            pass
+            print(f"FITS Viewer: Error parsing results CSV: {e}")
     def _update_details(self, text):
         """Update the Live Inspection text panel."""
         self.details_text.config(state=tk.NORMAL)
@@ -459,6 +707,18 @@ class FITSViewer:
 
         x_click, y_click = event.xdata, event.ydata
         
+        # Check if clicked near a matched VSX variable star
+        clicked_vsx = None
+        min_dist = 15.0  # Click tolerance in pixels
+        for star in self.matched_vsx_stars:
+            dist = np.sqrt((star['x_0based'] - x_click)**2 + (star['y_0based'] - y_click)**2)
+            if dist < min_dist:
+                min_dist = dist
+                clicked_vsx = star
+                
+        if clicked_vsx:
+            self._show_vsx_star_info(clicked_vsx, event)
+            
         # Search for a star in existing pipeline results using spatial index (Fix #6)
         found_in_csv = False
         if self.results_tree:
@@ -689,7 +949,7 @@ class FITSViewer:
                     
                     # Distance check for VSX match (5 arcsec tolerance)
                     dist_v = d2d_v[0].arcsec if hasattr(d2d_v, '__len__') else d2d_v.arcsec
-                    if dist_v < 5.0 and var_type and 'CST' not in str(var_type).upper():
+                    if dist_v < 5.0 and 'CST' not in str(var_type or '').upper():
                         star['is_variable'] = True
                     else:
                         star['is_variable'] = False
