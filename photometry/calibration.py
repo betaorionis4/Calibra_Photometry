@@ -8,6 +8,49 @@ from astropy.stats import sigma_clipped_stats
 from astroquery.vizier import Vizier
 from astropy.table import Table
 
+def match_filter_band(filt_str, v_key, b_key, g_key, r_key, l_key=None):
+    """
+    Translates a FITS header FILTER string to standard categories: 'V', 'B', 'G', 'R', 'L'.
+    Avoids accidental single-character substring matches with raw/calibration keywords
+    (like 'LIGHT', 'CLEAR', 'RGGB', etc.) unless they match the user's config exactly.
+    """
+    if not filt_str:
+        return ""
+    filt_str = str(filt_str).upper().strip()
+    
+    v_k = str(v_key).upper().strip() if v_key else ""
+    b_k = str(b_key).upper().strip() if b_key else ""
+    g_k = str(g_key).upper().strip() if g_key else ""
+    r_k = str(r_key).upper().strip() if r_key else ""
+    l_k = str(l_key).upper().strip() if l_key else ""
+    
+    # Standard raw/calibration/non-color keywords that shouldn't match single-letter filters by accident
+    raw_keywords = {"LIGHT", "CLEAR", "NONE", "DARK", "BIAS", "FLAT", "RGB", "RGGB", "BGGR", "GRBG", "GBRG", "LUM", "LUMINANCE", "OBJECT"}
+    
+    # Exact check first
+    if filt_str in raw_keywords:
+        if v_k == filt_str: return "V"
+        if b_k == filt_str: return "B"
+        if g_k == filt_str: return "G"
+        if r_k == filt_str: return "R"
+        if l_k == filt_str: return "L"
+        if l_k == "L" and filt_str in ["LUM", "LUMINANCE"]: return "L"
+        return filt_str
+        
+    def is_match(key):
+        if not key:
+            return False
+        # Exact match or substring mapping (e.g. 'Gmag' contains 'G', or 'G' is in 'Gmag')
+        return (key in filt_str) or (filt_str in key)
+        
+    if is_match(v_k): return "V"
+    if is_match(b_k): return "B"
+    if is_match(g_k): return "G"
+    if is_match(r_k): return "R"
+    if is_match(l_k): return "L"
+    
+    return filt_str
+
 def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS", verbose=True):
     """
     Queries VizieR for photometric reference stars.

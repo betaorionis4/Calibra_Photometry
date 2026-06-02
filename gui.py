@@ -13,6 +13,7 @@ import astropy.units as u
 from photometry.plate_solve import plate_solve_files, solve_with_astap
 from photometry.image_calibration import calibrate_image
 from photometry.gui_utils import add_copy_context_menu, SelectableLabel, add_treeview_copy_menu
+from photometry.calibration import match_filter_band
 
 # Platform-agnostic safe icons to prevent broken emoji boxes on Linux/Ubuntu
 IS_LINUX = sys.platform.startswith("linux")
@@ -258,6 +259,85 @@ class AdvancedPlotWindow(tk.Toplevel):
         if filepath:
             self.fig.savefig(filepath, dpi=300, bbox_inches='tight')
             messagebox.showinfo("Saved", f"Plot saved to:\n{filepath}")
+def scan_fits_header(filepath):
+    from astropy.io import fits
+    import os
+    metadata = {
+        'path': filepath,
+        'filename': os.path.basename(filepath),
+        'filter': '',
+        'binning': '',
+        'airmass': '',
+        'date_obs': '',
+        'exposure': '',
+        'wcs': False,
+        'object': '',
+        'size': f"{os.path.getsize(filepath) / 1024:.1f} KB",
+        'checked': True
+    }
+    try:
+        def get_hdr_val(hdul, key, default=None):
+            for hdu in hdul:
+                if key in hdu.header:
+                    return hdu.header[key]
+            return default
+
+        with fits.open(filepath) as hdul:
+            filt_val = get_hdr_val(hdul, 'FILTER', '')
+            metadata['filter'] = str(filt_val)
+            xbin = get_hdr_val(hdul, 'XBINNING', '')
+            ybin = get_hdr_val(hdul, 'YBINNING', '')
+            if xbin and ybin:
+                metadata['binning'] = f"{xbin}x{ybin}"
+            # Rounded airmass
+            am = get_hdr_val(hdul, 'AIRMASS')
+            if am is not None:
+                try:
+                    metadata['airmass'] = f"{float(am):.3f}"
+                except:
+                    metadata['airmass'] = str(am)
+            
+            date_obs = get_hdr_val(hdul, 'DATE-OBS', '')
+            metadata['date_obs'] = str(date_obs)
+            
+            # Exposure time search with fallback chain
+            exposure = get_hdr_val(hdul, 'EXPTIME')
+            if exposure is None or exposure == '':
+                exposure = get_hdr_val(hdul, 'EXPOSURE')
+            if exposure is None or exposure == '':
+                exposure = get_hdr_val(hdul, 'EXPO')
+            if exposure is None or exposure == '':
+                exposure = get_hdr_val(hdul, 'TELAPSE')
+            if exposure is None or exposure == '':
+                exposure = get_hdr_val(hdul, 'ELAPTIME')
+            if exposure is None or exposure == '':
+                exposure = get_hdr_val(hdul, 'INTEGTIME')
+            
+            if exposure is not None and exposure != '':
+                try:
+                    exposure_val = float(exposure)
+                    if exposure_val.is_integer():
+                        metadata['exposure'] = str(int(exposure_val))
+                    else:
+                        metadata['exposure'] = f"{exposure_val:.2f}"
+                except:
+                    metadata['exposure'] = str(exposure)
+            else:
+                metadata['exposure'] = ''
+            
+            # Check WCS
+            wcs_val = '✗'
+            for hdu in hdul:
+                if 'CRVAL1' in hdu.header:
+                    wcs_val = '✓'
+                    break
+            metadata['wcs'] = wcs_val
+            
+            obj_val = get_hdr_val(hdul, 'OBJECT', '')
+            metadata['object'] = str(obj_val)
+    except Exception as e:
+        print(f"Error reading header for {filepath}: {e}")
+    return metadata
 
 def run_config_gui(pipeline_callback=None):
     """
@@ -401,61 +481,7 @@ def run_config_gui(pipeline_callback=None):
         btn.bind("<Leave>", on_leave)
         sidebar_buttons[tab_name] = btn
         return btn
-    
-    def scan_fits_header(filepath):
-        from astropy.io import fits
-        metadata = {
-            'path': filepath,
-            'filename': os.path.basename(filepath),
-            'filter': '',
-            'binning': '',
-            'airmass': '',
-            'date_obs': '',
-            'exposure': '',
-            'wcs': False,
-            'object': '',
-            'size': f"{os.path.getsize(filepath) / 1024:.1f} KB"
-        }
-        try:
-            def get_hdr_val(hdul, key, default=None):
-                for hdu in hdul:
-                    if key in hdu.header:
-                        return hdu.header[key]
-                return default
 
-            with fits.open(filepath) as hdul:
-                filt_val = get_hdr_val(hdul, 'FILTER', '')
-                metadata['filter'] = str(filt_val)
-                xbin = get_hdr_val(hdul, 'XBINNING', '')
-                ybin = get_hdr_val(hdul, 'YBINNING', '')
-                if xbin and ybin:
-                    metadata['binning'] = f"{xbin}x{ybin}"
-                # Rounded airmass
-                am = get_hdr_val(hdul, 'AIRMASS')
-                if am is not None:
-                    try:
-                        metadata['airmass'] = f"{float(am):.3f}"
-                    except:
-                        metadata['airmass'] = str(am)
-                
-                date_obs = get_hdr_val(hdul, 'DATE-OBS', '')
-                metadata['date_obs'] = str(date_obs)
-                exposure = get_hdr_val(hdul, 'EXPTIME', '')
-                metadata['exposure'] = str(exposure)
-                
-                # Check WCS
-                wcs_val = '✗'
-                for hdu in hdul:
-                    if 'CRVAL1' in hdu.header:
-                        wcs_val = '✓'
-                        break
-                metadata['wcs'] = wcs_val
-                
-                obj_val = get_hdr_val(hdul, 'OBJECT', '')
-                metadata['object'] = str(obj_val)
-        except Exception as e:
-            print(f"Error reading header for {filepath}: {e}")
-        return metadata
 
     def show_pipeline_info():
         pop = tk.Toplevel(root)
@@ -802,9 +828,14 @@ def run_config_gui(pipeline_callback=None):
             idx = int(item)
             file_path = loaded_files[idx]['path']
             filt = loaded_files[idx]['filter'].upper()
+            v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
             b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+            g_key = vars_dict["filter_g_keyword"][0].get().upper() if "filter_g_keyword" in vars_dict else "GMAG"
+            r_key = vars_dict["filter_r_keyword"][0].get().upper() if "filter_r_keyword" in vars_dict else "RMAG"
+            l_key = vars_dict["filter_l_keyword"][0].get().upper() if "filter_l_keyword" in vars_dict else "LMAG"
             
-            if b_key in filt:
+            band = match_filter_band(filt, v_key, b_key, g_key, r_key, l_key)
+            if band == "B":
                 def_zp = float(vars_dict["default_zp_b"][0].get()) if "default_zp_b" in vars_dict else 23.399
             else:
                 def_zp = float(vars_dict["default_zp_v"][0].get()) if "default_zp_v" in vars_dict else 23.399
@@ -1043,6 +1074,9 @@ def run_config_gui(pipeline_callback=None):
                 'default_zp_b': vars_vals.pop('default_zp_b'),
                 'filter_v_keyword': vars_vals.pop('filter_v_keyword'),
                 'filter_b_keyword': vars_vals.pop('filter_b_keyword'),
+                'filter_g_keyword': vars_vals.pop('filter_g_keyword') if 'filter_g_keyword' in vars_vals else 'Gmag',
+                'filter_r_keyword': vars_vals.pop('filter_r_keyword') if 'filter_r_keyword' in vars_vals else 'Rmag',
+                'filter_l_keyword': vars_vals.pop('filter_l_keyword') if 'filter_l_keyword' in vars_vals else 'Lmag',
                 'calib_snr_threshold': vars_vals.pop('calib_snr_threshold'),
                 'catalog_search_radius': vars_vals.pop('catalog_search_radius'),
                 'run_new_calibration': vars_vals.pop('run_new_calibration'),
@@ -1110,9 +1144,14 @@ def run_config_gui(pipeline_callback=None):
                                 shift_val = res[3] if len(res) >= 4 else None
                                 det_val = res[4] if len(res) >= 5 else None
                                 
-                                f_upper = str(filt).upper()
+                                v_key = config_run.get('filter_v_keyword', 'VMAG').upper()
                                 b_key = config_run.get('filter_b_keyword', 'BMAG').upper()
-                                if b_key in f_upper:
+                                g_key = config_run.get('filter_g_keyword', 'GMAG').upper()
+                                r_key = config_run.get('filter_r_keyword', 'RMAG').upper()
+                                l_key = config_run.get('filter_l_keyword', 'LMAG').upper()
+                                
+                                band = match_filter_band(filt, v_key, b_key, g_key, r_key, l_key)
+                                if band == "B":
                                     vars_dict['color_b_csv'][0].set(csv_path)
                                     last_zp_b = zp_val
                                 else:
@@ -1765,11 +1804,33 @@ def run_config_gui(pipeline_callback=None):
     toolbar_frame = ttk.Frame(file_manager_frame)
     toolbar_frame.pack(fill="x", padx=5, pady=5)
     
-    def update_file_table(select_iid=None):
-        # Remember selection if select_iid is not explicitly passed
-        current_selection = tree.selection()
-        prev_selected_iid = current_selection[0] if current_selection else None
-        
+    def update_file_table(select_iids=None, select_iid=None):
+        if select_iids is None and select_iid is not None:
+            select_iids = select_iid
+
+        # Remember selection by file paths
+        selected_paths = []
+        if select_iids is not None:
+            if isinstance(select_iids, (str, int)):
+                select_iids = [str(select_iids)]
+            else:
+                select_iids = [str(i) for i in select_iids]
+            for iid in select_iids:
+                try:
+                    idx = int(iid)
+                    if 0 <= idx < len(loaded_files):
+                        selected_paths.append(loaded_files[idx]['path'])
+                except ValueError:
+                    pass
+        else:
+            for iid in tree.selection():
+                try:
+                    idx = int(iid)
+                    if 0 <= idx < len(loaded_files):
+                        selected_paths.append(loaded_files[idx]['path'])
+                except ValueError:
+                    pass
+
         # Clear existing items
         for item in tree.get_children():
             tree.delete(item)
@@ -1777,9 +1838,10 @@ def run_config_gui(pipeline_callback=None):
         # Populate with loaded_files
         for idx, file_data in enumerate(loaded_files):
             tag = 'even' if idx % 2 == 0 else 'odd'
-            # Default to checked '[X]'
+            # Read checked status from database dictionary
+            chk_val = '[X]' if file_data.get('checked', True) else '[ ]'
             tree.insert('', tk.END, iid=str(idx), values=(
-                '[X]',
+                chk_val,
                 file_data['filename'],
                 file_data['filter'],
                 file_data['binning'],
@@ -1790,7 +1852,8 @@ def run_config_gui(pipeline_callback=None):
                 file_data['object'],
                 file_data['size']
             ), tags=(tag,))
-           # Update status bar
+
+        # Update status bar
         if "filter_v_keyword" in vars_dict:
             v_key = vars_dict["filter_v_keyword"][0].get().upper().strip()
         else:
@@ -1801,32 +1864,33 @@ def run_config_gui(pipeline_callback=None):
         else:
             b_key = "BMAG"
 
-        v_count = 0
-        b_count = 0
-        for f in loaded_files:
-            filt_str = str(f.get('filter', '')).upper().strip()
-            if filt_str:
-                if v_key and (v_key in filt_str or filt_str in v_key):
-                    v_count += 1
-                elif b_key and (b_key in filt_str or filt_str in b_key):
-                    b_count += 1
+        g_key = vars_dict["filter_g_keyword"][0].get().upper().strip() if "filter_g_keyword" in vars_dict else "GMAG"
+        r_key = vars_dict["filter_r_keyword"][0].get().upper().strip() if "filter_r_keyword" in vars_dict else "RMAG"
+        l_key = vars_dict["filter_l_keyword"][0].get().upper().strip() if "filter_l_keyword" in vars_dict else "LMAG"
 
-        status_text = f"Loaded: {len(loaded_files)} files ({v_count}× V, {b_count}× B)"
+        filter_counts = {}
+        for f in loaded_files:
+            filt_val = str(f.get('filter', '')).strip()
+            if filt_val:
+                filter_counts[filt_val] = filter_counts.get(filt_val, 0) + 1
+
+        counts_str = []
+        for filt in sorted(filter_counts.keys()):
+            counts_str.append(f"{filter_counts[filt]}× {filt}")
+        
+        status_text = f"Loaded: {len(loaded_files)} files"
+        if counts_str:
+            status_text += f" ({', '.join(counts_str)})"
         file_manager_status.set(status_text)
         
-        # Update light curve filter dropdown with unique translated filters
-        unique_translated = set()
+        # Update light curve filter dropdown with unique raw filters from the headers
+        unique_filters_set = set()
         for f in loaded_files:
-            filt_str = str(f.get('filter', '')).upper().strip()
-            if filt_str:
-                if v_key and (v_key in filt_str or filt_str in v_key):
-                    unique_translated.add("V")
-                elif b_key and (b_key in filt_str or filt_str in b_key):
-                    unique_translated.add("B")
-                else:
-                    unique_translated.add(filt_str)
+            filt_val = str(f.get('filter', '')).strip()
+            if filt_val:
+                unique_filters_set.add(filt_val)
         
-        unique_filters = sorted(list(unique_translated))
+        unique_filters = sorted(list(unique_filters_set)) if unique_filters_set else ["V", "B", "R", "G", "L"]
         if 'filter_cb' in ts_widgets:
             ts_widgets['filter_cb']['values'] = unique_filters
             # If current selection is not in new list and list is not empty, select first
@@ -1835,11 +1899,15 @@ def run_config_gui(pipeline_callback=None):
                 if curr not in unique_filters:
                     vars_dict["ts_filter"][0].set(unique_filters[0])
         
-        # Select target item, or re-select previous, or select first item if nothing selected
-        target_iid = select_iid if select_iid is not None else prev_selected_iid
-        if target_iid is not None and tree.exists(str(target_iid)):
-            tree.selection_set(str(target_iid))
-            tree.see(str(target_iid))
+        # Restore selection based on file paths
+        new_selection = []
+        for idx, file_data in enumerate(loaded_files):
+            if file_data['path'] in selected_paths:
+                new_selection.append(str(idx))
+                
+        if new_selection:
+            tree.selection_set(new_selection)
+            tree.see(new_selection[0])
             on_tree_select(None)
         elif tree.get_children():
             first_iid = tree.get_children()[0]
@@ -1895,16 +1963,14 @@ def run_config_gui(pipeline_callback=None):
         update_file_table()
 
     def on_check_all():
-        for iid in tree.get_children():
-            vals = list(tree.item(iid, 'values'))
-            vals[0] = '[X]'
-            tree.item(iid, values=vals)
+        for f in loaded_files:
+            f['checked'] = True
+        update_file_table()
 
     def on_uncheck_all():
-        for iid in tree.get_children():
-            vals = list(tree.item(iid, 'values'))
-            vals[0] = '[ ]'
-            tree.item(iid, values=vals)
+        for f in loaded_files:
+            f['checked'] = False
+        update_file_table()
 
     ttk.Button(toolbar_frame, text="Load Files...", command=on_load_files).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Load Directory...", command=on_load_dir).pack(side=tk.LEFT, padx=5)
@@ -1951,8 +2017,54 @@ def run_config_gui(pipeline_callback=None):
     left_side.grid_rowconfigure(0, weight=1)
     left_side.grid_columnconfigure(0, weight=1)
     
+    sort_states = {}
+    def sort_files_column(col_id):
+        state = sort_states.get(col_id, 'asc')
+        reverse = (state == 'desc')
+        
+        if col_id == "filename":
+            loaded_files.sort(key=lambda x: str(x.get('filename', '')).lower(), reverse=reverse)
+        elif col_id == "filter":
+            loaded_files.sort(key=lambda x: str(x.get('filter', '')).lower(), reverse=reverse)
+        elif col_id == "date_obs":
+            default_date = '9999-99-99' if not reverse else '0000-00-00'
+            loaded_files.sort(key=lambda x: str(x.get('date_obs', '') or default_date), reverse=reverse)
+        elif col_id == "exposure":
+            default_exp = 999999.0 if not reverse else -1.0
+            def safe_float(v):
+                if v is None or v == '': return default_exp
+                try: return float(v)
+                except: return default_exp
+            loaded_files.sort(key=lambda x: safe_float(x.get('exposure', '')), reverse=reverse)
+        elif col_id == "airmass":
+            default_am = 99.0 if not reverse else -1.0
+            def safe_float(v):
+                if v is None or v == '': return default_am
+                try: return float(v)
+                except: return default_am
+            loaded_files.sort(key=lambda x: safe_float(x.get('airmass', '')), reverse=reverse)
+        elif col_id == "size":
+            def safe_size(v):
+                try:
+                    s = str(v).lower().replace("kb", "").strip()
+                    return float(s)
+                except:
+                    return 0.0
+            loaded_files.sort(key=lambda x: safe_size(x.get('size', '')), reverse=reverse)
+        elif col_id == "object":
+            loaded_files.sort(key=lambda x: str(x.get('object', '')).lower(), reverse=reverse)
+        elif col_id == "binning":
+            loaded_files.sort(key=lambda x: str(x.get('binning', '')).lower(), reverse=reverse)
+        elif col_id == "wcs":
+            loaded_files.sort(key=lambda x: str(x.get('wcs', '')).lower(), reverse=reverse)
+        elif col_id == "use":
+            loaded_files.sort(key=lambda x: x.get('checked', True), reverse=reverse)
+            
+        sort_states[col_id] = 'desc' if state == 'asc' else 'asc'
+        update_file_table()
+
     for col, (text, width) in column_configs.items():
-        tree.heading(col, text=text)
+        tree.heading(col, text=text, command=lambda c=col: sort_files_column(c))
         tree.column(col, width=width, anchor=tk.CENTER, stretch=False)
     
     tree.grid(row=0, column=0, sticky="nsew")
@@ -1994,7 +2106,38 @@ def run_config_gui(pipeline_callback=None):
     def copy_all():
         copy_to_clipboard(tree.get_children())
 
+    def check_selected():
+        selected = tree.selection()
+        for iid in selected:
+            idx = int(iid)
+            if 0 <= idx < len(loaded_files):
+                loaded_files[idx]['checked'] = True
+        update_file_table()
+
+    def uncheck_selected():
+        selected = tree.selection()
+        for iid in selected:
+            idx = int(iid)
+            if 0 <= idx < len(loaded_files):
+                loaded_files[idx]['checked'] = False
+        update_file_table()
+
+    def remove_selected_context():
+        selected = tree.selection()
+        if not selected:
+            return
+        if messagebox.askyesno("Confirm Removal", f"Are you sure you want to remove the {len(selected)} selected files from the list?"):
+            indices_to_remove = sorted([int(iid) for iid in selected], reverse=True)
+            for idx in indices_to_remove:
+                if 0 <= idx < len(loaded_files):
+                    loaded_files.pop(idx)
+            update_file_table()
+
     tree_menu.add_command(label="✏️ Edit FITS Header...", command=on_edit_header_context)
+    tree_menu.add_separator()
+    tree_menu.add_command(label="☑️ Check Selected Files", command=check_selected)
+    tree_menu.add_command(label="🔲 Uncheck Selected Files", command=uncheck_selected)
+    tree_menu.add_command(label="❌ Remove Selected Files", command=remove_selected_context)
     tree_menu.add_separator()
     tree_menu.add_command(label="Copy Selected Rows (Excel-ready)", command=copy_selected)
     tree_menu.add_command(label="Copy Entire List (Excel-ready)", command=copy_all)
@@ -2386,14 +2529,46 @@ def run_config_gui(pipeline_callback=None):
             if column == '#1': # The 'use' column
                 iid = tree.identify_row(event.y)
                 if iid:
-                    vals = list(tree.item(iid, 'values'))
-                    if vals[0] == '[X]':
-                        vals[0] = '[ ]'
-                    else:
-                        vals[0] = '[X]'
-                    tree.item(iid, values=vals)
+                    idx = int(iid)
+                    if 0 <= idx < len(loaded_files):
+                        selected_iids = list(tree.selection())
+                        if iid in selected_iids:
+                            new_val = not loaded_files[idx].get('checked', True)
+                            for s_iid in selected_iids:
+                                try:
+                                    s_idx = int(s_iid)
+                                    if 0 <= s_idx < len(loaded_files):
+                                        loaded_files[s_idx]['checked'] = new_val
+                                except ValueError:
+                                    pass
+                            update_file_table(select_iids=selected_iids)
+                        else:
+                            loaded_files[idx]['checked'] = not loaded_files[idx].get('checked', True)
+                            update_file_table(select_iids=[iid])
+                return "break" # Intercept and prevent clearing other selections!
 
-    tree.bind("<ButtonRelease-1>", on_tree_click)
+    def on_space_pressed(event):
+        selected_iids = list(tree.selection())
+        if not selected_iids:
+            return "break"
+        try:
+            first_idx = int(selected_iids[0])
+            if 0 <= first_idx < len(loaded_files):
+                new_val = not loaded_files[first_idx].get('checked', True)
+                for s_iid in selected_iids:
+                    try:
+                        s_idx = int(s_iid)
+                        if 0 <= s_idx < len(loaded_files):
+                            loaded_files[s_idx]['checked'] = new_val
+                    except ValueError:
+                        pass
+                update_file_table(select_iids=selected_iids)
+        except ValueError:
+            pass
+        return "break" # Prevent default spacebar selection action
+
+    tree.bind("<Button-1>", on_tree_click)
+    tree.bind("<space>", on_space_pressed)
     tree.bind("<Double-1>", on_double_click)
     
     file_manager_status = tk.StringVar(value="No files loaded.")
@@ -2518,10 +2693,13 @@ def run_config_gui(pipeline_callback=None):
     # Filter Keyword Mapping
     lf_map = tk.LabelFrame(sub_astro, text="Filter Keyword Mapping")
     lf_map.pack(fill="x", padx=10, pady=10)
-    tk.Label(lf_map, text="Define keywords in your FITS headers that identify the B and V filters.", 
+    tk.Label(lf_map, text="Define keywords in your FITS headers that identify the B, V, G, and R filters.", 
               fg="#555", font=("Arial", 8, "italic")).grid(row=0, column=0, columnspan=4, padx=10, pady=(0, 10))
     add_entry(lf_map, "B-Filter Keyword:", "filter_b_keyword", "Bmag", 1, col_offset=0, vtype=str)
     add_entry(lf_map, "V-Filter Keyword:", "filter_v_keyword", "Vmag", 1, col_offset=1, vtype=str)
+    add_entry(lf_map, "G-Filter Keyword:", "filter_g_keyword", "Gmag", 2, col_offset=0, vtype=str)
+    add_entry(lf_map, "R-Filter Keyword:", "filter_r_keyword", "Rmag", 2, col_offset=1, vtype=str)
+    add_entry(lf_map, "L-Filter Keyword:", "filter_l_keyword", "Lmag", 3, col_offset=0, vtype=str)
 
     # Region Selection (from old TAB 1)
     lf_filt = tk.LabelFrame(sub_astro, text="Region Selection")
@@ -2578,13 +2756,17 @@ def run_config_gui(pipeline_callback=None):
                     orig_path = loaded_files[iid_int]['path']
                     
                     filt = loaded_files[iid_int]['filter'].upper()
-                    b_key = vars_dict["filter_b_keyword"][0].get().upper()
-                    v_key = vars_dict["filter_v_keyword"][0].get().upper()
+                    v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
+                    b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+                    g_key = vars_dict["filter_g_keyword"][0].get().upper() if "filter_g_keyword" in vars_dict else "GMAG"
+                    r_key = vars_dict["filter_r_keyword"][0].get().upper() if "filter_r_keyword" in vars_dict else "RMAG"
+                    l_key = vars_dict["filter_l_keyword"][0].get().upper() if "filter_l_keyword" in vars_dict else "LMAG"
                     
+                    band = match_filter_band(filt, v_key, b_key, g_key, r_key, l_key)
                     flat_path = None
-                    if b_key and b_key in filt:
+                    if band == "B":
                         flat_path = flat_b
-                    elif v_key and v_key in filt:
+                    elif band == "V":
                         flat_path = flat_v
                     
                     if not flat_path:
@@ -2995,14 +3177,20 @@ def run_config_gui(pipeline_callback=None):
         selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
         b_count = 0
         v_count = 0
-        b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
         v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
+        b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+        g_key = vars_dict["filter_g_keyword"][0].get().upper() if "filter_g_keyword" in vars_dict else "GMAG"
+        r_key = vars_dict["filter_r_keyword"][0].get().upper() if "filter_r_keyword" in vars_dict else "RMAG"
+        l_key = vars_dict["filter_l_keyword"][0].get().upper() if "filter_l_keyword" in vars_dict else "LMAG"
         
         for iid in selected_iids:
             finfo = loaded_files[int(iid)]
             filt = str(finfo.get('filter', '')).upper()
-            if b_key in filt or (len(filt)==1 and filt=='B'): b_count += 1
-            elif v_key in filt or (len(filt)==1 and filt=='V'): v_count += 1
+            band = match_filter_band(filt, v_key, b_key, g_key, r_key, l_key)
+            if band == "B":
+                b_count += 1
+            elif band == "V":
+                v_count += 1
         return b_count, v_count
 
     # --- Differential Photometry Section ---
@@ -3322,7 +3510,7 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(filter_frame, text="Light Curve Filter:").pack(side=tk.LEFT, padx=5)
     ts_filter_var = tk.StringVar(value="V")
     vars_dict["ts_filter"] = (ts_filter_var, str)
-    ts_filter_cb = ttk.Combobox(filter_frame, textvariable=ts_filter_var, values=["V", "B"], state="readonly", width=5)
+    ts_filter_cb = ttk.Combobox(filter_frame, textvariable=ts_filter_var, values=["V", "B", "R", "G", "L"], state="readonly", width=5)
     ts_filter_cb.pack(side=tk.LEFT, padx=5)
     ts_widgets['filter_cb'] = ts_filter_cb
     def get_coords_ts(mode, name, ra_s, dec_s):
@@ -3816,15 +4004,40 @@ def run_config_gui(pipeline_callback=None):
                 messagebox.showwarning("No Selection", "Please select at least one star.")
                 return
                 
-            count = 0
+            # Determine available slots (slots that are empty or not in use)
+            available_slots = []
+            for i in range(5):
+                name_val = vars_dict[f"ts_ref_{i}_name"][0].get()
+                use_val = vars_dict[f"ts_ref_{i}_use"][0].get()
+                if not name_val or not use_val:
+                    available_slots.append(i)
+            
             from astropy.coordinates import SkyCoord
             import astropy.units as u
             use_catalog = (source_var.get() == "catalog")
             
+            count = 0
+            ensemble_full_warned = False
             for item in selected_items:
-                if count >= 5: break
                 vals = tree_stars.item(item, 'values')
                 auid = vals[0]
+                
+                # Check for duplicates: skip if this star is already in the ensemble and is in use
+                is_duplicate = False
+                for i in range(5):
+                    if vars_dict[f"ts_ref_{i}_name"][0].get() == auid and vars_dict[f"ts_ref_{i}_use"][0].get():
+                        is_duplicate = True
+                        break
+                if is_duplicate:
+                    continue
+                
+                if not available_slots:
+                    if not ensemble_full_warned:
+                        messagebox.showwarning("Ensemble Full", "The ensemble is full (max 5 stars). Some selected stars were not added.")
+                        ensemble_full_warned = True
+                    break
+                
+                slot = available_slots.pop(0)
                 star_data = next((s for s in stars if s['auid'] == auid), None)
                 if not star_data: continue
                 
@@ -3836,18 +4049,18 @@ def run_config_gui(pipeline_callback=None):
                     b_to_use = star_data['cat_b']
                     src_label = cat_name.split()[0] # Short name
                 
-                vars_dict[f"ts_ref_{count}_name"][0].set(star_data['auid'])
-                vars_dict[f"ts_ref_{count}_mag"][0].set(v_to_use)
-                vars_dict[f"ts_ref_{count}_bv"][0].set(round(b_to_use - v_to_use, 3))
-                vars_dict[f"ts_ref_{count}_ra"][0].set(star_data['ra'])
-                vars_dict[f"ts_ref_{count}_dec"][0].set(star_data['dec'])
-                vars_dict[f"ts_ref_{count}_has_manual"][0].set(True)
+                vars_dict[f"ts_ref_{slot}_name"][0].set(star_data['auid'])
+                vars_dict[f"ts_ref_{slot}_mag"][0].set(v_to_use)
+                vars_dict[f"ts_ref_{slot}_bv"][0].set(round(b_to_use - v_to_use, 3))
+                vars_dict[f"ts_ref_{slot}_ra"][0].set(star_data['ra'])
+                vars_dict[f"ts_ref_{slot}_dec"][0].set(star_data['dec'])
+                vars_dict[f"ts_ref_{slot}_has_manual"][0].set(True)
                 
                 c = SkyCoord(ra=star_data['ra']*u.deg, dec=star_data['dec']*u.deg)
                 ra_hms = c.ra.to_string(unit='hour', sep=':', precision=1)
                 dec_dms = c.dec.to_string(unit='degree', sep=':', precision=1, alwayssign=True)
-                vars_dict[f"ts_ref_{count}_coord_label"][0].set(f"({ra_hms}, {dec_dms}) [{src_label}]")
-                vars_dict[f"ts_ref_{count}_use"][0].set(True)
+                vars_dict[f"ts_ref_{slot}_coord_label"][0].set(f"({ra_hms}, {dec_dms}) [{src_label}]")
+                vars_dict[f"ts_ref_{slot}_use"][0].set(True)
                 count += 1
             
             ts_status_var.set(f"Imported {count} stars to ensemble.")
@@ -3937,7 +4150,13 @@ def run_config_gui(pipeline_callback=None):
             try:
                 with open(json_path, 'r') as f:
                     coeffs = json.load(f)
-                filt = ts_filter_var.get().upper()
+                filt_raw = ts_filter_var.get().upper().strip()
+                v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
+                b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+                g_key = vars_dict["filter_g_keyword"][0].get().upper() if "filter_g_keyword" in vars_dict else "GMAG"
+                r_key = vars_dict["filter_r_keyword"][0].get().upper() if "filter_r_keyword" in vars_dict else "RMAG"
+                l_key = vars_dict["filter_l_keyword"][0].get().upper() if "filter_l_keyword" in vars_dict else "LMAG"
+                filt = match_filter_band(filt_raw, v_key, b_key, g_key, r_key, l_key) or filt_raw
                 if filt == 'B':
                     val = coeffs.get('Tb_bv', 0.0)
                     key_name = 'Tb_bv'
@@ -3945,7 +4164,7 @@ def run_config_gui(pipeline_callback=None):
                     val = coeffs.get('Tv_bv', 0.0)
                     key_name = 'Tv_bv'
                 ts_coeff_var.set(val)
-                ts_status_var.set(f"Loaded {key_name} for {filt} filter.")
+                ts_status_var.set(f"Loaded {key_name} for {filt_raw} filter.")
             except Exception as e:
                 ts_status_var.set(f"Error loading JSON: {e}")
         else:
@@ -3994,24 +4213,56 @@ def run_config_gui(pipeline_callback=None):
             messagebox.showwarning("No Selection", "Please check at least one FITS file in the File Manager.")
             return
         
-        selected_filter = ts_filter_var.get().upper()
-        v_key = vars_dict["filter_v_keyword"][0].get().upper()
-        b_key = vars_dict["filter_b_keyword"][0].get().upper()
+        selected_filter = ts_filter_var.get().upper().strip()
+        v_key = vars_dict["filter_v_keyword"][0].get().upper() if "filter_v_keyword" in vars_dict else "VMAG"
+        b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
+        g_key = vars_dict["filter_g_keyword"][0].get().upper() if "filter_g_keyword" in vars_dict else "GMAG"
+        r_key = vars_dict["filter_r_keyword"][0].get().upper() if "filter_r_keyword" in vars_dict else "RMAG"
+        l_key = vars_dict["filter_l_keyword"][0].get().upper() if "filter_l_keyword" in vars_dict else "LMAG"
         
-        files = []
+        matching_files = []
         for iid in selected_iids:
             file_data = loaded_files[int(iid)]
-            filt_str = str(file_data['filter']).upper()
+            filt_str = str(file_data['filter']).upper().strip()
             
             # Determine translated filter of this file
-            trans_filt = filt_str
-            if v_key and v_key in filt_str:
-                trans_filt = "V"
-            elif b_key and b_key in filt_str:
-                trans_filt = "B"
-            
-            if selected_filter == trans_filt:
-                files.append(file_data['path'])
+            trans_filt = match_filter_band(filt_str, v_key, b_key, g_key, r_key, l_key)
+            if selected_filter == filt_str or selected_filter == trans_filt:
+                matching_files.append(file_data)
+                
+        # Apply suffix-based filtering if split/monochrome files are mixed with original files
+        trans_selected_filter = match_filter_band(selected_filter, v_key, b_key, g_key, r_key, l_key) or selected_filter
+        target_suffix_parts = []
+        if trans_selected_filter == "G":
+            target_suffix_parts = ["_sp_g.fits", "_sp_g.fit", "_g.fits", "_g.fit"]
+        elif trans_selected_filter == "R":
+            target_suffix_parts = ["_sp_r.fits", "_sp_r.fit", "_r.fits", "_r.fit"]
+        elif trans_selected_filter == "B":
+            target_suffix_parts = ["_sp_b.fits", "_sp_b.fit", "_b.fits", "_b.fit"]
+        elif trans_selected_filter == "L":
+            target_suffix_parts = ["_sp_l.fits", "_sp_l.fit", "_l.fits", "_l.fit"]
+        elif trans_selected_filter == "V":
+            if g_key and (g_key in ["G", "GREEN", "GMAG"] or "G" in g_key):
+                target_suffix_parts = ["_sp_g.fits", "_sp_g.fit", "_g.fits", "_g.fit"]
+            elif b_key and (b_key in ["B", "BLUE", "BMAG"] or "B" in b_key):
+                target_suffix_parts = ["_sp_b.fits", "_sp_b.fit", "_b.fits", "_b.fit"]
+            elif r_key and (r_key in ["R", "RED", "RMAG"] or "R" in r_key):
+                target_suffix_parts = ["_sp_r.fits", "_sp_r.fit", "_r.fits", "_r.fit"]
+            elif l_key and (l_key in ["L", "LUM", "LUMINANCE", "LMAG"] or "L" in l_key):
+                target_suffix_parts = ["_sp_l.fits", "_sp_l.fit", "_l.fits", "_l.fit"]
+                
+        if target_suffix_parts and matching_files:
+            has_split_files = any(
+                any(file_data['path'].lower().endswith(sfx) for sfx in target_suffix_parts)
+                for file_data in matching_files
+            )
+            if has_split_files:
+                matching_files = [
+                    fd for fd in matching_files
+                    if any(fd['path'].lower().endswith(sfx) for sfx in target_suffix_parts)
+                ]
+                
+        files = [fd['path'] for fd in matching_files]
         
         if not files:
             messagebox.showwarning("No Matching Files", f"None of the checked files match the selected filter: {selected_filter}")
@@ -4936,7 +5187,7 @@ def run_config_gui(pipeline_callback=None):
                 f"{s.get('n_valid', 0)}", flag, vsx_name, vsx_type, catalog_id
             ), tags=(tag,) if tag else ())
             
-    def sort_column(col):
+    def sort_dm_column(col):
         if dm_tree.sort_col == col:
             dm_tree.sort_desc = not dm_tree.sort_desc
         else:
@@ -5258,19 +5509,19 @@ def run_config_gui(pipeline_callback=None):
     chk_show_non.pack(side=tk.LEFT, padx=10)
 
     # Task 2: Setup Table Headings
-    dm_tree.heading("ID", text="ID", command=lambda: sort_column("ID"))
+    dm_tree.heading("ID", text="ID", command=lambda: sort_dm_column("ID"))
     dm_tree.heading("RA (hms)", text="RA (hms)")
     dm_tree.heading("Dec (dms)", text="Dec (dms)")
-    dm_tree.heading("RA (deg)", text="RA (deg)", command=lambda: sort_column("RA (deg)"))
-    dm_tree.heading("Dec (deg)", text="Dec (deg)", command=lambda: sort_column("Dec (deg)"))
-    dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_column("Mean Mag"))
-    dm_tree.heading("RMS", text="RMS", command=lambda: sort_column("RMS"))
-    dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_column("Excess"))
-    dm_tree.heading("Valid", text="Valid", command=lambda: sort_column("Valid"))
-    dm_tree.heading("Flag", text="Flag", command=lambda: sort_column("Flag"))
-    dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_column("VSX Name"))
-    dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_column("VSX Type"))
-    dm_tree.heading("Catalog ID", text="Catalog ID", command=lambda: sort_column("Catalog ID"))
+    dm_tree.heading("RA (deg)", text="RA (deg)", command=lambda: sort_dm_column("RA (deg)"))
+    dm_tree.heading("Dec (deg)", text="Dec (deg)", command=lambda: sort_dm_column("Dec (deg)"))
+    dm_tree.heading("Mean Mag", text="Mean Mag", command=lambda: sort_dm_column("Mean Mag"))
+    dm_tree.heading("RMS", text="RMS", command=lambda: sort_dm_column("RMS"))
+    dm_tree.heading("Excess", text="Excess RMS ▼", command=lambda: sort_dm_column("Excess"))
+    dm_tree.heading("Valid", text="Valid", command=lambda: sort_dm_column("Valid"))
+    dm_tree.heading("Flag", text="Flag", command=lambda: sort_dm_column("Flag"))
+    dm_tree.heading("VSX Name", text="VSX Name", command=lambda: sort_dm_column("VSX Name"))
+    dm_tree.heading("VSX Type", text="VSX Type", command=lambda: sort_dm_column("VSX Type"))
+    dm_tree.heading("Catalog ID", text="Catalog ID", command=lambda: sort_dm_column("Catalog ID"))
     
     # Task 2: Setup Column Widths
     dm_tree.column("ID", width=70, anchor=tk.CENTER)
@@ -5505,7 +5756,6 @@ def run_config_gui(pipeline_callback=None):
 
     # Auto-load previous session
     load_session()
-
     # Run the UI loop
     root.mainloop()
 

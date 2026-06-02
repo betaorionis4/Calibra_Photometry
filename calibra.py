@@ -12,7 +12,7 @@ log.setLevel('WARNING')
 from photometry.star_detection import detect_stars
 from photometry.psf_fitting import refine_coordinates_psf
 from photometry.aperture_phot import perform_aperture_photometry
-from photometry.calibration import match_and_calibrate
+from photometry.calibration import match_and_calibrate, match_filter_band
 from photometry.shift_analysis import generate_shift_report
 from photometry.image_calibration import calibrate_image
 import csv
@@ -155,8 +155,14 @@ def process_file(fits_filename, config):
 
     # 4. Zero Point Calibration
     filter_name = header.get('FILTER', 'V')
+    v_key = config.get('filter_v_keyword', 'VMAG').upper()
     b_key = config.get('filter_b_keyword', 'BMAG').upper()
-    if b_key in filter_name.upper():
+    g_key = config.get('filter_g_keyword', 'GMAG').upper()
+    r_key = config.get('filter_r_keyword', 'RMAG').upper()
+    l_key = config.get('filter_l_keyword', 'LMAG').upper()
+    
+    band = match_filter_band(filter_name, v_key, b_key, g_key, r_key, l_key)
+    if band == "B":
         def_zp = config.get('default_zp_b', 24.0)
     else:
         def_zp = config.get('default_zp_v', 24.0)
