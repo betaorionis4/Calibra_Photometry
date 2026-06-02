@@ -111,6 +111,8 @@ class AdvancedPlotWindow(tk.Toplevel):
         self.results = results
         self.target_name = target_name
         self.filter_name = filter_name
+        self.rebinned_results = None  # cached rebinned data
+        self.rebin_var = tk.StringVar(value="None")
         
         self.visibility_state = {"Target": tk.BooleanVar(value=True), "Check Star": tk.BooleanVar(value=True)}
         
@@ -156,9 +158,27 @@ class AdvancedPlotWindow(tk.Toplevel):
         self.redraw_plot()
         
     def build_ui(self):
-        left_panel = tk.Frame(self, width=420, bg="#f8f9fa", padx=10, pady=10)
-        left_panel.pack(side="left", fill="y")
-        left_panel.pack_propagate(False)
+        # --- Scrollable left panel ---
+        left_outer = tk.Frame(self, width=420, bg="#f8f9fa")
+        left_outer.pack(side="left", fill="y")
+        left_outer.pack_propagate(False)
+        
+        left_canvas = tk.Canvas(left_outer, bg="#f8f9fa", highlightthickness=0, width=400)
+        left_scrollbar = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        left_panel = tk.Frame(left_canvas, bg="#f8f9fa", padx=10, pady=10)
+        
+        left_panel.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        left_canvas.create_window((0, 0), window=left_panel, anchor="nw", width=400)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+        
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left_scrollbar.pack(side="right", fill="y")
+        
+        # Mouse wheel scrolling for the left panel
+        def _on_left_mousewheel(event):
+            left_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        left_canvas.bind("<Enter>", lambda _: left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel))
+        left_canvas.bind("<Leave>", lambda _: left_canvas.unbind_all("<MouseWheel>"))
         
         right_panel = tk.Frame(self, bg="white")
         right_panel.pack(side="right", fill="both", expand=True)
@@ -171,7 +191,7 @@ class AdvancedPlotWindow(tk.Toplevel):
         self.toolbar.update()
         
         lf_vis = tk.LabelFrame(left_panel, text="Visibility, Labels & Styles", bg="#f8f9fa", padx=5, pady=5)
-        lf_vis.pack(fill="both", expand=True, pady=(0, 10))
+        lf_vis.pack(fill="x", pady=(0, 10))
         
         vis_sf = ScrollableFrame(lf_vis)
         vis_sf.pack(fill="both", expand=True)
@@ -230,14 +250,54 @@ class AdvancedPlotWindow(tk.Toplevel):
         e_ylabel.pack(anchor="w", pady=(0, 10))
         e_ylabel.bind("<Return>", lambda e: self.redraw_plot())
         
+        # --- Rebinning Section ---
+        lf_rebin = tk.LabelFrame(left_panel, text="Data Rebinning", bg="#f8f9fa", padx=5, pady=5)
+        lf_rebin.pack(fill="x", pady=(0, 10))
+        
+        rebin_row = tk.Frame(lf_rebin, bg="#f8f9fa")
+        rebin_row.pack(fill="x", pady=2)
+        tk.Label(rebin_row, text="Bin Size:", bg="#f8f9fa").pack(side="left", padx=(0, 5))
+        cb_rebin = ttk.Combobox(rebin_row, textvariable=self.rebin_var, 
+                                values=["None", "2", "4", "8", "16"], width=6, state="readonly")
+        cb_rebin.pack(side="left")
+        cb_rebin.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
+        
+        self.rebin_info_var = tk.StringVar(value="")
+        tk.Label(lf_rebin, textvariable=self.rebin_info_var, bg="#f8f9fa", fg="#555", 
+                 font=("Arial", 8, "italic")).pack(anchor="w", pady=(2, 0))
+        
+        btn_export_rebin = tk.Button(lf_rebin, text="Export Rebinned CSV", 
+                                     command=self.export_rebinned_csv, bg="#6a1b9a", fg="white", 
+                                     font=("Arial", 9), pady=3)
+        btn_export_rebin.pack(fill="x", pady=(5, 0))
+        
+        # --- Action Buttons ---
         btn_apply = tk.Button(left_panel, text="Apply & Redraw", command=self.redraw_plot, bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), pady=5)
         btn_apply.pack(fill="x", pady=(10, 5))
         
         btn_export = tk.Button(left_panel, text="Save High-Res Image", command=self.export_plot, bg="#2e7d32", fg="white", font=("Arial", 10), pady=5)
         btn_export.pack(fill="x")
         
+    def _get_active_results(self):
+        """Returns rebinned results if rebinning is active, otherwise original."""
+        from photometry.time_series import rebin_results
+        rebin_str = self.rebin_var.get()
+        if rebin_str == "None" or not rebin_str:
+            self.rebinned_results = None
+            self.rebin_info_var.set("")
+            return self.results
+        
+        bin_size = int(rebin_str)
+        self.rebinned_results = rebin_results(self.results, bin_size)
+        n_orig = len(self.results)
+        n_rebin = len(self.rebinned_results)
+        self.rebin_info_var.set(f"{n_orig} points → {n_rebin} bins (bin size {bin_size})")
+        return self.rebinned_results
+    
     def redraw_plot(self):
         from photometry.time_series import plot_light_curve
+        active_results = self._get_active_results()
+        
         v_state = {k: v.get() for k, v in self.visibility_state.items()}
         opts = {k: v.get() for k, v in self.plot_options.items()}
         
@@ -248,7 +308,7 @@ class AdvancedPlotWindow(tk.Toplevel):
         if not str(opts["xlabel"]).strip():
             del opts["xlabel"]
             
-        plot_light_curve(self.results, self.target_name, "", ax=self.ax, visibility_state=v_state, plot_options=opts)
+        plot_light_curve(active_results, self.target_name, "", ax=self.ax, visibility_state=v_state, plot_options=opts)
         self.canvas.draw()
         
     def export_plot(self):
@@ -259,6 +319,62 @@ class AdvancedPlotWindow(tk.Toplevel):
         if filepath:
             self.fig.savefig(filepath, dpi=300, bbox_inches='tight')
             messagebox.showinfo("Saved", f"Plot saved to:\n{filepath}")
+    
+    def export_rebinned_csv(self):
+        """Exports the currently rebinned data (or original if no rebinning) to CSV."""
+        from tkinter import filedialog
+        active = self._get_active_results()
+        if not active:
+            messagebox.showwarning("No Data", "No data available to export.")
+            return
+        
+        rebin_str = self.rebin_var.get()
+        suffix = f"_rebin{rebin_str}" if rebin_str != "None" else ""
+        default_name = f"light_curve_{self.target_name.replace(' ', '_')}{suffix}.csv"
+        
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", 
+                                                initialfile=default_name,
+                                                filetypes=[("CSV File", "*.csv")])
+        if not filepath:
+            return
+        
+        import csv
+        fieldnames = ['file', 'hjd', 'jd', 'mag', 'mag_err', 'check_mag', 'snr', 
+                      'airmass', 'fwhm', 'flag']
+        if rebin_str != "None":
+            fieldnames.append('n_binned')
+        
+        try:
+            with open(filepath, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for r in active:
+                    row = {k: r.get(k, '') for k in fieldnames}
+                    # Format numeric values
+                    if isinstance(row.get('hjd'), (int, float)):
+                        row['hjd'] = f"{row['hjd']:.6f}"
+                    if isinstance(row.get('jd'), (int, float)):
+                        row['jd'] = f"{row['jd']:.6f}"
+                    if isinstance(row.get('mag'), (int, float)):
+                        row['mag'] = f"{row['mag']:.4f}"
+                    if isinstance(row.get('mag_err'), (int, float)):
+                        row['mag_err'] = f"{row['mag_err']:.4f}"
+                    if isinstance(row.get('check_mag'), (int, float)) and not np.isnan(row['check_mag']):
+                        row['check_mag'] = f"{row['check_mag']:.4f}"
+                    else:
+                        row['check_mag'] = 'N/A'
+                    if isinstance(row.get('snr'), (int, float)):
+                        row['snr'] = f"{row['snr']:.1f}"
+                    if isinstance(row.get('airmass'), (int, float)):
+                        row['airmass'] = f"{row['airmass']:.3f}"
+                    if isinstance(row.get('fwhm'), (int, float)) and not np.isnan(row['fwhm']):
+                        row['fwhm'] = f"{row['fwhm']:.2f}"
+                    else:
+                        row['fwhm'] = 'N/A'
+                    writer.writerow(row)
+            messagebox.showinfo("Exported", f"Rebinned data saved to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to save CSV:\n{e}")
 def scan_fits_header(filepath):
     from astropy.io import fits
     import os

@@ -27,6 +27,7 @@ Calibra is an automated, high-precision Python toolkit designed for processing a
    - [3.3 Mathematical Zero-Point Averaging & Uncertainty Propagation](#33-mathematical-zero-point-averaging--uncertainty-propagation)
    - [3.4 Single Reference Star Photometry Mode](#34-single-reference-star-photometry-mode)
    - [3.5 Interactive Plot Customization](#35-interactive-plot-customization)
+   - [3.7 Data Rebinning for Improved SNR](#37-data-rebinning-for-improved-snr)
 5. [Chapter 4: Data Mining & Variable Star Discovery](#chapter-4-data-mining--variable-star-discovery)
    - [4.1 Statistical Star Tracking & Excess Scatter Detection](#41-statistical-star-tracking--excess-scatter-detection)
    - [4.2 VSX Catalog Integration & Candidate Validation](#42-vsx-catalog-integration--candidate-validation)
@@ -227,6 +228,45 @@ To ensure the pipeline is robust against duplicate or mixed data configurations,
     *   It will automatically isolate and process **only** the split channel files.
     *   The original raw frames are automatically excluded from the run, preventing coordinate alignment, epoch duplication, and shape/size mismatch errors.
 
+### 3.7 Data Rebinning for Improved SNR
+When individual exposures are short and signal-to-noise ratios (SNR) are low, consecutive measurements can be combined ("rebinned") to produce a smoother light curve with reduced scatter. This is particularly useful for faint targets or rapid-cadence time-series observations.
+
+*   **Accessing Rebinning**:
+    1. Run the time-series analysis to generate the light curve.
+    2. Click **⚙️ Customize Plot** to open the **Advanced Plot Customizer** window.
+    3. In the **Data Rebinning** section on the left panel, select a **Bin Size** from the dropdown: `None` (original data), `2`, `4`, `8`, or `16`.
+    4. The plot updates immediately. An info label shows the transformation, e.g. "80 points → 10 bins (bin size 8)".
+
+*   **Rebinning Algorithm**:
+    Consecutive groups of $n$ measurements (where $n$ is the chosen bin size) are combined into a single data point. If the total number of measurements is not evenly divisible by $n$, the final bin contains the remaining points.
+
+    **Magnitude**: The rebinned magnitude is computed as the **inverse-variance weighted mean**:
+    $$m_{\text{bin}} = \frac{\sum_{i=1}^{n} w_i \cdot m_i}{\sum_{i=1}^{n} w_i}, \quad w_i = \frac{1}{\sigma_i^2}$$
+    where $m_i$ and $\sigma_i$ are the magnitude and uncertainty of the $i$-th measurement. This weighting scheme ensures that higher-precision measurements contribute more strongly to the average.
+
+    **Uncertainty**: The formal uncertainty of the weighted mean is:
+    $$\sigma_{\text{formal}} = \frac{1}{\sqrt{\sum_{i=1}^{n} w_i}}$$
+    For bins with more than one point, the pipeline also estimates a scatter-based uncertainty from the weighted residuals:
+    $$\sigma_{\text{scatter}} = \frac{1}{\sqrt{n}} \sqrt{\frac{\sum_{i=1}^{n} w_i \cdot (m_i - m_{\text{bin}})^2}{\sum_{i=1}^{n} w_i}}$$
+    The final reported uncertainty is the **larger** of $\sigma_{\text{formal}}$ and $\sigma_{\text{scatter}}$, ensuring that the error bar is never underestimated when the data within a bin show excess scatter beyond what the formal errors predict.
+
+    **Time**: The rebinned HJD (and JD) is the arithmetic mean of the constituent times, representing the mid-point of the bin.
+
+    **SNR**: Combined in quadrature: $\text{SNR}_{\text{bin}} = \sqrt{\sum_{i=1}^{n} \text{SNR}_i^2}$.
+
+    **Check star and reference stars**: Averaged with equal weights (mean of constituent values).
+
+    **Airmass and FWHM**: Arithmetic mean of constituent values.
+
+*   **Outlier Status**:
+    Rebinned data points are always assigned an `OK` flag regardless of whether the original constituent points were marked as `SUSPECT`. The rationale is that the averaging process itself smooths out individual outlier measurements.
+
+*   **Non-Destructive Operation**:
+    Rebinning never modifies the original photometry results. Selecting `None` in the dropdown always returns to the full-resolution light curve. Different bin sizes can be tested interactively without re-running the photometry pipeline.
+
+*   **Exporting Rebinned Data**:
+    Click **Export Rebinned CSV** in the Data Rebinning section to save the rebinned light curve to a CSV file. The exported file includes columns for `file`, `hjd`, `jd`, `mag`, `mag_err`, `check_mag`, `snr`, `airmass`, `fwhm`, `flag`, and `n_binned` (the number of original points in each bin).
+
 ---
 
 # Chapter 4: Data Mining & Variable Star Discovery
@@ -369,6 +409,7 @@ Allows users to visualize catalog variables directly on the FITS image.
 ### I
 *   Instrumental Magnitude: [Section 2.1]
 *   Interactive Plot Customizer: [Section 3.5]
+*   Inverse-Variance Weighted Mean: [Section 3.7]
 
 ### L
 *   Light Curve: [Section 3]
@@ -393,6 +434,7 @@ Allows users to visualize catalog variables directly on the FITS image.
 
 ### R
 *   Read Noise: [Section 2.1]
+*   Rebinning (Data): [Section 3.7]
 *   Reference Selection: [Section 2.3]
 
 ### S

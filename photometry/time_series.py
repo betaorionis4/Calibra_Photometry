@@ -514,6 +514,128 @@ def save_aavso_report(results, output_path, target_name, filter_name, obs_code,
         print(f"Error saving AAVSO report: {e}")
         return False
 
+def rebin_results(results, bin_size=2):
+    """
+    Rebins time-series photometry results by grouping consecutive measurements.
+    
+    Uses inverse-variance weighted mean for magnitudes and proper uncertainty
+    propagation. ALL data points (including SUSPECT) are included in the binning.
+    
+    Parameters
+    ----------
+    results : list of dict
+        Original photometry results, sorted by time.
+    bin_size : int
+        Number of consecutive measurements to combine (e.g. 2, 4, 8).
+        
+    Returns
+    -------
+    list of dict
+        Rebinned results with the same structure as the input.
+    """
+    if bin_size <= 1 or not results:
+        return list(results)
+    
+    rebinned = []
+    n = len(results)
+    
+    for start in range(0, n, bin_size):
+        chunk = results[start:start + bin_size]
+        if not chunk:
+            continue
+        
+        # --- Target magnitude: inverse-variance weighted mean ---
+        mags = np.array([r['mag'] for r in chunk])
+        errs = np.array([r['mag_err'] for r in chunk])
+        
+        # Guard against zero or near-zero errors
+        valid_mask = (errs > 0) & np.isfinite(mags) & np.isfinite(errs)
+        if not np.any(valid_mask):
+            continue
+        
+        mags_v = mags[valid_mask]
+        errs_v = errs[valid_mask]
+        weights = 1.0 / (errs_v ** 2)
+        w_sum = np.sum(weights)
+        
+        wmean_mag = np.sum(weights * mags_v) / w_sum
+        # Combined uncertainty: 1/sqrt(sum(1/sigma_i^2))
+        wmean_err = 1.0 / np.sqrt(w_sum)
+        
+        # If bin has >1 point, also account for scatter (take larger of formal and scatter-based)
+        if len(mags_v) > 1:
+            scatter = np.sqrt(np.sum(weights * (mags_v - wmean_mag)**2) / w_sum)
+            wmean_err = max(wmean_err, scatter / np.sqrt(len(mags_v)))
+        
+        # --- Time: simple mean of HJD and JD ---
+        avg_hjd = np.mean([r['hjd'] for r in chunk])
+        avg_jd = np.mean([r['jd'] for r in chunk])
+        
+        # --- Airmass: simple mean ---
+        avg_airmass = np.mean([r['airmass'] for r in chunk])
+        
+        # --- SNR: quadrature sum (SNR improves as sqrt(N)) ---
+        snrs = np.array([r['snr'] for r in chunk if r['snr'] > 0])
+        combined_snr = np.sqrt(np.sum(snrs**2)) if len(snrs) > 0 else 0.0
+        
+        # --- FWHM: mean ---
+        fwhms = [r.get('fwhm', np.nan) for r in chunk]
+        valid_fwhms = [f for f in fwhms if not np.isnan(f)]
+        avg_fwhm = np.mean(valid_fwhms) if valid_fwhms else np.nan
+        
+        # --- Check star: weighted mean if available ---
+        check_mags = np.array([r.get('check_mag', np.nan) for r in chunk])
+        valid_check = np.isfinite(check_mags)
+        if np.any(valid_check):
+            # Use equal weights for check star (no per-point error available)
+            avg_check = np.mean(check_mags[valid_check])
+        else:
+            avg_check = np.nan
+        
+        # --- Zero point ---
+        avg_zp = np.mean([r.get('zp_avg', 0) for r in chunk])
+        avg_zp_err = np.mean([r.get('zp_err', 0) for r in chunk])
+        
+        # --- Reference stars: mean for each ---
+        ref_mags_combined = {}
+        all_refs = set()
+        for r in chunk:
+            if 'ref_mags' in r:
+                all_refs.update(r['ref_mags'].keys())
+        for ref_name in all_refs:
+            ref_vals = [r['ref_mags'][ref_name] for r in chunk 
+                       if 'ref_mags' in r and ref_name in r['ref_mags'] 
+                       and not np.isnan(r['ref_mags'].get(ref_name, np.nan))]
+            if ref_vals:
+                ref_mags_combined[ref_name] = np.mean(ref_vals)
+        
+        # --- Flag: rebinning averages out outliers, so always mark OK ---
+        combined_flag = 'OK'
+        
+        # --- File name: range ---
+        files = [r['file'] for r in chunk]
+        file_label = f"{files[0]}..{files[-1]}" if len(files) > 1 else files[0]
+        
+        rebinned.append({
+            'file': file_label,
+            'jd': avg_jd,
+            'hjd': avg_hjd,
+            'airmass': avg_airmass,
+            'mag': wmean_mag,
+            'mag_err': wmean_err,
+            'check_mag': avg_check,
+            'snr': combined_snr,
+            'fwhm': avg_fwhm,
+            'zp_avg': avg_zp,
+            'zp_err': avg_zp_err,
+            'n_ensemble': chunk[0].get('n_ensemble', 0),
+            'ref_mags': ref_mags_combined,
+            'flag': combined_flag,
+            'n_binned': len(chunk)
+        })
+    
+    return rebinned
+
 def plot_light_curve(results, target_name, output_path, ax=None, visibility_state=None, plot_options=None):
     """ Plots the light curve. If ax is provided, plots to that axes. """
     if not results: return
