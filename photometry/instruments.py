@@ -54,7 +54,8 @@ def template(name):
                        'osc': False, 'gain': None, 'offset': None},
         'site': {'name': '', 'lat': None, 'lon': None, 'elevation_m': None, 'timezone': ''},
         'filters': {b: {'fits_name': '', 'nina_position': None} for b in BANDS},
-        'planning': {'exposures_s': [30, 60, 120], 'mag_bright': None, 'mag_faint': None},
+        'planning': {'exposures_s': [30, 60, 120], 'mag_bright': None, 'mag_faint': None,
+                     'zp_v_e': None, 'sky_mag': 20.0, 'seeing_arcsec': 3.0},
         'settings': {}, 'settings_saved': '',
     }
 

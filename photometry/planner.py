@@ -302,6 +302,11 @@ def plan(targets, times, jd, lat, lon, alt_min=30.0, sector=(0, 360), moon_min=N
     if moon_min is not None:
         ok &= ~moon_up | (msep >= moon_min)
     dt_h = (jd[1] - jd[0]) * 24.0 if len(jd) > 1 else 0.0
+    # meridian passage (upper culmination) nearest to the middle of the window
+    jd_mid = 0.5 * (jd[0] + jd[-1])
+    ha_mid = (gmst_deg(jd_mid) + lon - ra_d) % 360.0
+    ha_mid = np.where(ha_mid > 180, ha_mid - 360, ha_mid)
+    transit_jd = jd_mid - ha_mid / 360.98564736629
     rows = []
     for i, t in enumerate(targets):
         n_ok = int(ok[i].sum())
@@ -315,9 +320,40 @@ def plan(targets, times, jd, lat, lon, alt_min=30.0, sector=(0, 360), moon_min=N
                      'first': times[idx[0]], 'last': times[idx[-1]], 'best': times[k_best],
                      'best_alt': float(alt[i, k_best]), 'best_az': float(az[i, k_best]),
                      'max_alt': float(np.max(np.where(night['dark'], alt[i], -99))),
-                     'moon_sep': float(np.min(msep[i])), 'alt': alt[i], 'az': az[i], 'ok': ok[i]})
+                     'moon_sep': float(np.min(msep[i])), 'alt': alt[i], 'az': az[i], 'ok': ok[i],
+                     'transit': times[0] + _dt.timedelta(days=float(transit_jd[i] - jd[0])),
+                     'transit_in_window': bool(jd[0] <= transit_jd[i] <= jd[-1])})
     rows.sort(key=lambda r: (-r['hours'], -r['best_alt']))
     return rows, night
+
+
+_GREEK = ['alf', 'bet', 'gam', 'del', 'eps', 'zet', 'eta', 'the', 'iot', 'kap', 'lam', 'mu', 'nu', 'xi', 'omi',
+          'pi', 'rho', 'sig', 'tau', 'ups', 'phi', 'chi', 'psi', 'ome']
+
+
+def name_sort_key(name):
+    """Sort GCVS names by constellation first, then in the GCVS order of the designation:
+    Bayer letters (alf ... ome), R ... Z, RR ... ZZ, AA ... QZ, V335 ... (numbers).
+    Names without a constellation (e.g. 'NGC 869') come after, alphabetically."""
+    n = str(name or '').strip()
+    m = re.fullmatch(r'(.+?)\s+([A-Za-z]{3})', n)
+    if not m:
+        return (1, n.lower(), 0, 0, '')
+    des, con = m.group(1).strip(), m.group(2).capitalize()
+    d = des.lower()
+    g = re.fullmatch(r'([a-z]+)(\d*)', d)
+    if g and g.group(1) in _GREEK:
+        return (0, con, 0, _GREEK.index(g.group(1)) * 100 + int(g.group(2) or 0), d)
+    if re.fullmatch(r'[A-Z]', des):
+        return (0, con, 1, ord(des) - ord('R'), d)
+    if re.fullmatch(r'[A-Z]{2}', des):
+        a, b = des
+        grp = 0 if a >= 'R' else 1                      # RR..ZZ before AA..QZ
+        return (0, con, 2 + grp, (ord(a) - 65) * 26 + (ord(b) - 65), d)
+    v = re.fullmatch(r'V\s*(\d+)', des, re.IGNORECASE)
+    if v:
+        return (0, con, 4, int(v.group(1)), d)
+    return (0, con, 5, 0, d)
 
 
 def compass(az):
