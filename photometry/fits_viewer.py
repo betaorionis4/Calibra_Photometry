@@ -7,6 +7,8 @@ photometry, and selecting variable/reference stars.
 import numpy as np
 import os
 import csv
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib.patches as patches
@@ -54,7 +56,8 @@ class FITSViewer:
         # Load FITS Data and WCS header
         try:
             with fits.open(fits_path) as hdul:
-                self.data = hdul[0].data.astype(float)
+                # v4.16: float32 halves the memory (a 6248x4176 frame used 209 MB as float64)
+                self.data = hdul[0].data.astype(np.float32)
                 self.header = hdul[0].header
                 self.wcs = WCS(self.header)
                 self.has_wcs = self.wcs.has_celestial
@@ -86,8 +89,14 @@ class FITSViewer:
         self.vsx_patches = []
         self.vsx_texts = []
         self.matched_vsx_stars = []
-        if self.has_wcs:
-            self._load_vsx_variables()
+        # v4.34: catalogue data (field stars, VSX) are loaded in background threads after the
+        # window is shown - local copies first; online only for what is missing.
+        self._vsx_list = None            # all VSX/GCVS variables of the frame (None = not loaded yet)
+        self._vsx_done = threading.Event()
+        self._field_stars = None         # reference-catalogue stars of the whole frame (local copy)
+        self._field_coords = None
+        self._field_state = 'loading'    # 'loading' | 'local' | 'none'
+        self._closed = False
         
         # UI Setup
         self.parent.title(f"FITS Viewer: {os.path.basename(fits_path)}")
@@ -261,12 +270,33 @@ class FITSViewer:
         zscale = ZScaleInterval(contrast=0.15)
         vmin, vmax = zscale.get_limits(self.data)
         
-        # Ensure the background isn't blown out by noise
-        bg_median = np.nanmedian(self.data)
+        # Ensure the background isn't blown out by noise (median of a subsample - v4.34)
+        bg_median = np.nanmedian(self.data[::4, ::4])
         if vmin < bg_median:
             vmin = bg_median
             
-        self.im = self.ax.imshow(self.data, origin='lower', cmap='Greys_r', vmin=vmin, vmax=vmax)
+        # v4.34: faster display - a binned preview for the full view (large frames), the full
+        # resolution once zoomed in; scaling after resampling (interpolation_stage='data').
+        ny_, nx_ = self.data.shape
+        self._bin = max(1, int(np.ceil(max(nx_, ny_) / 2400.0)))
+        self._preview = None
+        if self._bin > 1:
+            b = self._bin
+            hb, wb = ny_ // b, nx_ // b
+            self._preview = self.data[:hb * b, :wb * b].reshape(hb, b, wb, b).mean(axis=(1, 3), dtype=np.float32)
+            self._preview_extent = (-0.5, wb * b - 0.5, -0.5, hb * b - 0.5)
+        self._full_extent = (-0.5, nx_ - 0.5, -0.5, ny_ - 0.5)
+        self._showing_preview = self._preview is not None
+        kw = dict(origin='lower', cmap='Greys_r', vmin=vmin, vmax=vmax)
+        try:
+            kw_ = dict(kw, interpolation_stage='data')
+            self.im = self.ax.imshow(self._preview if self._showing_preview else self.data,
+                                     extent=self._preview_extent if self._showing_preview else self._full_extent, **kw_)
+        except TypeError:                                    # old matplotlib
+            self.im = self.ax.imshow(self._preview if self._showing_preview else self.data,
+                                     extent=self._preview_extent if self._showing_preview else self._full_extent, **kw)
+        self.ax.set_xlim(-0.5, nx_ - 0.5)
+        self.ax.set_ylim(-0.5, ny_ - 0.5)
         self.ax.set_title(os.path.basename(fits_path))
         
         self.fig.subplots_adjust(left=0.15, right=0.95, top=0.92, bottom=0.12)
@@ -290,8 +320,11 @@ class FITSViewer:
                 pass
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.canvas_frame)
-        self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.draw_idle()                              # v4.34: one draw, when the window is shown
+        if self._preview is not None:
+            self.ax.callbacks.connect('xlim_changed', self._update_resolution)
+            self.ax.callbacks.connect('ylim_changed', self._update_resolution)
         
         # Radial Profile Plot Setup
         self.profile_fig = Figure(figsize=(4, 4))
@@ -311,16 +344,12 @@ class FITSViewer:
         self.canvas.mpl_connect('key_press_event', self.on_key)
         self.canvas.get_tk_widget().bind("<Enter>", lambda e: self.canvas.get_tk_widget().focus_set())
         
-        # Load Initial Stars if provided (delayed to ensure UI is ready)
-        if self.initial_stars:
-            self.parent.after(500, self._auto_mark_initial_stars)
-
         # Draw AAVSO sequence markers if provided
         if self.aavso_stars:
-            self.parent.after(800, self._draw_aavso_markers)
-            
-        if self.has_wcs:
-            self.parent.after(900, self._draw_vsx_markers)
+            self.parent.after(300, self._draw_aavso_markers)
+
+        # v4.34: catalogue data and initial stars in the background (window usable at once)
+        self.parent.after(50, self._start_background)
         
         # Right-click Context Menu for star role assignment
         self.context_menu = tk.Menu(self.parent, tearoff=0)
@@ -359,8 +388,7 @@ class FITSViewer:
             return
             
         # Determine filter from header to show relevant magnitude
-        header_filt = str(self.header.get('FILTER', 'V')).upper()
-        mag_key = 'V_mag' if 'V' in header_filt else 'B_mag'
+        mag_key = 'B_mag' if self._band() == 'B' else 'V_mag'
         
         for star in self.aavso_stars:
             try:
@@ -388,7 +416,7 @@ class FITSViewer:
         
         self.canvas.draw_idle()
 
-    def _load_vsx_variables(self):
+    def _load_vsx_variables(self, vsx_list_given=None):
         """
         Query AAVSO VSX catalog for variables in the FITS frame,
         and cross-match them with detected stars in self.results_data.
@@ -401,13 +429,15 @@ class FITSViewer:
             ny, nx = self.data.shape
             center_sky = self.wcs.pixel_to_world(nx / 2, ny / 2)
             corner_sky = self.wcs.pixel_to_world(0, 0)
-            radius_arcmin = center_sky.separation(corner_sky).arcmin
+            # v4.16: radius = largest centre-to-corner distance (was capped at 45',
+            # which covered only about half of a 2.4 x 1.6 deg frame)
+            corners = [self.wcs.pixel_to_world(cx, cy) for cx, cy in ((0, 0), (nx - 1, 0), (0, ny - 1), (nx - 1, ny - 1))]
+            radius_arcmin = max(center_sky.separation(c).arcmin for c in corners) + 1.0
+            radius_arcmin = max(5.0, min(180.0, radius_arcmin))
             
-            # Clamp search radius between 5 and 45 arcminutes for safety to align with pipeline defaults
-            radius_arcmin = max(5.0, min(45.0, radius_arcmin))
-            
-            # Fetch from catalog (uses caching internally)
-            vsx_list = get_vsx_stars(center_sky.ra.deg, center_sky.dec.deg, radius_arcmin=radius_arcmin, verbose=False)
+            # Fetch from catalog (uses caching internally); v4.34: list may be given (background thread)
+            vsx_list = vsx_list_given if vsx_list_given is not None else \
+                get_vsx_stars(center_sky.ra.deg, center_sky.dec.deg, radius_arcmin=radius_arcmin, verbose=False)
             if not vsx_list:
                 print(f"FITS Viewer: No VSX stars found in this region (radius {radius_arcmin:.1f} arcmin).")
                 return
@@ -470,6 +500,174 @@ class FITSViewer:
                     
         except Exception as e:
             print(f"Error loading VSX variables: {e}")
+
+    # ------------------------------------------------------------------ v4.34: background loading
+    def _alive(self):
+        if self._closed:
+            return False
+        try:
+            return bool(self.parent.winfo_exists())
+        except Exception:
+            return False
+
+    def _ui(self, fn):
+        """Run fn in the Tk main loop (called from background threads)."""
+        try:
+            self.parent.after(0, lambda: fn() if self._alive() else None)
+        except Exception:
+            pass
+
+    def _frame_circle(self):
+        """(ra, dec, radius_arcmin) of the whole frame."""
+        ny, nx = self.data.shape
+        c = self.wcs.pixel_to_world(nx / 2, ny / 2)
+        corners = [self.wcs.pixel_to_world(cx, cy) for cx, cy in ((0, 0), (nx - 1, 0), (0, ny - 1), (nx - 1, ny - 1))]
+        r = max(c.separation(k).arcmin for k in corners) + 1.0
+        return float(c.ra.deg), float(c.dec.deg), max(5.0, min(180.0, r))
+
+    def _start_background(self):
+        if not self._alive():
+            return
+        if not self.has_wcs:
+            self._field_state = 'none'
+            self._vsx_done.set()
+            if self.initial_stars:
+                print("FITS Viewer: no WCS - initial stars cannot be marked automatically.")
+            return
+        self.status_var.set("Loading catalogue data in the background - the image can already be used ...")
+        threading.Thread(target=self._bg_vsx, daemon=True).start()
+        threading.Thread(target=self._bg_field, daemon=True).start()
+
+    def _bg_vsx(self):
+        """Variables of the frame: local VSX copy / VSX cache / local GCVS list first, VSX online
+        only if needed and reachable. Then markers are drawn."""
+        lst = []
+        try:
+            from photometry import local_catalogs as _lc
+            ra, dec, rad = self._frame_circle()
+            try:
+                lst = get_vsx_stars(ra, dec, radius_arcmin=rad, verbose=False) or []
+            except Exception as e:
+                print(f"FITS Viewer: VSX not available ({e})")
+            gc = _lc.gcvs_in_field(ra, dec, rad) or []
+            if gc:                                  # add GCVS stars that VSX does not list
+                have = np.array([[v['ra_deg'], v['dec_deg']] for v in lst]) if lst else np.zeros((0, 2))
+                for t in gc:
+                    if have.size:
+                        d = np.hypot((have[:, 0] - t['ra']) * np.cos(np.radians(dec)), have[:, 1] - t['dec']) * 3600
+                        if d.min() < 5.0:
+                            continue
+                    lst.append({'id': t.get('name', ''), 'ra_deg': t['ra'], 'dec_deg': t['dec'],
+                                'Type': t.get('type') or '', 'max': t.get('max', np.nan) if t.get('max') not in (None, '') else np.nan,
+                                'min': t.get('min', np.nan) if t.get('min') not in (None, '') else np.nan,
+                                'Period': t.get('period', np.nan) if t.get('period') not in (None, '') else np.nan})
+            self._vsx_list = lst
+            if self._alive():
+                self._load_vsx_variables(vsx_list_given=lst)
+        except Exception as e:
+            print(f"FITS Viewer: variable stars could not be loaded: {e}")
+            self._vsx_list = self._vsx_list or []
+        finally:
+            self._vsx_done.set()
+        self._ui(self._draw_vsx_markers)
+
+    def _bg_field(self):
+        """Resolve names of the initial stars (local GCVS list first) and load the reference
+        catalogue for the whole frame from the LOCAL copy (no online query); then mark the
+        initial stars - their identification is a local look-up."""
+        try:
+            if self.initial_stars:
+                from photometry.names import from_name
+                items = [self.initial_stars.get('variable'), self.initial_stars.get('check')] + \
+                    list(self.initial_stars.get('refs', []))
+                for it in items:
+                    if it and it.get('ra') is None and it.get('name'):
+                        try:
+                            c = from_name(it['name'])
+                            it['ra'], it['dec'] = float(c.ra.deg), float(c.dec.deg)
+                        except Exception as e:
+                            print(f"FITS Viewer: '{it['name']}' could not be resolved ({e}) - not marked.")
+            cat = (self.ref_catalog or '').upper()
+            if any(k in cat for k in ("ATLAS", "APASS", "GAIA", "LANDOLT")):
+                from photometry import local_catalogs as _lc
+                from photometry.calibration import stars_from_local_rows
+                ra, dec, rad = self._frame_circle()
+                t0 = time.time()
+                rows = _lc.query(self.ref_catalog, ra, dec, rad)
+                if rows is not None:
+                    st = stars_from_local_rows(rows, self.ref_catalog)
+                    if st:
+                        self._field_coords = SkyCoord(ra=[s_['ra_deg'] for s_ in st] * u.deg,
+                                                      dec=[s_['dec_deg'] for s_ in st] * u.deg)
+                    self._field_stars = st
+                    self._field_state = 'local'
+                    print(f"FITS Viewer: {len(st)} {self.ref_catalog} stars of the frame from the local copy "
+                          f"({time.time() - t0:.1f} s) - no online queries needed.")
+                else:
+                    self._field_state = 'none'
+            else:
+                self._field_state = 'none'
+        except Exception as e:
+            print(f"FITS Viewer: local catalogue for the frame not available: {e}")
+            self._field_state = 'none'
+        self._vsx_done.wait(timeout=3.0)          # variable flags, if the variables come quickly
+        if self.initial_stars and self._field_state == 'none':
+            # no local copy: identify the initial stars online here (background), cached for marking
+            for it in [self.initial_stars.get('variable'), self.initial_stars.get('check')] + \
+                    list(self.initial_stars.get('refs', [])):
+                if it and it.get('ra') is not None and self._alive():
+                    try:
+                        self._query_catalog(it['ra'], it['dec'])
+                    except Exception:
+                        pass
+        self._ui(self._field_ready)
+
+    def _field_ready(self):
+        msg = {'local': "Catalogue data loaded (local copy).",
+               'none': "Catalogue data: no local copy for this frame - stars are identified online when clicked."}
+        self.status_var.set(msg.get(self._field_state, "") + "  Hover for coordinates | Scroll to zoom | Click to inspect star")
+        if self.initial_stars:
+            self._auto_mark_initial_stars()
+
+    def _update_resolution(self, *_):
+        """Binned preview for wide views, full resolution when zoomed in (v4.34)."""
+        if self._preview is None:
+            return
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        try:
+            w_px = max(1, self.canvas.get_tk_widget().winfo_width())
+        except Exception:
+            w_px = 1000
+        shown = max(abs(x1 - x0), abs(y1 - y0) * 1.5)
+        want_preview = shown / self._bin >= 0.8 * w_px
+        if want_preview != self._showing_preview:
+            self._showing_preview = want_preview
+            self.im.set_data(self._preview if want_preview else self.data)
+            self.im.set_extent(self._preview_extent if want_preview else self._full_extent)
+            self.ax.set_xlim(x0, x1)
+            self.ax.set_ylim(y0, y1)
+
+    def _field_match(self, ra, dec, max_arcsec=3.0):
+        """Nearest star of the locally loaded field catalogue (copy) or None."""
+        if not self._field_stars or self._field_coords is None:
+            return None
+        c = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+        idx, d2d, _ = c.match_to_catalog_sky(self._field_coords)
+        if d2d.arcsec > max_arcsec:
+            return None
+        return dict(self._field_stars[int(idx)])
+
+    def _vsx_match(self, ra, dec, max_arcsec=5.0):
+        if not self._vsx_list:
+            return None
+        cosd = np.cos(np.radians(dec))
+        best, bd = None, 1e9
+        for v in self._vsx_list:
+            d = np.hypot((v['ra_deg'] - ra) * cosd, v['dec_deg'] - dec) * 3600.0
+            if d < bd:
+                best, bd = v, d
+        return best if bd <= max_arcsec else None
 
     def _draw_vsx_markers(self):
         """
@@ -614,17 +812,81 @@ class FITSViewer:
                 
         self.canvas.draw_idle()
 
-    def on_close(self):
+    def _aperture_mag(self, x, y, ap, ann_in, ann_out):
         """
-        Clean up resources and autosave current selections before closing.
+        v4.16: aperture photometry identical to the pipeline / light curves
+        (photutils 'exact' aperture, sigma-clipped annulus median). Returns the
+        instrumental magnitude, or NaN if the aperture is not fully on the image
+        or the net flux is <= 0 (no silent fallback to the Gaussian-fit magnitude).
         """
         try:
-            # Autosave selections and aperture settings back to the main app (Fix)
-            self._on_export_click(quiet=True)
-            self._on_export_ap_click(quiet=True, refresh=False) # Skip refresh on close
-        except:
-            pass
+            from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
+            from photometry.noise import sky_stats
+            ny, nx = self.data.shape
+            if x - ap < -0.5 or y - ap < -0.5 or x + ap > nx - 0.5 or y + ap > ny - 0.5:
+                return np.nan
+            aper = CircularAperture((x, y), r=ap)
+            ann = CircularAnnulus((x, y), r_in=ann_in, r_out=ann_out)
+            raw = float(aperture_photometry(self.data, aper, method='exact')['aperture_sum'][0])
+            med, _, n = sky_stats(ann.to_mask(method='center').get_values(self.data))
+            if n == 0 or not np.isfinite(med):
+                return np.nan
+            net = raw - med * aper.area
+            return -2.5 * np.log10(net) if net > 0 else np.nan
+        except Exception:
+            return np.nan
 
+    def _band(self):
+        """'B' or 'V' for this image, using the central classifier and the
+        filter keywords from Settings (passed in the viewer config)."""
+        from photometry.filters import filter_band
+        return filter_band(self.header.get('FILTER', 'V'),
+                           self.config.get('filter_v_keyword', 'Vmag'),
+                           self.config.get('filter_b_keyword', 'Bmag'))
+
+    def _selection_signature(self):
+        """Compact description of the current star selection (roles + positions)."""
+        sig = []
+        try:
+            if self.variable_star:
+                sig.append(('V', round(self.variable_star['x'], 1), round(self.variable_star['y'], 1)))
+            if self.check_star:
+                sig.append(('C', round(self.check_star['x'], 1), round(self.check_star['y'], 1)))
+            for r in self.on_the_spot_refs:
+                sig.append(('R', round(r['x'], 1), round(r['y'], 1)))
+        except Exception:
+            pass
+        return tuple(sig)
+
+    def on_close(self):
+        self._on_close_inner()
+
+    def _on_close_inner(self):
+        """
+        Clean up resources before closing.
+
+        v4.15: selections and apertures are NO LONGER exported automatically on
+        close (that silently overwrote the Light Curves setup with placeholder
+        names, NaN magnitudes and per-star flexible apertures). If the star
+        selection was changed since it was opened/last exported, the user is
+        asked. Apertures are only exported with the 'Export Aps' button.
+        """
+        try:
+            if self.export_callback and self._selection_signature() != getattr(self, '_exported_signature', ()):
+                ans = messagebox.askyesnocancel(
+                    "Export Star Selection?",
+                    "The star selection was changed in the viewer.\n\n"
+                    "Export the marked Target / Check / Reference stars to the Light Curves tab before closing?\n\n"
+                    "(Apertures are not changed; use 'Export Aps to Settings' for that.)",
+                    parent=self.parent)
+                if ans is None:
+                    return  # Cancel -> keep the viewer open
+                if ans:
+                    self._on_export_click(quiet=True)
+        except Exception as e:
+            print(f"Viewer close: export failed: {e}")
+
+        self._closed = True                     # v4.34: background threads stop updating
         self.fig.clear()
         self.ref_markers = []
         self.parent.destroy()
@@ -847,7 +1109,10 @@ class FITSViewer:
             active_zp = self.on_the_spot_zp
             zp_label = f"Ens ZP={self.on_the_spot_zp:.3f}"
             
-        cal_mag = res['inst_mag'] + active_zp
+        # v4.16: calibrated magnitude from APERTURE photometry (same method as the
+        # reference stars that define the ensemble ZP); Gaussian value shown for info
+        ap_mag = self._aperture_mag(res['x'], res['y'], self.ap_var.get(), self.ann_in_var.get(), self.ann_out_var.get())
+        cal_mag = ap_mag + active_zp
         
         details = f"--- Real-time Fit ---\n\n"
         details += f"X:      {res['x']:.2f}\n"
@@ -876,7 +1141,8 @@ class FITSViewer:
                     details += f"Type: {cat_star.get('var_type', 'N/A')}\n\n"
         
         details += f"FWHM:   {res['fwhm']:.2f} px\n"
-        details += f"Inst M: {res['inst_mag']:.3f}\n"
+        details += f"Inst M: {ap_mag:.3f} (aperture)\n"
+        details += f"PSF M:  {res['inst_mag']:.3f} (Gaussian fit)\n"
         details += f"Cal M:  {cal_mag:.3f}*\n"
         details += f"(* using {zp_label})\n"
         
@@ -914,10 +1180,28 @@ class FITSViewer:
         if not self.ref_catalog or not any(k in self.ref_catalog.upper() for k in ["ATLAS", "APASS", "GAIA", "LANDOLT"]):
             return None
 
-        # Fix #4: Check in-memory cache first (keyed on 3-decimal rounded coords)
+        # v4.34: the frame's stars from the local catalogue copy - no query at all
+        if self._field_state == 'local':
+            star = self._field_match(ra, dec)
+            if star is None:
+                return None                          # not in the catalogue (faint/uncatalogued)
+            v = self._vsx_match(ra, dec)
+            star['vsx_name'] = v.get('id', '') if v else ''
+            star['var_type'] = v.get('Type', '') if v else ''
+            star['is_variable'] = bool(v) and 'CST' not in str(star['var_type'] or '').upper()
+            star['display_name'] = star['vsx_name'] or star.get('cat_id', '') or "Star"
+            return star
+
+        # Fix #4: Check in-memory cache first (keyed on 3-decimal rounded coords);
+        # v4.34: also an entry within 3 arcsec (fitted position differs slightly)
         cache_key = (round(ra, 3), round(dec, 3), self.ref_catalog.upper())
         if cache_key in self._catalog_cache:
             return self._catalog_cache[cache_key]
+        for (kra, kdec, kcat), val in list(self._catalog_cache.items()):
+            if kcat == cache_key[2] and abs(kdec - dec) < 0.002 and \
+                    abs((kra - ra) * np.cos(np.radians(dec))) < 0.002 and val is not None:
+                if np.hypot((val['ra_deg'] - ra) * np.cos(np.radians(dec)), val['dec_deg'] - dec) * 3600 < 3.0:
+                    return val
 
         try:
             # Fix #11: Route through disk cache (get_cached_catalog + save_to_cache)
@@ -936,8 +1220,11 @@ class FITSViewer:
                 idx_cat, d2d_cat, _ = target_coord.match_to_catalog_sky(cat_coords)
                 star = stars[idx_cat]
 
-                # Cross-check with AAVSO VSX for variability (already uses disk cache)
-                vsx = get_vsx_stars(ra, dec, radius_arcmin=1.0, verbose=False)
+                # Cross-check with AAVSO VSX for variability (already uses disk cache);
+                # v4.34: the frame's variable list if it is loaded (no extra query)
+                vsx = ([v_ for v_ in self._vsx_list
+                        if np.hypot((v_['ra_deg'] - ra) * np.cos(np.radians(dec)), v_['dec_deg'] - dec) * 60 <= 1.0]
+                       if self._vsx_list is not None else get_vsx_stars(ra, dec, radius_arcmin=1.0, verbose=False))
                 if vsx:
                     vsx_coords = SkyCoord(ra=[s['ra_deg'] for s in vsx]*u.deg, dec=[s['dec_deg'] for s in vsx]*u.deg)
                     idx_v, d2d_v, _ = target_coord.match_to_catalog_sky(vsx_coords)
@@ -1050,7 +1337,10 @@ class FITSViewer:
         # 1. Precise fit
         res = self._fit_at(x, y)
         if not res:
-            messagebox.showwarning("Fit Failed", "Could not fit a star at this position.")
+            if getattr(self, '_quiet_marking', False):         # v4.34: automatic marking - no pop-up
+                print(f"FITS Viewer: no star could be fitted at x={x:.0f}, y={y:.0f} ({role}) - not marked.")
+            else:
+                messagebox.showwarning("Fit Failed", "Could not fit a star at this position.")
             return None
             
         # 2. WCS Identification (Skip if cat_star is already provided)
@@ -1098,37 +1388,9 @@ class FITSViewer:
         self.ax.add_patch(m2)
         self.ax.add_patch(m3)
         
-        # 6. Aperture Photometry (Manual Implementation)
-        # We perform background-subtracted aperture photometry to ensure side panels 
-        # reflect the user's chosen aperture/annulus settings.
-        try:
-            ap_size = int(max(ann_out * 2.5, 30))
-            if ap_size % 2 == 0: ap_size += 1
-            ap_cutout = Cutout2D(self.data, (res['x'], res['y']), (ap_size, ap_size), mode='partial')
-            ap_data = ap_cutout.data
-            
-            # Distance map from centroid
-            c_pos = ap_cutout.to_cutout_position((res['x'], res['y']))
-            yy_ap, xx_ap = np.mgrid[:ap_size, :ap_size]
-            dist_sq = (xx_ap - c_pos[0])**2 + (yy_ap - c_pos[1])**2
-            
-            # Background from annulus (using sigma-clipped median for robustness, matching main app)
-            ann_mask = (dist_sq >= ann_in**2) & (dist_sq <= ann_out**2)
-            if np.any(ann_mask):
-                _, bg_local, _ = sigma_clipped_stats(ap_data[ann_mask], sigma=3.0, maxiters=5)
-            else:
-                bg_local = np.nanmedian(ap_data)
-            
-            # Net flux in aperture
-            ap_mask = dist_sq <= ap**2
-            net_flux = np.sum(ap_data[ap_mask] - bg_local)
-            
-            if net_flux > 0:
-                inst_mag = -2.5 * np.log10(net_flux)
-            else:
-                inst_mag = res['inst_mag'] # Fallback to PSF fit if flux is non-positive
-        except:
-            inst_mag = res['inst_mag'] # Fallback on error
+        # 6. Aperture Photometry (v4.16: photutils 'exact', same as pipeline; NaN instead
+        # of silently falling back to the Gaussian-fit magnitude)
+        inst_mag = self._aperture_mag(res['x'], res['y'], ap, ann_in, ann_out)
             
         # 7. Store data for export
         c_ref = SkyCoord(ra=cat_star['ra_deg']*u.deg, dec=cat_star['dec_deg']*u.deg)
@@ -1140,7 +1402,7 @@ class FITSViewer:
             'dec_deg': cat_star['dec_deg'],
             'ra_hms': c_ref.ra.to_string(unit='hour', sep=':', precision=1, pad=True),
             'dec_dms': c_ref.dec.to_string(unit='deg', sep=':', precision=1, alwayssign=True, pad=True),
-            'cat_mag': cat_star.get('V_mag') if 'B' not in self.header.get('FILTER', 'V').upper() else cat_star.get('B_mag'),
+            'cat_mag': cat_star.get('B_mag') if self._band() == 'B' else cat_star.get('V_mag'),
             'cat_bv': cat_star.get('B_V') or (cat_star.get('B_mag') - cat_star.get('V_mag') if cat_star.get('B_mag') is not None and cat_star.get('V_mag') is not None else 0.5),
             'inst_mag': inst_mag,
             'is_variable': cat_star.get('is_variable', False),
@@ -1234,7 +1496,8 @@ class FITSViewer:
             text += f"--- REFERENCES (Green) ---\n"
             # Calculate Zero Point from ensemble (Fix #10: use sigma-clipped stats)
             zps = [r['cat_mag'] - r['inst_mag'] for r in self.on_the_spot_refs
-                   if r['cat_mag'] is not None and not np.isnan(r['cat_mag'])]
+                   if r['cat_mag'] is not None and not np.isnan(r['cat_mag'])
+                   and r.get('inst_mag') is not None and np.isfinite(r['inst_mag'])]
             if len(zps) >= 3:
                 _, median_zp, _ = sigma_clipped_stats(zps, sigma=3.0, maxiters=5)
                 self.on_the_spot_zp = median_zp
@@ -1327,7 +1590,7 @@ class FITSViewer:
                     'y_mean': (y_init - 3.0, y_init + 3.0)
                 }
             )
-            fitter = fitting.LevMarLSQFitter()
+            fitter = fitting.TRFLSQFitter() if hasattr(fitting, 'TRFLSQFitter') else fitting.LevMarLSQFitter()
             yy, xx = np.mgrid[:size, :size]
             g_fit = fitter(g_init, xx, yy, d_fit_sub)
             
@@ -1449,7 +1712,13 @@ class FITSViewer:
     def _auto_mark_initial_stars(self):
         """Automatically mark stars provided during initialization (e.g. from session load)."""
         if not self.has_wcs: return
-        
+        self._quiet_marking = True
+        try:
+            self._auto_mark_initial_stars_inner()
+        finally:
+            self._quiet_marking = False
+
+    def _auto_mark_initial_stars_inner(self):
         # 1. Target Variable
         v = self.initial_stars.get('variable')
         if v and v.get('ra') is not None:
@@ -1472,6 +1741,8 @@ class FITSViewer:
         self._update_var_panel()
         self._update_ref_panel()
         self.canvas.draw_idle()
+        # Remember the selection we started from (used to decide whether to ask on close)
+        self._exported_signature = self._selection_signature()
 
     def _mark_by_coord(self, ra, dec, role):
         """
@@ -1549,6 +1820,7 @@ class FITSViewer:
                 })
             
         self.export_callback(data)
+        self._exported_signature = self._selection_signature()
         if not quiet:
             self._show_status_message("Stars Exported")
 

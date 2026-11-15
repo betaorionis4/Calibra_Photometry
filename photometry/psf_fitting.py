@@ -51,7 +51,9 @@ def refine_coordinates_psf(image_data, results, box_size, aperture_radius, satur
 
             try:
                 g_fit = fitter(g_init, xx, yy, data_to_fit)
-                if g_fit.x_stddev.value > box_size or g_fit.amplitude.value <= 0:
+                # v4.15: check both widths (sign of a fitted Gaussian sigma is arbitrary)
+                if (abs(g_fit.x_stddev.value) > box_size or abs(g_fit.y_stddev.value) > box_size
+                        or g_fit.amplitude.value <= 0):
                     raise ValueError("Calculus Diverged")
             except Exception:
                 # print(f"[{star_id}] FAILED PSF FIT")
@@ -59,10 +61,11 @@ def refine_coordinates_psf(image_data, results, box_size, aperture_radius, satur
 
             fwhm_x = g_fit.x_stddev.value * 2.355
             fwhm_y = g_fit.y_stddev.value * 2.355
-            avg_fwhm = abs((fwhm_x + fwhm_y) / 2.0)
+            # v4.15: abs() of each width (was abs of the mean, wrong if the fitted widths had opposite signs)
+            avg_fwhm = (abs(fwhm_x) + abs(fwhm_y)) / 2.0
             all_fwhms.append(avg_fwhm)
 
-            psf_integral_flux = 2 * np.pi * g_fit.amplitude.value * g_fit.x_stddev.value * g_fit.y_stddev.value
+            psf_integral_flux = 2 * np.pi * g_fit.amplitude.value * abs(g_fit.x_stddev.value * g_fit.y_stddev.value)
             pixel_flux_sum = np.sum(data_to_fit)
             diff_percent = ((psf_integral_flux - pixel_flux_sum) / pixel_flux_sum * 100) if pixel_flux_sum != 0 else 0.0
 

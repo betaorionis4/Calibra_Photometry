@@ -1,0 +1,19 @@
+{
+  "on_the_fly": true,
+  "folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/Bias_April_2026/22_gain100",
+  "bias_folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/Bias_April_2026/22_gain100",
+  "flat_folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/2026-11-05/FLAT",
+  "dark_folder": "",
+  "mode": "auto",
+  "manual": {
+    "bias": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\Master_Bias_1x1_gain_0.fits",
+    "dark": "",
+    "flat_V": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\FLAT_Vmag_1x1_gain_0.fits",
+    "flat_B": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\FLAT_Bmag_1x1_gain_0.fits",
+    "flat_L": ""
+  },
+  "flat_already_sub": true,
+  "sat_limit": 63000.0,
+  "write_files": false,
+  "use_darks": false
+}

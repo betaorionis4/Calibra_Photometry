@@ -9,7 +9,7 @@ from astropy.utils.exceptions import AstropyWarning
 
 def detect_stars(image_data, header, detect_sigma, 
                  sharplo=0.2, sharphi=1.0, roundlo=-1.0, roundhi=1.0,
-                 filter_mode='all', xy_bounds=None, radec_bounds=None):
+                 filter_mode='all', xy_bounds=None, radec_bounds=None, fwhm=3.5):
     print("=================================================================")
     print("--- 1. Automated Star Retrieval (DAOStarFinder) ---")
     print("=================================================================\n")
@@ -29,11 +29,12 @@ def detect_stars(image_data, header, detect_sigma,
         warnings.filterwarnings("ignore", category=AstropyWarning, message=".*sharplo.*")
         warnings.filterwarnings("ignore", category=AstropyWarning, message=".*roundlo.*")
         try:
-            daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
+            # v4.16: detection kernel FWHM is configurable (was fixed at 3.5 px)
+            daofind = DAOStarFinder(fwhm=fwhm, threshold=detect_sigma * std_bg,
                                     sharpness_range=(sharplo, sharphi), 
                                     roundness_range=(roundlo, roundhi))
         except TypeError:
-            daofind = DAOStarFinder(fwhm=3.5, threshold=detect_sigma * std_bg,
+            daofind = DAOStarFinder(fwhm=fwhm, threshold=detect_sigma * std_bg,
                                     sharplo=sharplo, sharphi=sharphi, 
                                     roundlo=roundlo, roundhi=roundhi)
     
@@ -50,13 +51,25 @@ def detect_stars(image_data, header, detect_sigma,
     # Pre-parse RA/DEC bounds if needed
     ra_min_deg, ra_max_deg, dec_min_deg, dec_max_deg = None, None, None, None
     if filter_mode == 'radec' and radec_bounds and has_wcs:
+        # v4.15: bounds from the GUI are plain numbers in degrees. Previously they
+        # were passed to SkyCoord without units, which always raised an error, so
+        # the RA/Dec region filter silently fell back to 'all'.
+        # RA_min > RA_max is interpreted as a region crossing RA = 0/360 deg.
+        def _to_deg(val, is_ra):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                from astropy.coordinates import Angle  # sexagesimal text, e.g. '9:36:53'
+                return Angle(str(val), unit=u.hourangle if is_ra else u.deg).deg
         try:
-            coord1 = SkyCoord(ra=radec_bounds['ra_min'], dec=radec_bounds['dec_min'], frame='icrs')
-            coord2 = SkyCoord(ra=radec_bounds['ra_max'], dec=radec_bounds['dec_max'], frame='icrs')
-            ra_min_deg = min(coord1.ra.deg, coord2.ra.deg)
-            ra_max_deg = max(coord1.ra.deg, coord2.ra.deg)
-            dec_min_deg = min(coord1.dec.deg, coord2.dec.deg)
-            dec_max_deg = max(coord1.dec.deg, coord2.dec.deg)
+            ra_min_deg = _to_deg(radec_bounds['ra_min'], True) % 360.0
+            ra_max_deg = _to_deg(radec_bounds['ra_max'], True)
+            ra_max_deg = 360.0 if ra_max_deg >= 360.0 else ra_max_deg % 360.0
+            d1 = _to_deg(radec_bounds['dec_min'], False)
+            d2 = _to_deg(radec_bounds['dec_max'], False)
+            dec_min_deg, dec_max_deg = min(d1, d2), max(d1, d2)
+            print(f"RA/Dec region filter: RA {ra_min_deg:.4f}..{ra_max_deg:.4f} deg"
+                  f"{' (wraps through 0)' if ra_min_deg > ra_max_deg else ''}, Dec {dec_min_deg:.4f}..{dec_max_deg:.4f} deg")
         except Exception as e:
             print(f"Error parsing RA/DEC bounds: {e}")
             filter_mode = 'all' # fallback
@@ -89,7 +102,11 @@ def detect_stars(image_data, header, detect_sigma,
                 continue
                 
         if filter_mode == 'radec' and ra_min_deg is not None:
-            if not (ra_min_deg <= ra_deg <= ra_max_deg and dec_min_deg <= dec_deg <= dec_max_deg):
+            if ra_min_deg <= ra_max_deg:
+                in_ra = ra_min_deg <= ra_deg <= ra_max_deg
+            else:  # wrap-around region
+                in_ra = ra_deg >= ra_min_deg or ra_deg <= ra_max_deg
+            if not (in_ra and dec_min_deg <= dec_deg <= dec_max_deg):
                 continue
 
         valid_count += 1

@@ -13,6 +13,8 @@ import astropy.units as u
 from photometry.plate_solve import plate_solve_files, solve_with_astap
 from photometry.image_calibration import calibrate_image
 from photometry.gui_utils import add_copy_context_menu, SelectableLabel, add_treeview_copy_menu
+from photometry.filters import classify_filter
+from photometry.names import from_name as _resolve_name   # v4.30: local GCVS list, then SIMBAD
 
 # Platform-agnostic safe icons to prevent broken emoji boxes on Linux/Ubuntu
 IS_LINUX = sys.platform.startswith("linux")
@@ -21,9 +23,38 @@ def get_icon(emoji_win, fallback_linux):
     return fallback_linux if IS_LINUX else emoji_win
 
 class StdoutRedirector:
+    """
+    Redirects print() output into Tk text widgets (and optionally a log file).
+
+    v4.15: tkinter is not thread-safe. Text written from worker threads is now
+    put on a queue and inserted into the widgets by the GUI thread
+    (see start_polling), instead of touching the widgets directly.
+    """
     def __init__(self, text_widget):
+        import queue
         self.text_widgets = [text_widget]
         self.log_file = None
+        self._queue = queue.Queue()
+        self._main_thread = threading.main_thread()
+
+    def start_polling(self, root, interval_ms=50):
+        def _drain():
+            try:
+                while True:
+                    widgets, text = self._queue.get_nowait()
+                    self._insert(text, widgets)
+            except Exception:
+                pass
+            root.after(interval_ms, _drain)
+        root.after(interval_ms, _drain)
+
+    def _insert(self, string, widgets=None):
+        for w in list(widgets if widgets is not None else self.text_widgets):
+            try:
+                w.insert(tk.END, string)
+                w.see(tk.END)
+            except Exception:
+                pass
 
     def add_widget(self, text_widget):
         if text_widget not in self.text_widgets:
@@ -37,15 +68,18 @@ class StdoutRedirector:
         self.log_file = file_path
 
     def write(self, string):
-        for w in self.text_widgets:
-            try:
-                w.insert(tk.END, string)
-                w.see(tk.END)
-            except:
-                pass
+        if threading.current_thread() is self._main_thread:
+            self._insert(string)
+        else:
+            # remember the target widgets now (the pipeline terminal may be
+            # detached before the queue is drained)
+            self._queue.put((tuple(self.text_widgets), string))
         if self.log_file:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(string)
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(string)
+            except Exception:
+                pass
 
     def flush(self):
         pass
@@ -55,9 +89,13 @@ class ScrollableFrame(ttk.Frame):
         super().__init__(container, *args, **kwargs)
         self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg="#f0f2f5")
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        # v4.39: horizontal scrollbar, shown only when the content is wider than the window
+        self.xscrollbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self._x_shown = False
         self.scrollable_frame = ttk.Frame(self.canvas)
 
         def update_scrollregion(e):
+            self._update_width()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
             req_height = self.scrollable_frame.winfo_reqheight()
             canvas_height = self.canvas.winfo_height()
@@ -75,19 +113,44 @@ class ScrollableFrame(ttk.Frame):
             else:
                 self.canvas.yview_moveto(0)
             
-        self.canvas.bind("<Enter>", lambda _: self.canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        self.canvas.bind("<Leave>", lambda _: self.canvas.unbind_all("<MouseWheel>"))
+        def _on_shift_wheel(event):
+            if self._x_shown:
+                self.canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+
+        def _enter(_):
+            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            self.canvas.bind_all("<Shift-MouseWheel>", _on_shift_wheel)
+
+        def _leave(_):
+            self.canvas.unbind_all("<MouseWheel>")
+            self.canvas.unbind_all("<Shift-MouseWheel>")
+        self.canvas.bind("<Enter>", _enter)
+        self.canvas.bind("<Leave>", _leave)
 
         self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.configure(yscrollcommand=scrollbar.set, xscrollcommand=self.xscrollbar.set)
 
-        self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
         
         self.canvas.bind("<Configure>", self.on_canvas_configure)
+
+    def _update_width(self, canvas_width=None):
+        """Inner frame as wide as the window, or wider (then with a horizontal scrollbar)."""
+        cw = canvas_width or self.canvas.winfo_width()
+        rw = self.scrollable_frame.winfo_reqwidth()
+        self.canvas.itemconfig(self.canvas_window, width=max(cw, rw))
+        need = rw > cw + 2
+        if need and not self._x_shown:
+            self.xscrollbar.pack(side="bottom", fill="x", before=self.canvas)
+            self._x_shown = True
+        elif not need and self._x_shown:
+            self.xscrollbar.pack_forget()
+            self.canvas.xview_moveto(0)
+            self._x_shown = False
         
     def on_canvas_configure(self, event):
-        self.canvas.itemconfig(self.canvas_window, width=event.width)
+        self._update_width(event.width)
         # Stretch inner frame to fill canvas height if it is smaller than the canvas viewport
         req_height = self.scrollable_frame.winfo_reqheight()
         if req_height < event.height:
@@ -100,8 +163,41 @@ class ScrollableFrame(ttk.Frame):
         if self.scrollable_frame.winfo_height() <= self.canvas.winfo_height():
             self.canvas.yview_moveto(0)
 
+# v4.19: file extensions recognised as FITS (compared in lower case)
+FITS_EXTENSIONS = ('.fits', '.fit', '.fts')
+
+
+def read_tk_var(var, vtype):
+    """
+    v4.15: strict, user-friendly conversion of a Tk variable.
+    Tk raises TclError (not ValueError) for empty/invalid numeric fields, and
+    IntVar silently truncated '3.7' to 3. Numbers are therefore parsed from the
+    raw text here; any problem is raised as ValueError with a clear message.
+    """
+    if vtype in (int, float):
+        try:
+            raw = str(var._tk.globalgetvar(var._name)).strip()
+        except Exception:
+            raw = str(var.get()).strip()
+        if raw == "":
+            raise ValueError("field is empty")
+        try:
+            num = float(raw)
+        except ValueError:
+            raise ValueError(f"'{raw}' is not a number")
+        if vtype is int:
+            if not float(num).is_integer():
+                raise ValueError(f"'{raw}' is not a whole number")
+            return int(num)
+        return num
+    try:
+        return vtype(var.get())
+    except tk.TclError as e:
+        raise ValueError(str(e))
+
+
 class AdvancedPlotWindow(tk.Toplevel):
-    def __init__(self, parent, results, target_name, filter_name, check_name="Check Star"):
+    def __init__(self, parent, results, target_name, filter_name, check_name="Check Star", y_quantity=None):
         super().__init__(parent)
         self.title(f"Advanced Plot Customizer: {target_name}")
         self.geometry("1100x700")
@@ -111,11 +207,26 @@ class AdvancedPlotWindow(tk.Toplevel):
         self.target_name = target_name
         self.filter_name = filter_name
         
+        # Light-curve mode (calibrated / relative / raw) decides the y quantity
+        self.lc_mode = results[0].get('lc_mode', 'calibrated') if results else 'calibrated'
+        if self.lc_mode == 'calibrated':
+            self.y_quantity = 'mag'
+        else:
+            self.y_quantity = y_quantity or 'flux'
+        is_flux = (self.y_quantity == 'flux')
+        unit = results[0].get('flux_unit', 'ADU') if results else 'ADU'
+        if self.lc_mode == 'calibrated':
+            default_ylabel = "Magnitude"
+        elif self.lc_mode == 'raw':
+            default_ylabel = f"Net flux [{unit}]" if is_flux else "Instrumental magnitude"
+        else:
+            default_ylabel = "Relative flux (target / \u03a3 ref)" if is_flux else "Differential instrumental magnitude"
+        
         self.visibility_state = {"Target": tk.BooleanVar(value=True), "Check Star": tk.BooleanVar(value=True)}
         
         all_refs = set()
         for r in results:
-            if 'ref_mags' in r:
+            if 'ref_mags' in r and isinstance(r['ref_mags'], dict):
                 all_refs.update(r['ref_mags'].keys())
                 
         for ref in sorted(all_refs):
@@ -145,10 +256,10 @@ class AdvancedPlotWindow(tk.Toplevel):
         self.plot_options = {
             "title": tk.StringVar(value=f"{target_name} ({filter_name} Filter)"),
             "xlabel": tk.StringVar(value=""), 
-            "ylabel": tk.StringVar(value="Magnitude"),
+            "ylabel": tk.StringVar(value=default_ylabel),
             "y_min": tk.StringVar(value=""),
             "y_max": tk.StringVar(value=""),
-            "invert_y": tk.BooleanVar(value=True)
+            "invert_y": tk.BooleanVar(value=not is_flux)
         }
         
         self.build_ui()
@@ -209,7 +320,7 @@ class AdvancedPlotWindow(tk.Toplevel):
         e_ymax.grid(row=1, column=1, sticky="w", pady=2)
         e_ymax.bind("<Return>", lambda e: self.redraw_plot())
         
-        ttk.Checkbutton(lf_axes, text="Invert Y-Axis (Mag)", variable=self.plot_options["invert_y"], command=self.redraw_plot).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Checkbutton(lf_axes, text="Invert Y-Axis (use for magnitudes)", variable=self.plot_options["invert_y"], command=self.redraw_plot).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
         
         lf_labels = tk.LabelFrame(left_panel, text="Labels & Title", bg="#f8f9fa", padx=5, pady=5)
         lf_labels.pack(fill="x", pady=(0, 10))
@@ -243,6 +354,7 @@ class AdvancedPlotWindow(tk.Toplevel):
         opts["custom_labels"] = {k: v.get() for k, v in self.custom_label_vars.items()}
         opts["custom_colors"] = {k: v.get() for k, v in self.custom_color_vars.items()}
         opts["custom_symbols"] = {k: v.get() for k, v in self.custom_symbol_vars.items()}
+        opts["y_quantity"] = self.y_quantity
         
         if not str(opts["xlabel"]).strip():
             del opts["xlabel"]
@@ -264,9 +376,25 @@ def run_config_gui(pipeline_callback=None):
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "4.13"
+    APP_VERSION = "4.44"
+    APP_DATE = "2026-11-14"          # update together with APP_VERSION (shown in the About tab)
     root = tk.Tk()
     root.title(f"Calibra v{APP_VERSION} - Astro Analysis & Photometry Suite")
+
+    # v4.15: show uncaught errors in button callbacks instead of only printing
+    # a traceback to the console (e.g. an empty or non-numeric settings field).
+    def _report_callback_exception(exc, val, tb):
+        import traceback
+        traceback.print_exception(exc, val, tb)
+        msg = str(val)
+        if isinstance(val, tk.TclError) and "expected" in msg:
+            msg = (f"A numeric field contains an invalid value:\n\n{msg}\n\n"
+                   "Please check the entry fields (Settings and the current tab).")
+        try:
+            messagebox.showerror("Calibra - Error", msg)
+        except Exception:
+            pass
+    root.report_callback_exception = _report_callback_exception
     root.geometry("1100x750")
     root.minsize(950, 650)
     root.resizable(True, True)
@@ -323,7 +451,90 @@ def run_config_gui(pipeline_callback=None):
 
     # Shared File State
     loaded_files = [] # List of dictionaries containing file path and metadata
+    unchecked_paths = set()  # v4.15: files the user un-ticked (survives table refreshes & sessions)
     vars_dict = {}    # Global-like storage for variable access
+
+    def get_catalog_radius(file_path=None):
+        """v4.16: configured catalogue search radius [arcmin]; 0 or negative =
+        automatic: half-diagonal of the image (from its WCS) + 1'."""
+        try:
+            r = float(vars_dict["catalog_search_radius"][0].get())
+        except (KeyError, tk.TclError, ValueError):
+            r = 15.0
+        if r > 0:
+            return r
+        paths = [file_path] if file_path else [f['path'] for f in loaded_files]
+        for pth in paths:
+            try:
+                from astropy.io import fits as _fits
+                from astropy.wcs import WCS as _WCS
+                from astropy.wcs.utils import proj_plane_pixel_scales
+                h = _fits.getheader(pth)
+                w = _WCS(h)
+                if w.has_celestial and h.get('NAXIS1') and h.get('NAXIS2'):
+                    scale = float(np.mean(proj_plane_pixel_scales(w.celestial))) * 60.0
+                    return round(0.5 * np.hypot(h['NAXIS1'], h['NAXIS2']) * scale + 1.0, 1)
+            except Exception:
+                continue
+        return 60.0
+
+    def open_path(path):
+        """v4.18: open a file or folder with the system's default application."""
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True) if not os.path.splitext(path)[1] else None
+            if sys.platform == 'win32':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                import subprocess; subprocess.Popen(['open', path])
+            else:
+                import subprocess; subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open:\n{path}\n\n{e}")
+
+    def tidy_numbers():
+        """v4.18: round values shown in entry fields (catalogue values were shown with
+        up to 16 digits, e.g. 10.256653035127442) - magnitudes/colours 3, coefficients 4 decimals."""
+        import re as _re
+        rules = [(r'^ts_ref_\d_(mag|bv)$', 3), (r'^ts_target_bv$', 3), (r'^default_zp_[vb]$', 3),
+                 (r'^ts_coeff$', 4), (r'^diff_(tbv|tbbv|tvbv)$', 4)]
+        for key, val in list(vars_dict.items()):
+            if not isinstance(val, (tuple, list)) or len(val) < 2 or val[1] is not float:
+                continue
+            for pat, nd in rules:
+                if _re.match(pat, key):
+                    try:
+                        v = float(val[0].get())
+                        if np.isfinite(v) and round(v, nd) != v:
+                            val[0].set(round(v, nd))
+                    except (tk.TclError, ValueError):
+                        pass
+                    break
+
+    def band_of(filt):
+        """v4.15: single B/V classification used everywhere in the GUI ('V', 'B' or None)."""
+        try:
+            v_key = vars_dict["filter_v_keyword"][0].get() if "filter_v_keyword" in vars_dict else "Vmag"
+            b_key = vars_dict["filter_b_keyword"][0].get() if "filter_b_keyword" in vars_dict else "Bmag"
+        except tk.TclError:
+            v_key, b_key = "Vmag", "Bmag"
+        return classify_filter(filt, v_key, b_key)
+
+    def lband_of(filt):
+        """v4.23: 'V', 'B', 'L' (luminance) or None - used where light curves are made."""
+        from photometry.filters import classify_band
+        try:
+            v_key = vars_dict["filter_v_keyword"][0].get() if "filter_v_keyword" in vars_dict else "Vmag"
+            b_key = vars_dict["filter_b_keyword"][0].get() if "filter_b_keyword" in vars_dict else "Bmag"
+            l_key = vars_dict["filter_l_keyword"][0].get() if "filter_l_keyword" in vars_dict else "L"
+        except tk.TclError:
+            v_key, b_key, l_key = "Vmag", "Bmag", "L"
+        return classify_band(filt, v_key, b_key, l_key)
+
+    def aavso_band(filt):
+        """AAVSO filter code: L (luminance) photometry reduced with V comparison magnitudes is 'CV'."""
+        f = str(filt).upper()
+        return "CV" if f == "L" else f
     ts_widgets = {}   # Shared widgets for dynamic updates (e.g., filter dropdown)
     
     # Initialize global observer variables early to avoid KeyErrors in tabs
@@ -369,6 +580,16 @@ def run_config_gui(pipeline_callback=None):
             tab_ts_outer.tkraise()
         elif tab_name == "datamining":
             tab_datamining_outer.tkraise()
+        elif tab_name == "fieldvars":
+            tab_fieldvars_outer.tkraise()
+            if 'fv_auto_gcvs' in vars_dict:
+                root.after(100, vars_dict['fv_auto_gcvs'])
+        elif tab_name == "period":
+            tab_period_outer.tkraise()
+        elif tab_name == "planner":
+            tab_planner_outer.tkraise()
+            if 'planner_refresh' in vars_dict:
+                vars_dict['planner_refresh']()
         elif tab_name == "settings":
             tab_settings_outer.tkraise()
         elif tab_name == "about":
@@ -522,7 +743,7 @@ def run_config_gui(pipeline_callback=None):
     def show_color_info():
         pop = tk.Toplevel(root)
         pop.title("About Color Coefficient Calibration (B-V Pairs)")
-        pop.geometry("620x550")
+        pop.geometry("620x650")
         pop.resizable(False, False)
         pop.transient(root)
         pop.configure(bg="white")
@@ -531,7 +752,7 @@ def run_config_gui(pipeline_callback=None):
         rx, ry = root.winfo_x(), root.winfo_y()
         rw, rh = root.winfo_width(), root.winfo_height()
         px = rx + (rw - 620) // 2
-        py = ry + (rh - 550) // 2
+        py = ry + (rh - 650) // 2
         pop.geometry(f"+{px}+{py}")
         
         header = tk.Frame(pop, bg="#1a3a5f", pady=15)
@@ -610,7 +831,7 @@ def run_config_gui(pipeline_callback=None):
             "How it works:\n"
             "1. Select the B-Filter and V-Filter CSV result files generated from your calibrated frames.\n"
             "2. Enter the Color Transformation Coefficients (Tbv, Tb_bv, Tv_bv) or click 'Load Last Coefficients' to load them from 'color_coefficients.json'.\n"
-            "3. Select a reference star (either automatically—the brightest star with a typical color index 0.4 <= B-V <= 0.8—or by name/coordinates) to calibrate the field's zero points.\n"
+            "3. Zero points: by default (v4.16) from an ENSEMBLE of all suitable catalogue stars (good SNR, below the peak limit, not blended, not variable); alternatively one automatically chosen star or a star given by name/coordinates. Results include uncertainties; an optional check star is compared with the catalogue.\n"
             "4. Select target stars to analyze (either 'all stars' or a specific target star).\n"
             "5. Click 'Execute Differential Photometry' to compute standardized magnitudes, save the results, and plot the Gaussian precision evaluation of the field.\n\n"
             "-------------------\n"
@@ -668,7 +889,20 @@ def run_config_gui(pipeline_callback=None):
             "   Corrects for pixel-to-pixel sensitivity variances, dust artifacts ('dust donuts'), and optical vignetting (dark corners). Flats standardize light throughput across the frame.\n\n"
             "How it works:\n"
             "- You check raw FITS files in the File Manager.\n"
-            "- The engine automatically maps and applies the correct Master Flat corresponding to the filter specified inside the FITS header (e.g. standard B or V flats).\n\n"
+            "- The engine automatically maps and applies the correct Master Flat corresponding to the filter specified inside the FITS header (V, B, L or any other filter).\n\n"
+            "Master frames (v4.27):\n"
+            "- Choose the folder with your raw bias / flat (/ dark) frames and press 'Build / Update Masters'. Frames are sorted by IMAGETYP (or file/folder name), grouped by size, binning, gain, offset and filter (darks: exposure, temperature), combined (sigma-clipped mean or median) and saved as master_*.fits in the same folder. Existing masters made from the same files are reused.\n"
+            "- Automatic mode picks the matching masters for every light frame; 'Show Masters for Checked Frames' shows the choice.\n"
+            "- 'Calibrate on the fly' corrects frames in memory when measuring (no extra files). 'Write Calibrated Files' writes cal_*.fits into a 'calibrated' folder next to the raw files.\n"
+            "- Darks are optional ('Use darks'). Already calibrated frames are never calibrated twice.\n\n"
+            "Separate folders (v4.29):\n"
+            "- Give a bias folder and a flat folder (and a dark folder if you use darks). Every FITS file in the bias folder is used as a bias, every file in the flat folder as a flat - the file names do not matter. The filter of the flats comes from the FITS header (FILTER) or, if missing, from the file or folder name (V, B, L, Lum, Vmag ...). Files whose header says something else (e.g. IMAGETYP = Light) are still used as the type of their folder; a warning is shown (v4.33).\n"
+            "- The masters are written into the same folders. Order: bias first, then the flats are corrected with this master bias (or a dark of the flats' exposure) and normalised.\n\n"
+            "No double counting:\n"
+            "- Calibrated light = (light - master bias) / normalised master flat.\n"
+            "- The bias is removed from the flats when the master flat is built, and once from every light. The master flat itself contains no bias; it only describes the relative sensitivity (median = 1).\n"
+            "- So both masters are needed when calibrating lights: the bias (additive offset of the light) and the flat (multiplicative response).\n"
+            "- If a master flat was made by other software, tell Calibra whether it is already bias-subtracted (checkbox); if not, Calibra subtracts the bias from it before normalising.\n\n"
             "----------------------------\n"
             "REQUIRED INPUTS:\n"
             "- FITS files loaded and checked in the File Manager.\n"
@@ -728,6 +962,17 @@ def run_config_gui(pipeline_callback=None):
             "- External ASTAP executable path installed on your computer.\n"
             "- A rough search radius around the target field.\n\n"
             "-------------------------\n"
+            "POSITION GUESS (v4.22):\n"
+            "ASTAP is fast when it knows roughly where the image points. The guess comes from:\n"
+            "- the FITS header (RA/DEC or OBJCTRA/OBJCTDEC written by the capture software), or\n"
+            "- an object name (looked up in SIMBAD / AAVSO VSX - internet needed), or\n"
+            "- RA/Dec typed in (hh:mm:ss +dd:mm:ss or degrees).\n"
+            "The search radius (Solver Settings) is the area searched around the guess. With 'Use the solution "
+            "of each image as the guess for the next image', every solved image guides the next one, so a series "
+            "only needs a guess for its first image. If a guess fails, Calibra tries your guess, then the header, "
+            "and finally (if allowed) a blind whole-sky solve, which can take minutes. 'Field height' tells ASTAP "
+            "the image height in degrees if it cannot derive it from the header (0 = automatic).\n\n"
+            "-------------------------\n"
             "OUTPUTS:\n"
             "- Solved FITS copy generated with standard suffix (e.g. '_wcs').\n"
             "- File Manager table automatically displays WCS success checkmarks (✓) for solved files!"
@@ -783,7 +1028,15 @@ def run_config_gui(pipeline_callback=None):
             "OUTPUTS:\n"
             "- Interactive plotted light curve preview.\n"
             "- Scrollable results table containing Julian dates, calibrated magnitudes, SNR, and errors.\n"
-            "- Photometry results saved to standard CSV and AAVSO-format text reports ready for upload!"
+            "- Photometry results saved to standard CSV and AAVSO-format text reports ready for upload!\n\n"
+            "-----------------------------\n"
+            "LIGHT CURVE MODES (v4.14):\n"
+            "- Calibrated magnitudes: the classic ensemble mode described above (needs reference stars with catalogue magnitudes). Only this mode writes an AAVSO report.\n"
+            "- Relative flux: uses only the measured ADU of the reference stars. The light curve is F_target / sum(F_ref); catalogue magnitudes, B-V and extinction are ignored. "
+            "Cancels first-order transparency/airmass changes. Each reference star is also shown relative to the sum of the other references as a stability diagnostic.\n"
+            "- Raw ADU: the target's background-subtracted net flux in ADU (optionally ADU/s) with CCD-equation errors. No reference or check stars needed - ideal for a quick look, "
+            "for eclipse timing on photometric nights, or for fields without good comparison stars. Selected reference/check stars are measured for display only.\n"
+            "If no reference star is selected, Calibra switches to Raw ADU automatically (can be disabled)."
         )
         
         info_box.insert(tk.END, details)
@@ -802,9 +1055,8 @@ def run_config_gui(pipeline_callback=None):
             idx = int(item)
             file_path = loaded_files[idx]['path']
             filt = loaded_files[idx]['filter'].upper()
-            b_key = vars_dict["filter_b_keyword"][0].get().upper() if "filter_b_keyword" in vars_dict else "BMAG"
             
-            if b_key in filt:
+            if band_of(filt) == 'B':
                 def_zp = float(vars_dict["default_zp_b"][0].get()) if "default_zp_b" in vars_dict else 23.399
             else:
                 def_zp = float(vars_dict["default_zp_v"][0].get()) if "default_zp_v" in vars_dict else 23.399
@@ -819,6 +1071,8 @@ def run_config_gui(pipeline_callback=None):
                     'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
                     'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
                     'annulus_width': float(vars_dict["annulus_width"][0].get()),
+                    'filter_v_keyword': vars_dict["filter_v_keyword"][0].get() if "filter_v_keyword" in vars_dict else "Vmag",
+                    'filter_b_keyword': vars_dict["filter_b_keyword"][0].get() if "filter_b_keyword" in vars_dict else "Bmag",
                 }
                 
                 # 2. Gather INITIAL STARS from Light Curves tab
@@ -828,10 +1082,8 @@ def run_config_gui(pipeline_callback=None):
                 t_mode = vars_dict["ts_target_mode"][0].get()
                 t_name = vars_dict["ts_target_name"][0].get().strip()
                 if t_mode == "name" and t_name:
-                    try:
-                        c = SkyCoord.from_name(t_name)
-                        initial_stars['variable'] = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': t_name}
-                    except: pass
+                    # v4.34: names are resolved by the viewer in the background (local GCVS list first)
+                    initial_stars['variable'] = {'ra': None, 'dec': None, 'name': t_name}
                 elif t_mode == "manual":
                     try:
                         c = SkyCoord(vars_dict["ts_target_ra"][0].get(), vars_dict["ts_target_dec"][0].get(), unit=(u.hourangle, u.deg))
@@ -849,19 +1101,81 @@ def run_config_gui(pipeline_callback=None):
                         if i == cs_idx: initial_stars['check'] = s_data
                         elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
                     elif name:
-                        try:
-                            c = SkyCoord.from_name(name)
-                            s_data = {'ra': c.ra.deg, 'dec': c.dec.deg, 'name': name}
-                            if i == cs_idx: initial_stars['check'] = s_data
-                            elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
-                        except: pass
+                        s_data = {'ra': None, 'dec': None, 'name': name}     # v4.34: resolved in the viewer
+                        if i == cs_idx: initial_stars['check'] = s_data
+                        elif vars_dict[f"ts_ref_{i}_use"][0].get(): initial_stars['refs'].append(s_data)
 
                 # 3. Define EXPORT Callbacks
                 def update_light_curve_stars(data):
+                    # v4.15: protect existing Light-Curve data from being replaced by
+                    # viewer placeholders ('Target', 'Uncataloged_*'), NaN magnitudes
+                    # or catalogue values when the same star is already configured.
+                    def _clean(val):
+                        try:
+                            f = float(val)
+                            return f if np.isfinite(f) else None
+                        except (TypeError, ValueError):
+                            return None
+                    def _is_placeholder(name):
+                        n = str(name or "").strip()
+                        return (not n) or n in ("Target", "Star") or n.startswith("Uncataloged")
+                    def _sep_arcsec(ra1, dec1, ra2, dec2):
+                        try:
+                            dra = (float(ra1) - float(ra2)) * np.cos(np.radians(float(dec1)))
+                            return 3600.0 * np.hypot(dra, float(dec1) - float(dec2))
+                        except (TypeError, ValueError):
+                            return 1e9
+                    # Snapshot of the currently configured comparison-star slots
+                    old_slots = []
+                    for k in range(5):
+                        if vars_dict[f"ts_ref_{k}_has_manual"][0].get():
+                            try:
+                                old_mag = _clean(vars_dict[f"ts_ref_{k}_mag"][0].get())
+                                old_bv = _clean(vars_dict[f"ts_ref_{k}_bv"][0].get())
+                            except tk.TclError:
+                                old_mag, old_bv = None, None
+                            old_slots.append({
+                                'name': vars_dict[f"ts_ref_{k}_name"][0].get(),
+                                'ra': vars_dict[f"ts_ref_{k}_ra"][0].get(),
+                                'dec': vars_dict[f"ts_ref_{k}_dec"][0].get(),
+                                'mag': old_mag if old_mag else None,   # 0.0 = "not fetched"
+                                'bv': old_bv,
+                                'label': vars_dict[f"ts_ref_{k}_coord_label"][0].get() if f"ts_ref_{k}_coord_label" in vars_dict else ""
+                            })
+                    def _merge_with_existing(star):
+                        """Return (name, mag, bv, label) preferring an already configured slot
+                        at the same position (within 3 arcsec)."""
+                        mag, bv = _clean(star.get('mag')), _clean(star.get('bv'))
+                        name = star.get('name')
+                        for o in old_slots:
+                            if _sep_arcsec(star['ra'], star['dec'], o['ra'], o['dec']) < 3.0:
+                                return (o['name'] or name, o['mag'] if o['mag'] is not None else mag,
+                                        o['bv'] if o['mag'] is not None else bv, o['label'])
+                        if _is_placeholder(name):
+                            c_tmp = SkyCoord(star['ra'], star['dec'], unit=u.deg)
+                            name = "J" + c_tmp.to_string('hmsdms', sep='', precision=0).replace(' ', '')
+                        return name, mag, bv, None
+                    for key in ('variable', 'check'):
+                        if data.get(key):
+                            data[key]['mag'] = _clean(data[key].get('mag'))
+                            data[key]['bv'] = _clean(data[key].get('bv'))
                     if data['variable']:
                         v = data['variable']
+                        # Keep the current target name if the exported one is a placeholder
+                        # or the star is the one already configured.
+                        old_name = vars_dict["ts_target_name"][0].get().strip()
+                        same_target = False
+                        try:
+                            if vars_dict["ts_target_mode"][0].get() == "manual":
+                                c_old = SkyCoord(vars_dict["ts_target_ra"][0].get(), vars_dict["ts_target_dec"][0].get(), unit=(u.hourangle, u.deg))
+                                same_target = _sep_arcsec(v['ra'], v['dec'], c_old.ra.deg, c_old.dec.deg) < 5.0
+                        except Exception:
+                            same_target = False
+                        new_name = v['name']
+                        if old_name and (_is_placeholder(new_name) or same_target):
+                            new_name = old_name
                         vars_dict["ts_target_mode"][0].set("manual")
-                        vars_dict["ts_target_name"][0].set(v['name'])
+                        vars_dict["ts_target_name"][0].set(new_name)
                         c = SkyCoord(v['ra'], v['dec'], unit=u.deg)
                         vars_dict["ts_target_ra"][0].set(c.ra.to_string(unit='hour', sep=':', precision=2))
                         vars_dict["ts_target_dec"][0].set(c.dec.to_string(unit='degree', sep=':', precision=2, alwayssign=True))
@@ -873,15 +1187,19 @@ def run_config_gui(pipeline_callback=None):
                     slots_filled = 0
                     if data['check']:
                         c = data['check']
-                        vars_dict["ts_ref_0_name"][0].set(c['name'])
+                        c_name, c_mag, c_bv, c_label = _merge_with_existing(c)
+                        c['mag'], c['bv'] = c_mag, c_bv
+                        vars_dict["ts_ref_0_name"][0].set(c_name)
                         vars_dict["ts_ref_0_ra"][0].set(c['ra'])
                         vars_dict["ts_ref_0_dec"][0].set(c['dec'])
                         vars_dict["ts_ref_0_has_manual"][0].set(True)
                         vars_dict["ts_ref_0_use"][0].set(False)
                         ts_check_star_idx_var.set(0)
+                        if c_label and "ts_ref_0_coord_label" in vars_dict:
+                            vars_dict["ts_ref_0_coord_label"][0].set(c_label)
                         
-                        if c.get('mag') is not None: vars_dict["ts_ref_0_mag"][0].set(c['mag'])
-                        if c.get('bv') is not None: vars_dict["ts_ref_0_bv"][0].set(c['bv'])
+                        vars_dict["ts_ref_0_mag"][0].set(c_mag if c_mag is not None else 0.0)
+                        vars_dict["ts_ref_0_bv"][0].set(c_bv if c_bv is not None else 0.0)
                         slots_filled = 1
                     else:
                         ts_check_star_idx_var.set(-1)
@@ -889,14 +1207,18 @@ def run_config_gui(pipeline_callback=None):
                     current_idx = slots_filled
                     for r in data['refs']:
                         if current_idx >= 5: break
-                        vars_dict[f"ts_ref_{current_idx}_name"][0].set(r['name'])
+                        r_name, r_mag, r_bv, r_label = _merge_with_existing(r)
+                        r['mag'], r['bv'] = r_mag, r_bv
+                        vars_dict[f"ts_ref_{current_idx}_name"][0].set(r_name)
                         vars_dict[f"ts_ref_{current_idx}_ra"][0].set(r['ra'])
                         vars_dict[f"ts_ref_{current_idx}_dec"][0].set(r['dec'])
                         vars_dict[f"ts_ref_{current_idx}_has_manual"][0].set(True)
                         vars_dict[f"ts_ref_{current_idx}_use"][0].set(True)
+                        if r_label and f"ts_ref_{current_idx}_coord_label" in vars_dict:
+                            vars_dict[f"ts_ref_{current_idx}_coord_label"][0].set(r_label)
                         
-                        if r.get('mag') is not None: vars_dict[f"ts_ref_{current_idx}_mag"][0].set(r['mag'])
-                        if r.get('bv') is not None: vars_dict[f"ts_ref_{current_idx}_bv"][0].set(r['bv'])
+                        vars_dict[f"ts_ref_{current_idx}_mag"][0].set(r_mag if r_mag is not None else 0.0)
+                        vars_dict[f"ts_ref_{current_idx}_bv"][0].set(r_bv if r_bv is not None else 0.0)
                         current_idx += 1
                     
                     for idx in range(current_idx, 5):
@@ -927,6 +1249,7 @@ def run_config_gui(pipeline_callback=None):
                                     
                     root.after(500, trigger_fetch_if_needed)
                     
+                    tidy_numbers()
                     # Autosave session to disk (Fix)
                     save_session()
 
@@ -939,8 +1262,15 @@ def run_config_gui(pipeline_callback=None):
                     # Autosave session to disk (Fix)
                     save_session()
 
-                # Pass the AAVSO cache if available
+                # Pass the AAVSO cache if available - v4.35: the sequence of the CURRENT target,
+                # from memory or from the stored file (no query)
                 aavso_cache = getattr(on_get_aavso_refs, 'cache', None)
+                try:
+                    from photometry.local_catalogs import name_key as _nk
+                    if t_name and _nk(getattr(on_get_aavso_refs, 'last_target', '')) != _nk(t_name):
+                        aavso_cache = stored_aavso_sequence(t_name)
+                except Exception:
+                    pass
                 
                 viewer_win = tk.Toplevel(root)
                 FITSViewer(viewer_win, file_path, ref_catalog=ref_cat, default_zp=def_zp, 
@@ -1017,9 +1347,9 @@ def run_config_gui(pipeline_callback=None):
                     continue
                 var, vtype = val[0], val[1]
                 try:
-                    vars_vals[k] = vtype(var.get())
+                    vars_vals[k] = read_tk_var(var, vtype)
                 except ValueError as ve:
-                    raise ValueError(f"Field '{k}' (current value: '{var.get()}') must be a valid {vtype.__name__}.") from ve
+                    raise ValueError(f"Setting '{k}' must be a valid {vtype.__name__} ({ve}).") from ve
             
             selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
             if not selected_iids:
@@ -1065,6 +1395,13 @@ def run_config_gui(pipeline_callback=None):
                 'dao_sharplo': vars_vals.pop('dao_sharplo'),
                 'dao_sharphi': vars_vals.pop('dao_sharphi'),
                 'dao_roundlo': vars_vals.pop('dao_roundlo'),
+                # v4.16
+                'stack_mode': vars_vals.pop('stack_mode', 'average'),
+                'detect_fwhm': vars_vals.pop('detect_fwhm', 3.5),
+                'sky_noise_factor': vars_vals.pop('sky_noise_factor', 1.0),
+                'calib_peak_limit': vars_vals.pop('calib_peak_limit', 30000),
+                'calib_exclude_blended': vars_vals.pop('calib_exclude_blended', True),
+                'flat_already_bias_subtracted': vars_vals.pop('flat_already_bias_subtracted', True),
             }
             
             config_run['xy_bounds'] = {
@@ -1090,9 +1427,9 @@ def run_config_gui(pipeline_callback=None):
                 # Run in a separate thread to keep UI alive
                 run_btn.config(state=tk.DISABLED, text="Processing...")
                 
+                pipeline_terminal.delete("1.0", tk.END)  # v4.15: done on the GUI thread
                 def thread_target():
                     try:
-                        pipeline_terminal.delete("1.0", tk.END)
                         if hasattr(sys.stdout, "add_widget"):
                             sys.stdout.add_widget(pipeline_terminal)
                         if hasattr(sys.stderr, "add_widget"):
@@ -1110,14 +1447,16 @@ def run_config_gui(pipeline_callback=None):
                                 shift_val = res[3] if len(res) >= 4 else None
                                 det_val = res[4] if len(res) >= 5 else None
                                 
-                                f_upper = str(filt).upper()
-                                b_key = config_run.get('filter_b_keyword', 'BMAG').upper()
-                                if b_key in f_upper:
-                                    vars_dict['color_b_csv'][0].set(csv_path)
+                                band = classify_filter(filt, config_run.get('filter_v_keyword', 'Vmag'), config_run.get('filter_b_keyword', 'Bmag'))
+                                if band == 'B':
+                                    root.after(0, lambda p=csv_path: vars_dict['color_b_csv'][0].set(p))
                                     last_zp_b = zp_val
-                                else:
-                                    vars_dict['color_v_csv'][0].set(csv_path)
+                                elif band == 'V':
+                                    root.after(0, lambda p=csv_path: vars_dict['color_v_csv'][0].set(p))
                                     last_zp_v = zp_val
+                                else:
+                                    print(f"Note: filter '{filt}' is neither B nor V (see Settings > Filter mapping); "
+                                          f"its zero point is not stored as a default.")
                                 
                                 # Build summary info for this file
                                 f_name = os.path.basename(csv_path).replace("targets_auto_", "")
@@ -1153,12 +1492,20 @@ def run_config_gui(pipeline_callback=None):
                                 root.after(0, lambda v=last_zp_v: vars_dict["default_zp_v"][0].set(round(v, 3)))
                             if last_zp_b is not None:
                                 root.after(0, lambda v=last_zp_b: vars_dict["default_zp_b"][0].set(round(v, 3)))
+                    except Exception as e:
+                        # v4.15: pipeline errors used to disappear silently
+                        import traceback
+                        traceback.print_exc()
+                        root.after(0, lambda err=e: messagebox.showerror("Pipeline Error", f"The analysis pipeline stopped with an error:\n\n{err}"))
                     finally:
                         if hasattr(sys.stdout, "remove_widget"):
                             sys.stdout.remove_widget(pipeline_terminal)
                         if hasattr(sys.stderr, "remove_widget"):
                             sys.stderr.remove_widget(pipeline_terminal)
-                        run_btn.config(state=tk.NORMAL, text="Run Analysis Pipeline on Selected")
+                        if hasattr(sys.stdout, 'set_log_file'):
+                            try: sys.stdout.set_log_file(None)
+                            except Exception: pass
+                        root.after(0, lambda: run_btn.config(state=tk.NORMAL, text="Run Analysis Pipeline on Selected"))
                 
                 thread = threading.Thread(target=thread_target)
                 thread.daemon = True
@@ -1207,10 +1554,7 @@ def run_config_gui(pipeline_callback=None):
                 import astropy.units as u
                 from photometry.calibration import get_vsx_stars
                 
-                radius = 15.0
-                if "catalog_search_radius" in vars_dict:
-                    try: radius = float(vars_dict["catalog_search_radius"][0].get())
-                    except: pass
+                radius = get_catalog_radius()
                     
                 seen_names = set()
                 queried_coords = []
@@ -1503,7 +1847,7 @@ def run_config_gui(pipeline_callback=None):
             dec_c = sum(d['dec_deg'] for d in valid_coords) / len(valid_coords) if valid_coords else 0
             
             cat_type = vars_dict["reference_catalog"][0].get()
-            search_radius = float(vars_dict["catalog_search_radius"][0].get())
+            search_radius = get_catalog_radius()
             from photometry.color_calibration import derive_color_terms
             from photometry.calibration import get_ref_stars
             
@@ -1513,11 +1857,21 @@ def run_config_gui(pipeline_callback=None):
                 color_status_var.set("Error: Could not fetch online catalog.")
                 return
                 
+            max_v_txt = color_max_v_var.get().strip()
+            try:
+                max_v = float(max_v_txt) if max_v_txt else None
+            except ValueError:
+                messagebox.showerror("Input Error", f"'Faintest catalogue V' must be a number or empty (got '{max_v_txt}').")
+                return
             res = derive_color_terms(data_b, data_v, 
                                      catalog, "photometry_output", 
                                      airmass_b=air_b_var.get(), airmass_v=air_v_var.get(),
                                      k_b=vars_dict["extinction_kb"][0].get(), k_v=vars_dict["extinction_kv"][0].get(),
-                                     axes=color_coeff_axes)
+                                     axes=color_coeff_axes,
+                                     min_snr=float(color_min_snr_var.get()),
+                                     peak_limit=float(vars_dict["calib_peak_limit"][0].get()),
+                                     max_v_mag=max_v,
+                                     exclude_blended=bool(vars_dict["calib_exclude_blended"][0].get()))
             color_coeff_canvas.draw()
             color_status_var.set(res)
             
@@ -1569,10 +1923,10 @@ def run_config_gui(pipeline_callback=None):
                     return
                 from astropy.coordinates import SkyCoord
                 from astropy.coordinates.name_resolve import NameResolveError
-                diff_status_var.set(f"Resolving '{star_name}' via Simbad...")
+                diff_status_var.set(f"Resolving '{star_name}' (local GCVS list, else Simbad)...")
                 root.update_idletasks()
                 try:
-                    c = SkyCoord.from_name(star_name)
+                    c = _resolve_name(star_name)
                     manual_coord = (c.ra.deg, c.dec.deg)
                     print(f"Resolved '{star_name}' to RA: {c.ra.deg:.5f}, Dec: {c.dec.deg:.5f}")
                 except NameResolveError as e:
@@ -1591,7 +1945,7 @@ def run_config_gui(pipeline_callback=None):
                         pass
                     
                     if manual_coord is None:
-                        messagebox.showerror("Resolution Error", f"Could not resolve name '{star_name}' via Simbad or Local Catalog.\n\nNote: Make sure your AAVSO CSV is loaded in the Analysis tab if you are using AUIDs like 000-BJS-555.")
+                        messagebox.showerror("Resolution Error", f"Could not resolve name '{star_name}' via the local GCVS list, Simbad or the local AAVSO catalogue.\n\nNote: Make sure your AAVSO CSV is loaded in the Analysis tab if you are using AUIDs like 000-BJS-555.")
                         diff_status_var.set(f"Error: Could not resolve '{star_name}'.")
                         return
                 except Exception as e:
@@ -1619,10 +1973,10 @@ def run_config_gui(pipeline_callback=None):
                     return
                 from astropy.coordinates import SkyCoord
                 from astropy.coordinates.name_resolve import NameResolveError
-                diff_status_var.set(f"Resolving '{star_name}' via Simbad...")
+                diff_status_var.set(f"Resolving '{star_name}' (local GCVS list, else Simbad)...")
                 root.update_idletasks()
                 try:
-                    c = SkyCoord.from_name(star_name)
+                    c = _resolve_name(star_name)
                     manual_target_coord = (c.ra.deg, c.dec.deg)
                     print(f"Resolved target '{star_name}' to RA: {c.ra.deg:.5f}, Dec: {c.dec.deg:.5f}")
                 except NameResolveError as e:
@@ -1641,7 +1995,7 @@ def run_config_gui(pipeline_callback=None):
                         pass
                         
                     if manual_target_coord is None:
-                        messagebox.showerror("Resolution Error", f"Could not resolve target name '{star_name}' via Simbad or Local Catalog.\n\nNote: Make sure your AAVSO CSV is loaded in the Analysis tab if you are using AUIDs like 000-BJS-555.")
+                        messagebox.showerror("Resolution Error", f"Could not resolve target name '{star_name}' via the local GCVS list, Simbad or the local AAVSO catalogue.\n\nNote: Make sure your AAVSO CSV is loaded in the Analysis tab if you are using AUIDs like 000-BJS-555.")
                         diff_status_var.set(f"Error: Could not resolve target '{star_name}'.")
                         return
                 except Exception as e:
@@ -1649,15 +2003,43 @@ def run_config_gui(pipeline_callback=None):
                     diff_status_var.set("Error during target name resolution.")
                     return
 
+            # v4.16: optional check star (name or "RA Dec")
+            check_coord = None
+            chk_txt = diff_check_var.get().strip()
+            if chk_txt:
+                from astropy.coordinates import SkyCoord
+                import astropy.units as u
+                try:
+                    parts = chk_txt.replace(',', ' ').split()
+                    if len(parts) == 2:
+                        try:
+                            c = SkyCoord(float(parts[0]) * u.deg, float(parts[1]) * u.deg)
+                        except ValueError:
+                            c = SkyCoord(parts[0], parts[1], unit=(u.hourangle, u.deg))
+                    elif len(parts) == 6:
+                        c = SkyCoord(" ".join(parts), unit=(u.hourangle, u.deg))
+                    else:
+                        c = _resolve_name(chk_txt)
+                    check_coord = (c.ra.deg, c.dec.deg)
+                except Exception as e:
+                    messagebox.showwarning("Check Star", f"Could not resolve the check star '{chk_txt}': {e}\nContinuing without check star.")
+            comp_mode = 'single' if ref_mode_var.get() == "auto_single" else 'ensemble'
+            diff_extra = dict(comp_mode=comp_mode, min_snr=float(diff_min_snr_var.get()),
+                              peak_limit=float(vars_dict["calib_peak_limit"][0].get()),
+                              exclude_blended=bool(vars_dict["calib_exclude_blended"][0].get()),
+                              Tbv_err=diff_coeff_err['Tbv'], Tb_bv_err=diff_coeff_err['Tb_bv'], Tv_bv_err=diff_coeff_err['Tv_bv'],
+                              check_coord=check_coord)
+
             res = run_differential_photometry(
                 csv_b=b_csv, csv_v=v_csv, ref_catalog=cat_type,
                 k_b=vars_dict["extinction_kb"][0].get(), k_v=vars_dict["extinction_kv"][0].get(),
                 Tbv=diff_tbv_var.get(), Tb_bv=diff_tbbv_var.get(), Tv_bv=diff_tvbv_var.get(),
-                radius_arcmin=float(vars_dict["catalog_search_radius"][0].get()),
+                radius_arcmin=get_catalog_radius(),
                 manual_ref_coord=manual_coord,
                 target_mode=target_mode,
                 manual_target_coord=manual_target_coord,
-                axes=accuracy_axes
+                axes=accuracy_axes,
+                **diff_extra
             )
             accuracy_canvas.draw()
             diff_status_var.set(res)
@@ -1673,10 +2055,11 @@ def run_config_gui(pipeline_callback=None):
                     'Tbv': diff_tbv_var.get(),
                     'Tb_bv': diff_tbbv_var.get(),
                     'Tv_bv': diff_tvbv_var.get(),
-                    'radius_arcmin': float(vars_dict["catalog_search_radius"][0].get()),
+                    'radius_arcmin': get_catalog_radius(),
                     'manual_ref_coord': manual_coord,
                     'target_mode': target_mode,
-                    'manual_target_coord': manual_target_coord
+                    'manual_target_coord': manual_target_coord,
+                    'extra': diff_extra
                 })
         except Exception as e:
             diff_status_var.set(f"Error: {e}")
@@ -1684,6 +2067,10 @@ def run_config_gui(pipeline_callback=None):
 
     def save_session():
         import json
+        try:
+            vars_dict['instrument_autosave']()     # v4.36: current settings -> active instrument setup
+        except Exception:
+            pass
         data = {}
         for key, val in vars_dict.items():
             # Robust check: only process (variable, type) pairs
@@ -1697,8 +2084,9 @@ def run_config_gui(pipeline_callback=None):
             except:
                 pass # Skip if variable is destroyed or invalid
         
-        # Add loaded file paths
+        # Add loaded file paths (+ which ones are un-ticked, v4.15)
         data['loaded_file_paths'] = [f['path'] for f in loaded_files]
+        data['unchecked_file_paths'] = sorted(p for p in unchecked_paths if any(f['path'] == p for f in loaded_files))
         
         # Add AAVSO sequence cache
         try:
@@ -1708,6 +2096,12 @@ def run_config_gui(pipeline_callback=None):
                 data['aavso_last_cat'] = getattr(on_get_aavso_refs, 'last_cat', "")
         except NameError:
             pass # on_get_aavso_refs not bound yet
+        # v4.19: Field Variables target list
+        try:
+            data['fv_target_list'] = [{k: t.get(k) for k in ('name', 'ra', 'dec', 'type', 'period', 'max', 'min', 'source', 'use')}
+                                      for t in fv_targets]
+        except NameError:
+            pass
         
         try:
             with open("calibra_session.json", "w") as f:
@@ -1728,8 +2122,19 @@ def run_config_gui(pipeline_callback=None):
             for key, value in data.items():
                 if key == 'loaded_file_paths':
                     for path in value:
-                        if os.path.exists(path):
+                        # v4.15: no duplicates when a session is loaded twice
+                        if os.path.exists(path) and not any(f['path'] == path for f in loaded_files):
                             loaded_files.append(scan_fits_header(path))
+                    continue
+                if key == 'unchecked_file_paths':
+                    unchecked_paths.update(value or [])
+                    continue
+                if key == 'fv_target_list':
+                    try:
+                        fv_targets[:] = [dict(t) for t in (value or []) if isinstance(t, dict) and t.get('name')]
+                        fv_refresh_tree()
+                    except NameError:
+                        pass
                     continue
                 if key in vars_dict:
                     val = vars_dict[key]
@@ -1777,9 +2182,9 @@ def run_config_gui(pipeline_callback=None):
         # Populate with loaded_files
         for idx, file_data in enumerate(loaded_files):
             tag = 'even' if idx % 2 == 0 else 'odd'
-            # Default to checked '[X]'
+            # v4.15: keep the user's tick state across refreshes (default: checked)
             tree.insert('', tk.END, iid=str(idx), values=(
-                '[X]',
+                '[ ]' if file_data.get('path') in unchecked_paths else '[X]',
                 file_data['filename'],
                 file_data['filter'],
                 file_data['binning'],
@@ -1803,15 +2208,17 @@ def run_config_gui(pipeline_callback=None):
 
         v_count = 0
         b_count = 0
+        l_count = 0
         for f in loaded_files:
-            filt_str = str(f.get('filter', '')).upper().strip()
-            if filt_str:
-                if v_key and (v_key in filt_str or filt_str in v_key):
-                    v_count += 1
-                elif b_key and (b_key in filt_str or filt_str in b_key):
-                    b_count += 1
+            band = lband_of(f.get('filter', ''))
+            if band == 'V':
+                v_count += 1
+            elif band == 'B':
+                b_count += 1
+            elif band == 'L':
+                l_count += 1
 
-        status_text = f"Loaded: {len(loaded_files)} files ({v_count}× V, {b_count}× B)"
+        status_text = f"Loaded: {len(loaded_files)} files ({v_count}× V, {b_count}× B" + (f", {l_count}× L)" if l_count else ")")
         file_manager_status.set(status_text)
         
         # Update light curve filter dropdown with unique translated filters
@@ -1819,12 +2226,8 @@ def run_config_gui(pipeline_callback=None):
         for f in loaded_files:
             filt_str = str(f.get('filter', '')).upper().strip()
             if filt_str:
-                if v_key and (v_key in filt_str or filt_str in v_key):
-                    unique_translated.add("V")
-                elif b_key and (b_key in filt_str or filt_str in b_key):
-                    unique_translated.add("B")
-                else:
-                    unique_translated.add(filt_str)
+                band = lband_of(filt_str)
+                unique_translated.add(band if band else filt_str)
         
         unique_filters = sorted(list(unique_translated))
         if 'filter_cb' in ts_widgets:
@@ -1850,32 +2253,45 @@ def run_config_gui(pipeline_callback=None):
 
     def on_load_files():
         from tkinter import filedialog
-        files = filedialog.askopenfilenames(title="Select FITS Files", filetypes=(("FITS files", "*.fits *.fit"), ("all files", "*.*")))
+        files = filedialog.askopenfilenames(title="Select FITS Files", filetypes=(("FITS files", "*.fits *.fit *.fts *.FITS *.FIT *.FTS"), ("all files", "*.*")))
         if files:
             for f in files:
                 # Avoid duplicates
                 if not any(existing['path'] == f for existing in loaded_files):
                     loaded_files.append(scan_fits_header(f))
             update_file_table()
+            try:
+                vars_dict['instrument_check'](list(files))      # v4.36
+            except Exception:
+                pass
 
     def on_load_dir():
         from tkinter import filedialog
         import glob
         dirname = filedialog.askdirectory(title="Select FITS Directory")
         if dirname:
-            pattern = os.path.join(dirname, "*.fits")
-            files = glob.glob(pattern)
+            # v4.19: .fits, .fit and .fts (any letter case), sorted by name
+            files = sorted(f for f in glob.glob(os.path.join(dirname, "*"))
+                           if os.path.splitext(f)[1].lower() in FITS_EXTENSIONS)
             for f in files:
                 if not any(existing['path'] == f for existing in loaded_files):
                     loaded_files.append(scan_fits_header(f))
             update_file_table()
+            try:
+                vars_dict['instrument_check'](list(files))      # v4.36
+            except Exception:
+                pass
 
     def on_remove_selected():
-        selected = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        # v4.15: remove the HIGHLIGHTED rows. Only if nothing is highlighted are the
+        # checked files removed - and only after confirmation (previously all checked
+        # files - i.e. usually the whole list - were removed first).
+        selected = list(tree.selection())
         if not selected:
-            # Fallback to highlighted if none are checked
-            selected = tree.selection()
+            selected = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
             if not selected: return
+            if not messagebox.askyesno("Remove Files", f"No rows are highlighted.\n\nRemove all {len(selected)} CHECKED file(s) from the list?"):
+                return
         
         # We need to remove from the back to keep indices valid if we were removing from list directly,
         # but here we can just rebuild the list from the remaining IIDs.
@@ -1895,12 +2311,14 @@ def run_config_gui(pipeline_callback=None):
         update_file_table()
 
     def on_check_all():
+        unchecked_paths.clear()
         for iid in tree.get_children():
             vals = list(tree.item(iid, 'values'))
             vals[0] = '[X]'
             tree.item(iid, values=vals)
 
     def on_uncheck_all():
+        unchecked_paths.update(f['path'] for f in loaded_files)
         for iid in tree.get_children():
             vals = list(tree.item(iid, 'values'))
             vals[0] = '[ ]'
@@ -1910,7 +2328,7 @@ def run_config_gui(pipeline_callback=None):
     ttk.Button(toolbar_frame, text="Load Directory...", command=on_load_dir).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Check All", command=on_check_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Uncheck All", command=on_uncheck_all).pack(side=tk.LEFT, padx=5)
-    ttk.Button(toolbar_frame, text="Remove Checked/Selected", command=on_remove_selected).pack(side=tk.LEFT, padx=5)
+    ttk.Button(toolbar_frame, text="Remove Highlighted", command=on_remove_selected).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Clear All", command=on_clear_all).pack(side=tk.LEFT, padx=5)
     ttk.Button(toolbar_frame, text="Refresh Headers", command=on_refresh_headers).pack(side=tk.LEFT, padx=5)
 
@@ -2046,6 +2464,7 @@ def run_config_gui(pipeline_callback=None):
         # Load cards in memory
         from astropy.io import fits
         all_cards = []
+        orig_values = {}  # v4.15: KEY -> (original python value, its string form) to preserve types
         try:
             with fits.open(file_path) as hdul:
                 hdr = hdul[0].header
@@ -2054,6 +2473,8 @@ def run_config_gui(pipeline_callback=None):
                         val_str = str(card.value) if card.value is not None else ''
                         comment = card.comment or ''
                         all_cards.append([card.keyword.upper(), val_str, comment])
+                        if card.keyword.upper() not in COMMENTARY_KEYWORDS:
+                            orig_values[card.keyword.upper()] = (card.value, val_str)
         except Exception as e:
             messagebox.showerror("Error", f"Could not read FITS header: {e}")
             editor_win.destroy()
@@ -2270,6 +2691,34 @@ def run_config_gui(pipeline_callback=None):
                     return val_str_stripped[1:-1]
                 return val_str_stripped
 
+            def value_for_card(key_upper, val_str):
+                """v4.15: unchanged cards keep their original value AND type
+                (e.g. the string '007' no longer becomes the integer 7);
+                edited cards whose original value was a string stay strings;
+                non-finite numbers (nan/inf) are stored as strings."""
+                if key_upper in orig_values:
+                    orig_val, orig_str = orig_values[key_upper]
+                    if val_str == orig_str:
+                        return orig_val
+                    if isinstance(orig_val, str):
+                        v = val_str.strip()
+                        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                            v = v[1:-1]
+                        return v
+                parsed = parse_fits_value(val_str)
+                if isinstance(parsed, float) and not np.isfinite(parsed):
+                    return val_str.strip()
+                return parsed
+
+            # v4.15: keep a backup of the original file (created once; never overwritten)
+            backup_path = file_path + ".bak"
+            try:
+                if not os.path.exists(backup_path):
+                    shutil.copy2(file_path, backup_path)
+            except Exception as e:
+                if not messagebox.askyesno("Backup Failed", f"Could not create a backup copy:\n{e}\n\nSave the header anyway?"):
+                    return
+
             try:
                 with fits.open(file_path, mode='update') as hdul:
                     hdr = hdul[0].header
@@ -2287,14 +2736,20 @@ def run_config_gui(pipeline_callback=None):
                                     
                     for key, val_str, comment in all_cards:
                         key_upper = key.upper()
-                        if key_upper in STRUCTURAL_KEYWORDS:
-                            parsed_val = parse_fits_value(val_str)
-                            hdr.set(key, parsed_val, comment)
-                        elif key_upper in COMMENTARY_KEYWORDS:
+                        if key_upper in COMMENTARY_KEYWORDS:
                             continue
-                        else:
-                            parsed_val = parse_fits_value(val_str)
-                            hdr.set(key, parsed_val, comment)
+                        hdr.set(key, value_for_card(key_upper, val_str), comment)
+
+                    # v4.15: COMMENT / HISTORY cards are rewritten from the editor list
+                    # (previously added/edited/deleted ones were silently ignored)
+                    for ck in ('COMMENT', 'HISTORY'):
+                        while ck in hdr:
+                            del hdr[ck]
+                    for key, val_str, comment in all_cards:
+                        if key.upper() == 'COMMENT':
+                            hdr.add_comment(val_str)
+                        elif key.upper() == 'HISTORY':
+                            hdr.add_history(val_str)
                     
                     hdul.flush()
                 
@@ -2302,7 +2757,7 @@ def run_config_gui(pipeline_callback=None):
                 update_file_table(select_iid=str(file_idx))
                 on_tree_select(None)
                 
-                messagebox.showinfo("Success", "FITS header saved successfully.")
+                messagebox.showinfo("Success", f"FITS header saved successfully.\n\nThe original file is kept as:\n{backup_path}")
                 editor_win.destroy()
                 
             except Exception as e:
@@ -2387,10 +2842,13 @@ def run_config_gui(pipeline_callback=None):
                 iid = tree.identify_row(event.y)
                 if iid:
                     vals = list(tree.item(iid, 'values'))
+                    path = loaded_files[int(iid)]['path'] if int(iid) < len(loaded_files) else None
                     if vals[0] == '[X]':
                         vals[0] = '[ ]'
+                        if path: unchecked_paths.add(path)
                     else:
                         vals[0] = '[X]'
+                        if path: unchecked_paths.discard(path)
                     tree.item(iid, values=vals)
 
     tree.bind("<ButtonRelease-1>", on_tree_click)
@@ -2468,6 +2926,27 @@ def run_config_gui(pipeline_callback=None):
     dm_scroll.pack(fill="both", expand=True)
     tab_datamining = dm_scroll.scrollable_frame
 
+    # --- TAB 5b: Field Variables (v4.19) ---
+    tab_fieldvars_outer = ttk.Frame(content_container)
+    tab_fieldvars_outer.grid(row=0, column=0, sticky="nsew")
+    fv_scroll = ScrollableFrame(tab_fieldvars_outer)
+    fv_scroll.pack(fill="both", expand=True)
+    tab_fieldvars = fv_scroll.scrollable_frame
+
+    # --- TAB 5c: Period Analysis (v4.21) ---
+    tab_period_outer = ttk.Frame(content_container)
+    tab_period_outer.grid(row=0, column=0, sticky="nsew")
+    period_scroll = ScrollableFrame(tab_period_outer)
+    period_scroll.pack(fill="both", expand=True)
+    tab_period = period_scroll.scrollable_frame
+
+    # --- TAB 5d: Observation Planner (v4.37) ---
+    tab_planner_outer = ttk.Frame(content_container)
+    tab_planner_outer.grid(row=0, column=0, sticky="nsew")
+    planner_scroll = ScrollableFrame(tab_planner_outer)
+    planner_scroll.pack(fill="both", expand=True)
+    tab_planner = planner_scroll.scrollable_frame
+
     # --- TAB 6: Settings ---
     tab_settings_outer = ttk.Frame(content_container)
     tab_settings_outer.grid(row=0, column=0, sticky="nsew")
@@ -2507,21 +2986,226 @@ def run_config_gui(pipeline_callback=None):
     cat_cb = ttk.Combobox(lf_files, textvariable=cat_var, values=["ATLAS refcat2", "APASS DR9", "Landolt Standard Star Catalogue", "GAIA_DR3", os.path.join('photometry_refstars', 'reference_stars.csv')], width=62)
     cat_cb.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
     
-    def browse_catalog():
+    # v4.26: local copies of the catalogues. The user only points to the folder that holds
+    # them; the subfolders (ATLAS, Gaia, APASS, VSX, GCVS list ...) are found automatically.
+    from photometry import local_catalogs as _lcat
+    _lcfg = _lcat.get_config()
+    tk.Label(lf_files, text="Local catalogue folder:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+    localcat_dir_var = tk.StringVar(value=_lcfg.get('root') or "")
+    vars_dict["local_catalog_dir"] = (localcat_dir_var, str)
+    ttk.Entry(lf_files, textvariable=localcat_dir_var, width=64).grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
+    localcat_use_var = tk.BooleanVar(value=_lcfg.get('use_local', True))
+    vars_dict["local_catalogs_use"] = (localcat_use_var, bool)
+    localcat_online_var = tk.BooleanVar(value=_lcfg.get('allow_online', True))
+    vars_dict["local_catalogs_online"] = (localcat_online_var, bool)
+    localcat_status_var = tk.StringVar(value="")
+
+    def localcat_show():
+        cfg = _lcat.get_config()
+        if not cfg.get('root'):
+            localcat_status_var.set("No local catalogue folder set - all catalogues are queried online (VizieR).")
+        else:
+            localcat_status_var.set("Found in " + cfg['root'] + ":\n   " + "\n   ".join(_lcat.summary_lines()))
+
+    def localcat_scan(path):
+        localcat_status_var.set(f"Scanning {path} ...")
+        root.update_idletasks()
+
+        def worker():
+            try:
+                found = _lcat.set_root(path)
+                tables = [c for c, i in found.items() if i.get('layout') == 'table']
+                if tables:
+                    root.after(0, lambda: localcat_status_var.set(
+                        "Indexing table catalogues (only once; large files take a while) ..."))
+                    _lcat.build_indexes(progress=lambda c, k, n, p_: root.after(
+                        0, lambda c=c, k=k, n=n: localcat_status_var.set(f"Indexing {c}: file {k}/{n} ...")))
+                root.after(0, localcat_show)
+            except Exception as e:
+                root.after(0, lambda err=e: localcat_status_var.set(f"Scan failed: {err}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def browse_catalog_dir():
         from tkinter import filedialog
-        filename = filedialog.askopenfilename(initialdir="photometry_refstars", title="Select Reference Catalog", filetypes=(("CSV files", "*.csv"), ("all files", "*.*")))
-        if filename:
-            cat_var.set(filename)
-            
-    ttk.Button(lf_files, text="Browse...", command=browse_catalog).grid(row=0, column=2, padx=5)
+        d = filedialog.askdirectory(title="Select the folder with the local catalogues (ATLAS, Gaia, APASS ... subfolders)",
+                                    initialdir=localcat_dir_var.get() or os.path.expanduser("~"))
+        if d:
+            localcat_dir_var.set(d)
+            localcat_scan(d)
+
+    def localcat_rescan():
+        d = localcat_dir_var.get().strip()
+        if not d:
+            _lcat.set_root(None); localcat_show(); return
+        if not os.path.isdir(d):
+            messagebox.showerror("Local catalogues", f"Folder not found:\n{d}"); return
+        localcat_scan(d)
+
+    def localcat_options(*_):
+        try:
+            _lcat.set_options(use_local=bool(localcat_use_var.get()), allow_online=bool(localcat_online_var.get()))
+        except tk.TclError:
+            pass
+    localcat_use_var.trace_add("write", localcat_options)
+    localcat_online_var.trace_add("write", localcat_options)
+
+    ttk.Button(lf_files, text="Browse Folder...", command=browse_catalog_dir).grid(row=1, column=2, padx=5)
+    ttk.Button(lf_files, text="Rescan", command=localcat_rescan).grid(row=1, column=3, padx=5)
+
+    def localcat_overview():
+        """v4.28: which catalogue files can be deleted (tools/catalog_overview.py) - read-only."""
+        d = localcat_dir_var.get().strip()
+        if not d or not os.path.isdir(d):
+            messagebox.showinfo("Catalogue Overview", "Choose the local catalogue folder first."); return
+        pop = tk.Toplevel(root); pop.title("Catalogue overview - which files can be deleted?"); pop.geometry("950x560")
+        top = tk.Frame(pop); top.pack(fill="x", padx=8, pady=6)
+        dec_v = tk.StringVar(value="-30"); mag_v = tk.StringVar(value="18")
+        tk.Label(top, text="Keep Dec >=").pack(side=tk.LEFT); ttk.Entry(top, textvariable=dec_v, width=6).pack(side=tk.LEFT, padx=(2, 10))
+        tk.Label(top, text="and magnitude <=").pack(side=tk.LEFT); ttk.Entry(top, textvariable=mag_v, width=6).pack(side=tk.LEFT, padx=(2, 10))
+        txt = scrolledtext.ScrolledText(pop, font=("Consolas", 9)); txt.pack(fill="both", expand=True, padx=8, pady=4)
+        tk.Label(pop, text="Nothing is deleted. The full list is written to catalog_overview.csv in the Calibra folder. "
+                           "Large Gaia/APASS files are read once and can take a while. For reduced copies of partly useful "
+                           "files use the command-line version (tools/catalog_overview.py --reduce, see manual 3.6a).",
+                 fg="#555", font=("Arial", 8), wraplength=900, justify=tk.LEFT).pack(anchor="w", padx=8, pady=(0, 6))
+
+        def run():
+            try:
+                dec_min, mag_max = float(dec_v.get()), float(mag_v.get())
+            except ValueError:
+                messagebox.showerror("Catalogue Overview", "Limits must be numbers.", parent=pop); return
+            txt.delete("1.0", tk.END); txt.insert(tk.END, "Scanning ...\n")
+            def emit(*a_, **k_):
+                s_ = " ".join(str(x) for x in a_) + "\n"
+                root.after(0, lambda s_=s_: (txt.insert(tk.END, s_), txt.see(tk.END)) if txt.winfo_exists() else None)
+
+            def worker():
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+                import catalog_overview as _co
+                try:
+                    _co.main([d, '--dec-min', str(dec_min), '--mag-max', str(mag_max), '--report', 'catalog_overview.csv'],
+                             emit=emit)
+                except Exception as e:
+                    emit(f"Error: {e}")
+            threading.Thread(target=worker, daemon=True).start()
+        ttk.Button(top, text="Scan", command=run).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Open Report (CSV)", command=lambda: open_path(os.path.abspath('catalog_overview.csv'))).pack(side=tk.LEFT, padx=4)
+    ttk.Button(lf_files, text="Which files can be deleted?...", command=localcat_overview).grid(row=2, column=3, padx=5, sticky=tk.E)
+    _lc_opts = tk.Frame(lf_files); _lc_opts.grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=10)
+    ttk.Checkbutton(_lc_opts, text="Use the local copies", variable=localcat_use_var).pack(side=tk.LEFT, padx=(0, 15))
+    ttk.Checkbutton(_lc_opts, text="Go online (VizieR) for catalogues or sky areas that are not available locally",
+                    variable=localcat_online_var).pack(side=tk.LEFT)
+    # v4.32: APASS DR10 from the AAVSO archive - button and automatic option
+    apass_auto_var = tk.BooleanVar(value=_lcfg.get('apass_auto', False))
+    vars_dict["apass_dr10_auto"] = (apass_auto_var, bool)
+    apass_auto_var.trace_add("write", lambda *_: _lcat.set_options(apass_auto=bool(apass_auto_var.get())))
+    _apass_row = tk.Frame(lf_files); _apass_row.grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(0, 4))
+    ttk.Checkbutton(_apass_row, text="APASS: download DR10 automatically from the AAVSO archive for fields not "
+                                     "available locally (saved for next time; DR9 from VizieR if it fails)",
+                    variable=apass_auto_var).pack(side=tk.LEFT)
+
+    def checked_image_paths():
+        try:
+            return [loaded_files[int(iid)]['path'] for iid in tree.get_children()
+                    if tree.item(iid, 'values')[0] == '[X]']
+        except Exception:
+            return []
+
+    def apass_dr10_dialog(*_):
+        """v4.32: download APASS DR10 for the checked images, a star name or RA/Dec."""
+        from photometry import apass_dr10 as _ad
+        pop = tk.Toplevel(root); pop.title("Download APASS DR10 (AAVSO archive)"); pop.geometry("820x520")
+        mode = tk.StringVar(value="images")
+        name_v = tk.StringVar(value=""); ra_v = tk.StringVar(value=""); dec_v = tk.StringVar(value="")
+        rad_v = tk.StringVar(value="0.5")
+        top = tk.Frame(pop); top.pack(fill="x", padx=10, pady=6)
+        ttk.Radiobutton(top, text="Field(s) of the checked images (plate-solved; radius from the image size)",
+                        variable=mode, value="images").grid(row=0, column=0, columnspan=6, sticky=tk.W)
+        ttk.Radiobutton(top, text="Star name:", variable=mode, value="name").grid(row=1, column=0, sticky=tk.W)
+        ttk.Entry(top, textvariable=name_v, width=18).grid(row=1, column=1, sticky=tk.W, padx=4)
+        ttk.Radiobutton(top, text="RA / Dec:", variable=mode, value="coords").grid(row=2, column=0, sticky=tk.W)
+        ttk.Entry(top, textvariable=ra_v, width=14).grid(row=2, column=1, sticky=tk.W, padx=4)
+        ttk.Entry(top, textvariable=dec_v, width=14).grid(row=2, column=2, sticky=tk.W, padx=4)
+        tk.Label(top, text="(hh:mm:ss / ±dd:mm:ss or degrees)", fg="#555").grid(row=2, column=3, sticky=tk.W)
+        tk.Label(top, text="Radius [deg] (name, RA/Dec):").grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(top, textvariable=rad_v, width=8).grid(row=3, column=1, sticky=tk.W, padx=4, pady=(4, 0))
+        tk.Label(top, text="max. 2; the download is a square of 2 x radius", fg="#555").grid(row=3, column=2, columnspan=3, sticky=tk.W)
+        tk.Label(pop, text="Saved unchanged in: " + os.path.abspath(_ad.target_folder()) + "\nEach field is downloaded only "
+                           "once. AAVSO asks to use the service with moderation; for large areas contact AAVSO.",
+                 fg="#555", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w", padx=10)
+        txt = scrolledtext.ScrolledText(pop, font=("Consolas", 9), height=14); txt.pack(fill="both", expand=True, padx=10, pady=6)
+
+        def emit(s_):
+            root.after(0, lambda s_=s_: (txt.insert(tk.END, s_ + "\n"), txt.see(tk.END)) if txt.winfo_exists() else None)
+
+        def go():
+            m_ = mode.get()
+            jobs = []
+            try:
+                if m_ == "images":
+                    paths = checked_image_paths()
+                    if not paths:
+                        messagebox.showinfo("APASS DR10", "Please check images in the File Manager.", parent=pop); return
+                    fields, no_wcs = _ad.fields_from_images(paths)
+                    if no_wcs:
+                        emit(f"{len(no_wcs)} image(s) without WCS skipped (plate-solve them first).")
+                    jobs = [(ra_, de_, r_) for ra_, de_, r_, n_ in fields]
+                    for ra_, de_, r_, n_ in fields:
+                        emit(f"Field: RA {ra_:.4f}, Dec {de_:+.4f}, radius {r_:g} deg ({n_} image(s))")
+                else:
+                    r_ = float(rad_v.get())
+                    if m_ == "name":
+                        c_ = _resolve_name(name_v.get().strip())
+                    else:
+                        from astropy.coordinates import SkyCoord
+                        import astropy.units as u
+                        import re
+                        rs, ds = ra_v.get().strip(), dec_v.get().strip()
+                        c_ = (SkyCoord(float(rs) * u.deg, float(ds) * u.deg)
+                              if re.fullmatch(r'[+-]?\d+(\.\d*)?', rs) else SkyCoord(rs, ds, unit=(u.hourangle, u.deg)))
+                    jobs = [(float(c_.ra.deg), float(c_.dec.deg), r_)]
+            except Exception as e:
+                messagebox.showerror("APASS DR10", f"Position could not be determined: {e}", parent=pop); return
+            if not jobs:
+                emit("Nothing to download."); return
+            go_btn.config(state=tk.DISABLED)
+
+            def worker():
+                import time as _t
+                for k, (ra_, de_, r_) in enumerate(jobs):
+                    if k:
+                        _t.sleep(_ad.MIN_INTERVAL)
+                    try:
+                        path_, n_, msg_ = _ad.download_field(ra_, de_, r_, log=emit)
+                        if n_ is None:
+                            emit(msg_)
+                    except Exception as e:
+                        emit(str(e))
+                root.after(0, lambda: (go_btn.config(state=tk.NORMAL) if go_btn.winfo_exists() else None, localcat_show()))
+            threading.Thread(target=worker, daemon=True).start()
+        bot = tk.Frame(pop); bot.pack(fill="x", padx=10, pady=(0, 8))
+        go_btn = ttk.Button(bot, text="Download", command=go); go_btn.pack(side=tk.LEFT)
+        ttk.Button(bot, text="Close", command=pop.destroy).pack(side=tk.RIGHT)
+    vars_dict['apass_dr10_dialog'] = apass_dr10_dialog
+    ttk.Button(_apass_row, text="Download APASS DR10...", command=apass_dr10_dialog).pack(side=tk.LEFT, padx=10)
+    tk.Label(lf_files, textvariable=localcat_status_var, justify=tk.LEFT, fg="#1a3a5f",
+             font=("Consolas", 8)).grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(2, 6))
+    vars_dict['localcat_after_load'] = lambda: (
+        localcat_scan(localcat_dir_var.get().strip())
+        if localcat_dir_var.get().strip() and os.path.abspath(localcat_dir_var.get().strip()) != (_lcat.get_config().get('root') or '')
+        else localcat_show())
+    localcat_show()
 
     # Filter Keyword Mapping
     lf_map = tk.LabelFrame(sub_astro, text="Filter Keyword Mapping")
     lf_map.pack(fill="x", padx=10, pady=10)
-    tk.Label(lf_map, text="Define keywords in your FITS headers that identify the B and V filters.", 
+    tk.Label(lf_map, text="Define keywords in your FITS headers that identify the B, V and L filters.", 
               fg="#555", font=("Arial", 8, "italic")).grid(row=0, column=0, columnspan=4, padx=10, pady=(0, 10))
     add_entry(lf_map, "B-Filter Keyword:", "filter_b_keyword", "Bmag", 1, col_offset=0, vtype=str)
     add_entry(lf_map, "V-Filter Keyword:", "filter_v_keyword", "Vmag", 1, col_offset=1, vtype=str)
+    add_entry(lf_map, "L-Filter Keyword:", "filter_l_keyword", "L", 2, col_offset=0, vtype=str)
+    tk.Label(lf_map, text="L (luminance) is used for light curves (Light Curves, Field Variables): magnitudes on the V scale "
+                          "of the comparison stars; 'L', 'Lum', 'Luminance' are recognised automatically.",
+             fg="#555", font=("Arial", 8, "italic"), wraplength=600, justify=tk.LEFT).grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=10)
 
     # Region Selection (from old TAB 1)
     lf_filt = tk.LabelFrame(sub_astro, text="Region Selection")
@@ -2544,89 +3228,277 @@ def run_config_gui(pipeline_callback=None):
 
     # --- TAB 1: Pre-processing CONTENT ---
     
-    # 1. Calibration (Bias & Flats)
-    lf_calib = tk.LabelFrame(tab_pre, text="FITS Calibration (Bias & Flats)")
-    lf_calib.pack(fill="x", padx=10, pady=10)
-    
-    add_file_selector(lf_calib, "Master Bias:", "bias_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits", 0, initial_dir="bias_and_flats")
-    add_file_selector(lf_calib, "Master Flat (V):", "flat_v_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Vmag_1x1_gain_0.fits", 1, initial_dir="bias_and_flats")
-    add_file_selector(lf_calib, "Master Flat (B):", "flat_b_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Bmag_1x1_gain_0.fits", 2, initial_dir="bias_and_flats")
+    # 1. Calibration (Bias & Flats) - v4.27: master frames built by Calibra, automatic
+    # selection of the matching masters, calibration on the fly or into files
+    from photometry import master_frames as _mf
+    _mcfg = _mf.get_config()
+
+    lf_mast = tk.LabelFrame(tab_pre, text="Master Frames (bias, flats, optional darks)")
+    lf_mast.pack(fill="x", padx=10, pady=(10, 4))
+    # v4.29: one folder per type - every FITS file in the bias folder is a bias, etc.; the masters
+    # are written into the same folder. The mixed folder (type from header / names) is still possible.
+    calbias_var = tk.StringVar(value=_mcfg.get('bias_folder', ''))
+    calflat_var = tk.StringVar(value=_mcfg.get('flat_folder', ''))
+    caldark_var = tk.StringVar(value=_mcfg.get('dark_folder', ''))
+    calfolder_var = tk.StringVar(value=_mcfg.get('folder', ''))
+    vars_dict["cal_bias_folder"] = (calbias_var, str)
+    vars_dict["cal_flat_folder"] = (calflat_var, str)
+    vars_dict["cal_dark_folder"] = (caldark_var, str)
+    vars_dict["cal_frames_folder"] = (calfolder_var, str)
+
+    def _cal_folder_row(r, label, var, button, title):
+        tk.Label(lf_mast, text=label).grid(row=r, column=0, sticky=tk.W, padx=10, pady=2)
+        ttk.Entry(lf_mast, textvariable=var, width=60).grid(row=r, column=1, columnspan=3, sticky=tk.W, padx=10)
+
+        def browse():
+            from tkinter import filedialog
+            d = filedialog.askdirectory(title=title, initialdir=var.get() or calbias_var.get() or os.path.expanduser("~"))
+            if d:
+                var.set(d)
+                cal_sync(); cal_show_masters()
+        ttk.Button(lf_mast, text=button, command=browse).grid(row=r, column=4, padx=5, sticky="ew")
+    _cal_folder_row(0, "Bias folder:", calbias_var, "Browse Bias Folder...",
+                    "Folder with bias frames (every FITS file in it is used as a bias)")
+    _cal_folder_row(1, "Flat folder:", calflat_var, "Browse Flat Folder...",
+                    "Folder with flat frames (every FITS file in it is a flat; filter from header or name)")
+    _cal_folder_row(2, "Dark folder (optional):", caldark_var, "Browse Dark Folder...",
+                    "Folder with dark frames (only needed if you use darks)")
+    _cal_folder_row(3, "or mixed folder:", calfolder_var, "Browse Calibration Folder...",
+                    "Folder with bias / flat (/ dark) frames mixed - type from FITS header or file names")
+    tk.Label(lf_mast, text="Bias/flat/dark folder: every FITS file in it is taken as that type, names do not matter. "
+                           "Mixed folder: type from the FITS header (IMAGETYP) or the file names. "
+                           "Masters are written into the same folder.",
+             fg="#555", font=("Arial", 8, "italic"), justify=tk.LEFT, wraplength=760).grid(
+        row=4, column=0, columnspan=5, sticky=tk.W, padx=10)
+    cal_method_var = tk.StringVar(value="sigma-clipped mean")
+    vars_dict["cal_combine_method"] = (cal_method_var, str)
+    cal_minframes_var = tk.IntVar(value=3)
+    vars_dict["cal_min_frames"] = (cal_minframes_var, int)
+    tk.Label(lf_mast, text="Combine:").grid(row=5, column=0, sticky=tk.W, padx=10)
+    ttk.Combobox(lf_mast, textvariable=cal_method_var, values=["sigma-clipped mean", "median"], width=18,
+                 state="readonly").grid(row=5, column=1, sticky=tk.W, padx=10)
+    tk.Label(lf_mast, text="min. frames:").grid(row=5, column=2, sticky=tk.E)
+    ttk.Spinbox(lf_mast, from_=2, to=500, textvariable=cal_minframes_var, width=5).grid(row=5, column=3, sticky=tk.W, padx=4)
+    cal_build_btn = ttk.Button(lf_mast, text="Build / Update Masters")
+    cal_build_btn.grid(row=5, column=4, padx=5, pady=4)
+    cal_mast_status = tk.StringVar(value="")
+    tk.Label(lf_mast, textvariable=cal_mast_status, fg="#1a3a5f", justify=tk.LEFT, wraplength=760,
+             font=("Arial", 9)).grid(row=6, column=0, columnspan=5, sticky=tk.W, padx=10)
+    cal_tree = ttk.Treeview(lf_mast, columns=("type", "filter", "size", "gain", "exp", "n", "file"), show="headings", height=5)
+    for c_, t_, w_ in (("type", "Type", 70), ("filter", "Filter", 60), ("size", "Size / bin", 110), ("gain", "Gain / offset", 90),
+                       ("exp", "Exp / temp", 90), ("n", "N", 40), ("file", "File", 330)):
+        cal_tree.heading(c_, text=t_); cal_tree.column(c_, width=w_, anchor="w" if c_ == "file" else "center")
+    cal_tree.grid(row=7, column=0, columnspan=5, sticky="ew", padx=10, pady=(2, 6))
+
+    def _cal_folders():
+        return {k: v.get().strip() for k, v in (('bias_folder', calbias_var), ('flat_folder', calflat_var),
+                                                ('dark_folder', caldark_var), ('folder', calfolder_var))}
+
+    def cal_show_masters():
+        cal_tree.delete(*cal_tree.get_children())
+        dirs = [d for d in _cal_folders().values() if d and os.path.isdir(d)]
+        if not dirs:
+            cal_mast_status.set("Choose the folder with your bias frames and the folder with your flat frames. "
+                                "'Build / Update Masters' creates the master frames in these folders.")
+            return
+        try:
+            folder = os.path.commonpath([os.path.abspath(d) for d in dirs]) if len(dirs) > 1 else dirs[0]
+        except ValueError:                       # e.g. different drives on Windows
+            folder = None
+        ms = _mf.find_masters(*dirs)
+        from astropy.io import fits as _fits
+        for m in ms:
+            g_ = "" if m['gain'] is None else f"{m['gain']:g}"
+            o_ = "" if m['offset'] is None else f"{m['offset']:g}"
+            et = ""
+            if m['mtype'] in ('DARK', 'DARKFLAT'):
+                et = f"{m['exptime']:g} s" + (f" / {m['temp']:g} C" if m['temp'] is not None else "")
+            try:
+                n_ = _fits.getheader(m['path']).get('NCOMBINE', '')
+            except Exception:
+                n_ = ''
+            cal_tree.insert("", "end", values=(m['mtype'], m['filter'] if m['mtype'] == 'FLAT' else "",
+                                               f"{m['shape'][1]}x{m['shape'][0]} / {m['xbin']}", f"{g_} / {o_}", et, n_,
+                                               os.path.relpath(m['path'], folder) if folder else m['path']))
+        where = folder if len(dirs) == 1 else "the calibration folders"
+        cal_mast_status.set(f"{len(ms)} master frame(s) in {where}." if ms else
+                            f"No master frames yet in {where} - press 'Build / Update Masters'.")
+
+    def on_build_masters():
+        dirs = _cal_folders()
+        bad = [d for d in dirs.values() if d and not os.path.isdir(d)]
+        if bad:
+            messagebox.showerror("Master Frames", "Folder not found:\n" + "\n".join(bad)); return
+        if not any(dirs.values()):
+            messagebox.showerror("Master Frames", "Please choose the bias folder and the flat folder "
+                                                  "(or one mixed calibration folder)."); return
+        method = 'median' if cal_method_var.get().startswith('median') else 'sigma'
+        try:
+            minf = max(2, int(cal_minframes_var.get()))
+        except (tk.TclError, ValueError):
+            minf = 3
+        cal_build_btn.config(state=tk.DISABLED)
+        cal_mast_status.set("Scanning calibration frames ...")
+
+        def worker():
+            try:
+                mistyped = []
+
+                def _log(msg):
+                    print(msg)
+                    if msg.lstrip().startswith("WARNING"):
+                        mistyped.append(msg.strip())
+                res = _mf.build_masters(dirs['folder'] or None, method=method, min_frames=minf,
+                                        bias_folder=dirs['bias_folder'] or None, flat_folder=dirs['flat_folder'] or None,
+                                        dark_folder=dirs['dark_folder'] or None,
+                                        progress=lambda x, name: root.after(0, lambda: cal_mast_status.set(
+                                            f"Building {name} ... {100 * x:.0f} %")),
+                                        log=_log)
+                nb = sum(r['status'] == 'built' for r in res); nr = sum(r['status'] == 'reused' for r in res)
+                ns = [r for r in res if r['status'] == 'skipped']
+                warn = [r for r in res if r['note'].startswith('WARNING')]
+                msg = f"Masters: {nb} built, {nr} up to date" + (f", {len(ns)} group(s) skipped (too few frames)" if ns else "")
+                if warn:
+                    msg += "\n" + "\n".join(f"{os.path.basename(r['path'])}: {r['note']}" for r in warn)
+                if mistyped:
+                    msg += (f"\nWarning: {len(mistyped)} file(s) have another frame type in the header (e.g. Light) - "
+                            "used anyway as the type of their folder (details in the console).")
+                if not res:
+                    msg = ("No raw bias/flat/dark frames found (bias/flat/dark folders: all FITS files; mixed folder: "
+                           "type from IMAGETYP, or 'bias'/'flat'/'dark' in file or folder names).")
+                def done():
+                    cal_sync(); cal_show_masters()
+                    cal_mast_status.set(msg)
+                root.after(0, done)
+            except Exception as e:
+                root.after(0, lambda err=e: (cal_mast_status.set(f"Error: {err}"),
+                                             messagebox.showerror("Master Frames", str(err))))
+            finally:
+                root.after(0, lambda: cal_build_btn.config(state=tk.NORMAL))
+        threading.Thread(target=worker, daemon=True).start()
+    cal_build_btn.config(command=on_build_masters)
+
+    lf_calib = tk.LabelFrame(tab_pre, text="Calibration of Light Frames")
+    lf_calib.pack(fill="x", padx=10, pady=4)
+    cal_mode_var = tk.StringVar(value=_mcfg.get('mode', 'auto'))
+    vars_dict["cal_mode"] = (cal_mode_var, str)
+    ttk.Radiobutton(lf_calib, text="Automatic: matching masters from the calibration folders (filter, size, binning, gain, offset)",
+                    variable=cal_mode_var, value="auto").grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(4, 0))
+    ttk.Radiobutton(lf_calib, text="Manual master files:", variable=cal_mode_var, value="manual").grid(
+        row=1, column=0, columnspan=3, sticky=tk.W, padx=10)
+    lf_man = tk.Frame(lf_calib); lf_man.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=20)
+    add_file_selector(lf_man, "Master Bias:", "bias_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\Master_Bias_1x1_gain_0.fits", 0, initial_dir="bias_and_flats")
+    add_file_selector(lf_man, "Master Flat (V):", "flat_v_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Vmag_1x1_gain_0.fits", 1, initial_dir="bias_and_flats")
+    add_file_selector(lf_man, "Master Flat (B):", "flat_b_path", r"C:\Astro\Photometry_Calibra\bias_and_flats\FLAT_Bmag_1x1_gain_0.fits", 2, initial_dir="bias_and_flats")
+    add_file_selector(lf_man, "Master Flat (L):", "flat_l_path", "", 3, initial_dir="bias_and_flats")
+    add_file_selector(lf_man, "Master Dark (optional):", "dark_path", "", 4, initial_dir="bias_and_flats")
+    # v4.15: option to subtract the bias from the master flat before normalising.
+    flat_bias_sub_var = tk.BooleanVar(value=True)
+    vars_dict["flat_already_bias_subtracted"] = (flat_bias_sub_var, bool)
+    ttk.Checkbutton(lf_man, text="Master flats from other software (e.g. Siril) are already bias/dark-subtracted (Calibra's own flats always are)",
+                    variable=flat_bias_sub_var).grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 5))
+    cal_darks_var = tk.BooleanVar(value=_mcfg.get('use_darks', False))
+    vars_dict["cal_use_darks"] = (cal_darks_var, bool)
+    ttk.Checkbutton(lf_calib, text="Use darks (master dark of the same exposure/temperature, or scaled) - otherwise bias only",
+                    variable=cal_darks_var).grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=10)
+    cal_fly_var = tk.BooleanVar(value=_mcfg.get('on_the_fly', False))
+    vars_dict["cal_on_the_fly"] = (cal_fly_var, bool)
+    ttk.Checkbutton(lf_calib, text="Calibrate on the fly when measuring (Light Curves, Field Variables, Data Mining, Analysis) "
+                                   "- no calibrated files needed", variable=cal_fly_var).grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=10)
+    cal_info_var = tk.StringVar(value="")
+    tk.Label(lf_calib, textvariable=cal_info_var, fg="#555", font=("Arial", 8, "italic"), justify=tk.LEFT,
+             wraplength=760).grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 6))
+
+    def cal_sync(*_):
+        """Push the GUI settings into photometry.master_frames (also saved for the pipeline)."""
+        try:
+            sat = float(vars_dict["saturation_limit"][0].get()) if "saturation_limit" in vars_dict else 63000.0
+        except (tk.TclError, ValueError):
+            sat = 63000.0
+        try:
+            _mf.configure(on_the_fly=bool(cal_fly_var.get()), mode=cal_mode_var.get(), **_cal_folders(),
+                          use_darks=bool(cal_darks_var.get()), flat_already_sub=bool(flat_bias_sub_var.get()), sat_limit=sat,
+                          manual={'bias': vars_dict["bias_path"][0].get(), 'dark': vars_dict["dark_path"][0].get(),
+                                  'flat_V': vars_dict["flat_v_path"][0].get(), 'flat_B': vars_dict["flat_b_path"][0].get(),
+                                  'flat_L': vars_dict["flat_l_path"][0].get()})
+        except tk.TclError:
+            return
+        cal_info_var.set("Calibration on the fly is ON: every measured frame is corrected in memory with the selected masters "
+                         "(already calibrated frames are left as they are). Raw files stay unchanged."
+                         if cal_fly_var.get() else
+                         "Calibration on the fly is OFF: frames are measured as loaded (raw, or cal_ files written below).")
+    for _v in (cal_fly_var, cal_mode_var, cal_darks_var, flat_bias_sub_var, calfolder_var, calbias_var, calflat_var, caldark_var):
+        _v.trace_add("write", cal_sync)
+    for _k in ("bias_path", "dark_path", "flat_v_path", "flat_b_path", "flat_l_path"):
+        vars_dict[_k][0].trace_add("write", cal_sync)
+    vars_dict['cal_after_load'] = lambda: (cal_sync(), cal_show_masters())
 
     def on_run_calibration():
         selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
         if not selected_iids:
             messagebox.showwarning("No Selection", "Please check at least one FITS file in the File Manager.")
             return
-        
-        bias_path = vars_dict["bias_path"][0].get()
-        flat_v = vars_dict["flat_v_path"][0].get()
-        flat_b = vars_dict["flat_b_path"][0].get()
-        
-        if not os.path.exists(bias_path):
-            messagebox.showerror("Error", f"Master Bias not found at:\n{bias_path}")
-            return
+        cal_sync()
+        jobs = [(int(iid), loaded_files[int(iid)]['path']) for iid in selected_iids]
 
         def cal_thread():
             try:
-                from astropy.io import fits
-                print(f"\n--- Starting Batch Calibration ---")
-                total = len(selected_iids)
-                success_count = 0
-                
-                for idx, iid in enumerate(selected_iids):
-                    iid_int = int(iid)
-                    orig_path = loaded_files[iid_int]['path']
-                    
-                    filt = loaded_files[iid_int]['filter'].upper()
-                    b_key = vars_dict["filter_b_keyword"][0].get().upper()
-                    v_key = vars_dict["filter_v_keyword"][0].get().upper()
-                    
-                    flat_path = None
-                    if b_key and b_key in filt:
-                        flat_path = flat_b
-                    elif v_key and v_key in filt:
-                        flat_path = flat_v
-                    
-                    if not flat_path:
-                        print(f"[{idx+1}/{total}] Error: Filter '{filt}' does not match B ({b_key}) or V ({v_key}) mapping. Skipping {os.path.basename(orig_path)}.")
-                        continue
-                    
-                    if not os.path.exists(flat_path):
-                        print(f"[{idx+1}/{total}] Warning: Master Flat for '{filt}' not found at {flat_path}. Skipping.")
-                        continue
-
-                    print(f"[{idx+1}/{total}] Calibrating {os.path.basename(orig_path)}...")
-                    with fits.open(orig_path) as hdul:
-                        data = hdul[0].data
-                        header = hdul[0].header
-                        if 'FILENAME' not in header:
-                            header['FILENAME'] = os.path.basename(orig_path)
-                        
-                        # Apply calibration
-                        calibrate_image(data, header, bias_path, flat_path, verbose=True)
-                        
-                        # Expected output path
-                        out_dir = "fitsfiles/calibrated"
-                        new_path = os.path.join(out_dir, f"cal_{os.path.basename(orig_path)}")
-                        
-                        if os.path.exists(new_path):
-                            success_count += 1
-                            loaded_files[iid_int] = scan_fits_header(new_path)
-                            root.after(0, update_file_table)
-                
-                msg = f"Calibration complete.\n{success_count} of {total} files were successfully calibrated."
-                print(f"\n{msg}")
+                print(f"\n--- Calibration of {len(jobs)} frame(s) (written to 'calibrated' next to the raw files) ---")
+                ok = 0
+                for idx, (iid_int, orig_path) in enumerate(jobs):
+                    out, msg = _mf.calibrate_to_file(orig_path)
+                    print(f"[{idx + 1}/{len(jobs)}] {os.path.basename(orig_path)}: {msg}")
+                    if out and os.path.exists(out):
+                        ok += 1
+                        new_info = scan_fits_header(out)
+                        def _replace(orig=orig_path, info=new_info):
+                            for k, f in enumerate(loaded_files):
+                                if f['path'] == orig:
+                                    loaded_files[k] = info
+                                    break
+                            update_file_table()
+                        root.after(0, _replace)
+                msg = f"Calibration complete.\n{ok} of {len(jobs)} files calibrated (or already up to date).\nDetails in the console."
+                print(msg)
                 root.after(0, lambda: messagebox.showinfo("Batch Complete", msg))
             except Exception as e:
                 print(f"Calibration error: {e}")
-                root.after(0, lambda: messagebox.showerror("Error", f"Calibration failed: {e}"))
-
+                root.after(0, lambda err=e: messagebox.showerror("Error", f"Calibration failed: {err}"))
         threading.Thread(target=cal_thread, daemon=True).start()
+
+    def on_check_calibration():
+        """Show which masters would be used for the checked frames."""
+        selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+        if not selected_iids:
+            messagebox.showwarning("No Selection", "Please check at least one FITS file in the File Manager."); return
+        cal_sync()
+        from astropy.io import fits
+        lines = []
+        for iid in selected_iids[:40]:
+            p_ = loaded_files[int(iid)]['path']
+            try:
+                h_ = fits.getheader(p_)
+                why = _mf.skip_reason(h_, p_)
+                if why:
+                    lines.append(f"{os.path.basename(p_)}: not calibrated - {why}"); continue
+                b_, d_, f_, notes = _mf._CAL.choose(_mf.frame_info(p_, h_))
+                lines.append(f"{os.path.basename(p_)}:  bias={os.path.basename(b_) if b_ else '-'}"
+                             + (f"  dark={os.path.basename(d_[0])}{' (scaled)' if d_[1] else ''}" if d_ else "")
+                             + f"  flat={os.path.basename(f_) if f_ else '-'}"
+                             + (("   [" + "; ".join(notes) + "]") if notes else "")
+                             + (f"   NOTE: {_mf.stack_note(h_)}" if _mf.stack_note(h_) else ""))
+            except Exception as e:
+                lines.append(f"{os.path.basename(p_)}: {e}")
+        pop = tk.Toplevel(root); pop.title("Masters for the checked frames"); pop.geometry("1000x400")
+        txt = scrolledtext.ScrolledText(pop, font=("Consolas", 9)); txt.pack(fill="both", expand=True)
+        txt.insert("1.0", "\n".join(lines) + ("\n..." if len(selected_iids) > 40 else ""))
+        txt.config(state=tk.DISABLED)
 
     cal_btn_frame = ttk.Frame(tab_pre)
     cal_btn_frame.pack(pady=(10, 20))
     
-    run_cal_btn = tk.Button(cal_btn_frame, text="Run Calibration (Bias/Flat) on Selected", command=on_run_calibration,
+    ttk.Button(cal_btn_frame, text="Show Masters for Checked Frames", command=on_check_calibration).pack(side=tk.LEFT, padx=5)
+    run_cal_btn = tk.Button(cal_btn_frame, text="Write Calibrated Files for Checked Frames", command=on_run_calibration,
                             bg="#388e3c", fg="white", font=("Arial", 11, "bold"), pady=10, width=35)
     run_cal_btn.pack(side=tk.LEFT, padx=5)
     
@@ -2659,6 +3531,75 @@ def run_config_gui(pipeline_callback=None):
     ttk.Button(lf_plate_settings, text="Browse...", command=browse_astap).grid(row=1, column=2, padx=5)
 
     add_check(lf_plate_settings, "Annotate Image", "plate_annotate", False, 2)
+    add_entry(lf_plate_settings, "Field height (deg, 0 = auto):", "plate_fov", 0.0, 3, col_offset=0)
+
+    # v4.22: position guess for images without (usable) coordinates in the header
+    lf_plate_guess = tk.LabelFrame(tab_pre_right, text="Position Guess")
+    lf_plate_guess.pack(fill="x", padx=10, pady=(0, 10))
+    plate_guess_mode = tk.StringVar(value="header")
+    vars_dict["plate_guess_mode"] = (plate_guess_mode, str)
+    plate_obj_var = tk.StringVar(value="")
+    vars_dict["plate_guess_object"] = (plate_obj_var, str)
+    plate_ra_var = tk.StringVar(value="")
+    vars_dict["plate_guess_ra"] = (plate_ra_var, str)
+    plate_dec_var = tk.StringVar(value="")
+    vars_dict["plate_guess_dec"] = (plate_dec_var, str)
+    plate_chain_var = tk.BooleanVar(value=True)
+    vars_dict["plate_chain"] = (plate_chain_var, bool)
+    plate_blind_var = tk.BooleanVar(value=True)
+    vars_dict["plate_allow_blind"] = (plate_blind_var, bool)
+    plate_obj_coord_var = tk.StringVar(value="")
+    plate_obj_resolved = {}
+
+    ttk.Radiobutton(lf_plate_guess, text="From the FITS header (blind solve if there is none)",
+                    variable=plate_guess_mode, value="header").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=2)
+    ttk.Radiobutton(lf_plate_guess, text="Object name:", variable=plate_guess_mode, value="name").grid(row=1, column=0, sticky=tk.W, padx=10, pady=2)
+    ttk.Entry(lf_plate_guess, textvariable=plate_obj_var, width=18).grid(row=1, column=1, sticky=tk.W, padx=2)
+
+    def plate_lookup_name(name):
+        """SIMBAD, then AAVSO VSX. Returns (ra, dec) in degrees; raises on failure."""
+        key = name.strip().lower()
+        if key in plate_obj_resolved:
+            return plate_obj_resolved[key]
+        from astropy.coordinates import SkyCoord as _SC
+        try:
+            c = _resolve_name(name)
+            pos = (float(c.ra.deg), float(c.dec.deg))
+        except Exception:
+            from photometry.calibration import resolve_auid
+            r = resolve_auid(name, verbose=False)
+            if not r:
+                raise ValueError(f"'{name}' could not be resolved (local GCVS list, SIMBAD, VSX).")
+            pos = (float(r['ra']), float(r['dec']))
+        plate_obj_resolved[key] = pos
+        return pos
+
+    def on_plate_lookup():
+        name = plate_obj_var.get().strip()
+        if not name:
+            return
+        plate_guess_mode.set("name")
+        plate_obj_coord_var.set("looking up...")
+        def worker():
+            try:
+                ra_, dec_ = plate_lookup_name(name)
+                c = SkyCoord(ra_ * u.deg, dec_ * u.deg)
+                txt = f"{c.ra.to_string(unit=u.hour, sep=':', precision=1, pad=True)}  {c.dec.to_string(sep=':', precision=0, pad=True, alwayssign=True)}"
+            except Exception as ex:
+                txt = f"not found: {ex}"
+            root.after(0, lambda: plate_obj_coord_var.set(txt))
+        threading.Thread(target=worker, daemon=True).start()
+    ttk.Button(lf_plate_guess, text="Look up", command=on_plate_lookup).grid(row=1, column=2, sticky=tk.W, padx=2)
+    tk.Label(lf_plate_guess, textvariable=plate_obj_coord_var, font=("Arial", 8, "italic")).grid(row=1, column=3, sticky=tk.W, padx=6)
+    ttk.Radiobutton(lf_plate_guess, text="RA / Dec:", variable=plate_guess_mode, value="manual").grid(row=2, column=0, sticky=tk.W, padx=10, pady=2)
+    ttk.Entry(lf_plate_guess, textvariable=plate_ra_var, width=18).grid(row=2, column=1, sticky=tk.W, padx=2)
+    ttk.Entry(lf_plate_guess, textvariable=plate_dec_var, width=14).grid(row=2, column=2, sticky=tk.W, padx=2)
+    tk.Label(lf_plate_guess, text="e.g. 09:36:53 +44:04:00 or 144.22 44.07 (deg)",
+             font=("Arial", 8, "italic")).grid(row=2, column=3, sticky=tk.W, padx=6)
+    ttk.Checkbutton(lf_plate_guess, text="Use the solution of each image as the guess for the next image of the series",
+                    variable=plate_chain_var).grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=10, pady=2)
+    ttk.Checkbutton(lf_plate_guess, text="Allow blind solving (whole sky, slow) if all guesses fail",
+                    variable=plate_blind_var).grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(0, 6))
 
     plate_status_var = tk.StringVar(value="Ready")
     plate_status_label = SelectableLabel(tab_pre_right, textvariable=plate_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
@@ -2701,38 +3642,75 @@ def run_config_gui(pipeline_callback=None):
         radius = vars_dict["plate_radius"][0].get()
         exe = astap_path_var.get()
         annotate = vars_dict["plate_annotate"][0].get()
+        try:
+            fov = float(vars_dict["plate_fov"][0].get() or 0)
+        except (tk.TclError, ValueError):
+            fov = 0.0
+        # v4.22: position guess
+        mode = plate_guess_mode.get()
+        chain = bool(plate_chain_var.get())
+        allow_blind = bool(plate_blind_var.get())
+        guess = None
+        if mode == "manual":
+            try:
+                from photometry.field_variables import parse_coordinates
+                guess = parse_coordinates(plate_ra_var.get(), plate_dec_var.get())
+            except Exception as ex:
+                messagebox.showerror("Position Guess", f"RA/Dec could not be read:\n'{plate_ra_var.get()}'  "
+                                     f"'{plate_dec_var.get()}'\n({ex})\n\nUse e.g. 09:36:53 +44:04:00 or 144.22 44.07.")
+                return
+        obj_name = plate_obj_var.get().strip() if mode == "name" else ""
+        if mode == "name" and not obj_name:
+            messagebox.showerror("Position Guess", "Please enter an object name (or choose another option).")
+            return
         
         plate_status_var.set(f"Solving {len(files_to_solve)} files...")
         run_plate_btn.config(state=tk.DISABLED, text="Solving...")
         
         def plate_thread():
             try:
+                from photometry.plate_solve import solve_series
                 print(f"\n--- Starting Batch Plate Solve ---")
                 print(f"Target files: {len(files_to_solve)}")
                 print(f"Suffix: {suffix}")
+                g = guess
+                if obj_name:
+                    try:
+                        g = plate_lookup_name(obj_name)
+                        print(f"Position guess from '{obj_name}': RA={g[0]:.4f}, Dec={g[1]:+.4f} deg")
+                    except Exception as ex:
+                        print(f"Object name not resolved ({ex}) - using the header / blind solve instead.")
+                        g = None
                 
-                solved_count = 0
+                # copy files first (same order as the File Manager)
+                todo = []
                 for idx, iid in enumerate(files_to_solve):
                     iid_int = int(iid)
                     orig_path = loaded_files[iid_int]['path']
-                    
                     base, ext = os.path.splitext(orig_path)
                     new_filename = f"{base}_{suffix}{ext}" if suffix else orig_path
-                    
                     if new_filename != orig_path:
                         print(f"[{idx+1}/{len(files_to_solve)}] Copying {orig_path} to {new_filename}...")
                         shutil.copy2(orig_path, new_filename)
-                    
-                    print(f"[{idx+1}/{len(files_to_solve)}] Solving {new_filename}...")
-                    res = solve_with_astap(new_filename, astap_exe=exe, search_radius=radius, annotate=annotate)
-                    
-                    if res:
-                        solved_count += 1
-                        # Update the loaded_files entry in-place
-                        loaded_files[iid_int] = scan_fits_header(new_filename)
+                    todo.append((iid_int, new_filename))
+
+                counts = {'ok': 0}
+                def on_result(i, path, res, used):
+                    iid_int = todo[i][0]
+                    if res is not None:
+                        counts['ok'] += 1
+                        print(f"[{i+1}/{len(todo)}] Solved (guess: {used}).")
+                        loaded_files[iid_int] = scan_fits_header(path)
                         root.after(0, update_file_table)
                     else:
-                        print(f"[{idx+1}/{len(files_to_solve)}] Solve failed for {new_filename}")
+                        print(f"[{i+1}/{len(todo)}] Solve failed for {path}")
+                    root.after(0, lambda k=i + 1, n=counts['ok']: plate_status_var.set(
+                        f"Solving... {k}/{len(todo)} done, {n} solved"))
+
+                solve_series([p for _, p in todo], astap_exe=exe, search_radius=radius, annotate=annotate,
+                             ra_hint_deg=g[0] if g else None, dec_hint_deg=g[1] if g else None,
+                             chain=chain, fov=fov, allow_blind=allow_blind, on_result=on_result)
+                solved_count = counts['ok']
                 
                 msg = f"Plate solve complete.\n{solved_count} of {len(files_to_solve)} files were successfully solved."
                 print(f"\n{msg}")
@@ -2740,7 +3718,7 @@ def run_config_gui(pipeline_callback=None):
                 root.after(0, lambda: plate_status_var.set("Complete."))
             except Exception as e:
                 print(f"Plate solve error: {e}")
-                root.after(0, lambda: messagebox.showerror("Error", f"Plate solve failed: {e}"))
+                root.after(0, lambda err=e: messagebox.showerror("Error", f"Plate solve failed: {err}"))
                 root.after(0, lambda: plate_status_var.set("Error occurred."))
             finally:
                 root.after(0, lambda: run_btn_plate_solve_relabel())
@@ -2859,7 +3837,7 @@ def run_config_gui(pipeline_callback=None):
                 root.after(0, update_file_table)
             except Exception as e:
                 print(f"OSC Split error: {e}")
-                root.after(0, lambda: messagebox.showerror("Error", f"OSC Split failed: {e}"))
+                root.after(0, lambda err=e: messagebox.showerror("Error", f"OSC Split failed: {err}"))
                 root.after(0, lambda: osc_status_var.set("Error occurred."))
             finally:
                 root.after(0, lambda: run_osc_btn.config(state=tk.NORMAL, text="Run OSC Channel Split on Selected"))
@@ -2966,6 +3944,18 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(lf_color, text="* 1.0 used if FITS values not found. To override FITS airmass values, check the box below and enter new values.", fg="#555", font=("Arial", 8, "italic")).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
     ttk.Checkbutton(lf_color, text="Override FITS Airmass", variable=override_airmass_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
 
+    # v4.16: star selection for the colour fit (faint stars biased the old fit)
+    tk.Label(lf_color, text="Min SNR (colour fit):").grid(row=6, column=0, sticky=tk.W, padx=10, pady=5)
+    color_min_snr_var = tk.DoubleVar(value=50.0)
+    vars_dict["color_min_snr"] = (color_min_snr_var, float)
+    ttk.Entry(lf_color, textvariable=color_min_snr_var, width=10).grid(row=6, column=1, sticky=tk.W, padx=10, pady=5)
+    tk.Label(lf_color, text="Faintest catalogue V (empty = no limit):").grid(row=7, column=0, sticky=tk.W, padx=10, pady=5)
+    color_max_v_var = tk.StringVar(value="")
+    vars_dict["color_max_v"] = (color_max_v_var, str)
+    ttk.Entry(lf_color, textvariable=color_max_v_var, width=10).grid(row=7, column=1, sticky=tk.W, padx=10, pady=5)
+    tk.Label(lf_color, text="* Stars brighter than 'Max Peak for Calib Stars' (Settings) and blends are also excluded.",
+             fg="#555", font=("Arial", 8, "italic")).grid(row=6, column=2, columnspan=2, sticky=tk.W, padx=10, pady=5)
+
     color_btn_frame = ttk.Frame(sub_color)
     color_btn_frame.pack(pady=5)
     
@@ -3000,9 +3990,9 @@ def run_config_gui(pipeline_callback=None):
         
         for iid in selected_iids:
             finfo = loaded_files[int(iid)]
-            filt = str(finfo.get('filter', '')).upper()
-            if b_key in filt or (len(filt)==1 and filt=='B'): b_count += 1
-            elif v_key in filt or (len(filt)==1 and filt=='V'): v_count += 1
+            band = band_of(finfo.get('filter', ''))
+            if band == 'B': b_count += 1
+            elif band == 'V': v_count += 1
         return b_count, v_count
 
     # --- Differential Photometry Section ---
@@ -3036,8 +4026,10 @@ def run_config_gui(pipeline_callback=None):
     
     ref_mode_var = tk.StringVar(value="auto")
     vars_dict["ref_mode"] = (ref_mode_var, str)
-    ttk.Radiobutton(lf_ref, text="Automatic (Brightest star with 0.4 <= B-V <= 0.8)", variable=ref_mode_var, value="auto").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
-    ttk.Radiobutton(lf_ref, text="Resolve Star by Name (via Simbad)", variable=ref_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    # v4.16: 'auto' = ensemble of all suitable comparison stars; 'auto_single' = one star
+    ttk.Radiobutton(lf_ref, text="Automatic ensemble (all suitable catalogue stars - recommended)", variable=ref_mode_var, value="auto").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    ttk.Radiobutton(lf_ref, text="Automatic single star (typical brightness/colour of the field)", variable=ref_mode_var, value="auto_single").grid(row=0, column=4, columnspan=6, sticky=tk.W, padx=10, pady=5)
+    ttk.Radiobutton(lf_ref, text="Resolve Star by Name (local GCVS list, else Simbad)", variable=ref_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
     
     tk.Label(lf_ref, text="Star Name:").grid(row=2, column=0, sticky=tk.E, padx=(10, 2), pady=5)
     star_name_var = tk.StringVar(value="AE UMa")
@@ -3062,8 +4054,11 @@ def run_config_gui(pipeline_callback=None):
             from astropy.coordinates import SkyCoord
             from photometry.calibration import resolve_auid
             c = None
+            src = ''
             try:
-                c = SkyCoord.from_name(star_name)
+                c = _resolve_name(star_name)
+                from photometry.names import LAST_SOURCE as _ls
+                src = _ls['source']
             except Exception:
                 pass
                 
@@ -3071,13 +4066,14 @@ def run_config_gui(pipeline_callback=None):
                 res = resolve_auid(star_name, verbose=False)
                 if res:
                     c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+                    src = 'AAVSO VSX'
             
             if c:
                 ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
                 dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
-                root.after(0, lambda: name_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
+                root.after(0, lambda: name_resolve_status_var.set(f"Found ({src}): {ra_hms}, {dec_dms}"))
             else:
-                root.after(0, lambda: name_resolve_status_var.set("Not found in Simbad or VSX."))
+                root.after(0, lambda: name_resolve_status_var.set("Not found in the local GCVS list, Simbad or VSX."))
         
         import threading
         threading.Thread(target=resolve_thread, daemon=True).start()
@@ -3117,6 +4113,16 @@ def run_config_gui(pipeline_callback=None):
     vars_dict["ref_dec_s"] = (dec_s_var, str)
     ttk.Entry(lf_ref, textvariable=dec_s_var, width=6).grid(row=5, column=5, sticky=tk.W, padx=2)
     tk.Label(lf_ref, text="s").grid(row=5, column=6, sticky=tk.W, padx=0)
+
+    # v4.16: ensemble selection and optional check star
+    tk.Label(lf_ref, text="Min SNR (comp stars):").grid(row=6, column=0, sticky=tk.E, padx=(10, 2), pady=5)
+    diff_min_snr_var = tk.DoubleVar(value=30.0)
+    vars_dict["diff_min_snr"] = (diff_min_snr_var, float)
+    ttk.Entry(lf_ref, textvariable=diff_min_snr_var, width=6).grid(row=6, column=1, columnspan=2, sticky=tk.W, padx=2)
+    tk.Label(lf_ref, text="Check star (name or RA Dec, optional):").grid(row=7, column=0, columnspan=3, sticky=tk.E, padx=(10, 2), pady=5)
+    diff_check_var = tk.StringVar(value="")
+    vars_dict["diff_check_star"] = (diff_check_var, str)
+    ttk.Entry(lf_ref, textvariable=diff_check_var, width=28).grid(row=7, column=3, columnspan=6, sticky=tk.W, padx=2)
     
     def toggle_ref_entries(*args):
         mode = ref_mode_var.get()
@@ -3138,7 +4144,7 @@ def run_config_gui(pipeline_callback=None):
     target_mode_var = tk.StringVar(value="all")
     vars_dict["target_mode"] = (target_mode_var, str)
     ttk.Radiobutton(lf_target, text="Analyze all stars", variable=target_mode_var, value="all").grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
-    ttk.Radiobutton(lf_target, text="Resolve Target by Name (via Simbad)", variable=target_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+    ttk.Radiobutton(lf_target, text="Resolve Target by Name (local GCVS list, else Simbad)", variable=target_mode_var, value="name").grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
     
     tk.Label(lf_target, text="Star Name:").grid(row=2, column=0, sticky=tk.E, padx=(10, 2), pady=5)
     target_name_var = tk.StringVar(value="")
@@ -3163,8 +4169,11 @@ def run_config_gui(pipeline_callback=None):
             from astropy.coordinates import SkyCoord
             from photometry.calibration import resolve_auid
             c = None
+            src = ''
             try:
-                c = SkyCoord.from_name(star_name)
+                c = _resolve_name(star_name)
+                from photometry.names import LAST_SOURCE as _ls
+                src = _ls['source']
             except Exception:
                 pass
                 
@@ -3172,13 +4181,14 @@ def run_config_gui(pipeline_callback=None):
                 res = resolve_auid(star_name, verbose=False)
                 if res:
                     c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
+                    src = 'AAVSO VSX'
             
             if c:
                 ra_hms = c.ra.to_string(unit='hour', sep='hms', precision=1)
                 dec_dms = c.dec.to_string(unit='degree', sep='dms', precision=1)
-                root.after(0, lambda: target_resolve_status_var.set(f"Found: {ra_hms}, {dec_dms}"))
+                root.after(0, lambda: target_resolve_status_var.set(f"Found ({src}): {ra_hms}, {dec_dms}"))
             else:
-                root.after(0, lambda: target_resolve_status_var.set("Not found in Simbad or VSX."))
+                root.after(0, lambda: target_resolve_status_var.set("Not found in the local GCVS list, Simbad or VSX."))
         
         import threading
         threading.Thread(target=resolve_thread, daemon=True).start()
@@ -3227,6 +4237,8 @@ def run_config_gui(pipeline_callback=None):
     target_mode_var.trace("w", toggle_target_entries)
     toggle_target_entries()
 
+    diff_coeff_err = {'Tbv': 0.0, 'Tb_bv': 0.0, 'Tv_bv': 0.0}
+
     def load_color_coefficients():
         import json
         json_path = os.path.join("photometry_output", "color_coefficients.json")
@@ -3234,10 +4246,15 @@ def run_config_gui(pipeline_callback=None):
             try:
                 with open(json_path, 'r') as f:
                     coeffs = json.load(f)
-                diff_tbv_var.set(coeffs.get('Tbv', 1.0))
-                diff_tbbv_var.set(coeffs.get('Tb_bv', 0.0))
-                diff_tvbv_var.set(coeffs.get('Tv_bv', 0.0))
-                diff_status_var.set("Loaded coefficients from previous run.")
+                diff_tbv_var.set(round(float(coeffs.get('Tbv', 1.0)), 4))
+                diff_tbbv_var.set(round(float(coeffs.get('Tb_bv', 0.0)), 4))
+                diff_tvbv_var.set(round(float(coeffs.get('Tv_bv', 0.0)), 4))
+                # v4.16: coefficient uncertainties (0 if the file is from an older version)
+                diff_coeff_err['Tbv'] = float(coeffs.get('Tbv_err', 0.0) or 0.0)
+                diff_coeff_err['Tb_bv'] = float(coeffs.get('Tb_bv_err', 0.0) or 0.0)
+                diff_coeff_err['Tv_bv'] = float(coeffs.get('Tv_bv_err', 0.0) or 0.0)
+                extra = "" if coeffs.get('consistent', True) else "  WARNING: coefficients flagged INCONSISTENT in the colour report."
+                diff_status_var.set(f"Loaded coefficients (±{diff_coeff_err['Tbv']:.3f}, ±{diff_coeff_err['Tb_bv']:.3f}, ±{diff_coeff_err['Tv_bv']:.3f}).{extra}")
             except Exception as e:
                 diff_status_var.set(f"Error loading JSON: {e}")
         else:
@@ -3281,7 +4298,8 @@ def run_config_gui(pipeline_callback=None):
             manual_ref_coord=last_diff_args['manual_ref_coord'],
             target_mode=last_diff_args['target_mode'],
             manual_target_coord=last_diff_args['manual_target_coord'],
-            axes=axes
+            axes=axes,
+            **last_diff_args.get('extra', {})
         )
         canvas.draw()
 
@@ -3315,6 +4333,11 @@ def run_config_gui(pipeline_callback=None):
     accuracy_toolbar.update()
 
     ts_container = tab_ts
+
+    # v4.18: fixed (non-scrolling) action bar at the top of the Light Curves tab:
+    # Generate / Viewer / setups / output folder, status line and progress bar.
+    ts_topbar = tk.Frame(tab_ts_outer, bg="#e8eef5", bd=1, relief="groove")
+    ts_topbar.pack(side=tk.TOP, fill="x", before=ts_scroll)
     
     # Filter selection for Light Curves
     filter_frame = ttk.Frame(ts_container)
@@ -3322,21 +4345,100 @@ def run_config_gui(pipeline_callback=None):
     tk.Label(filter_frame, text="Light Curve Filter:").pack(side=tk.LEFT, padx=5)
     ts_filter_var = tk.StringVar(value="V")
     vars_dict["ts_filter"] = (ts_filter_var, str)
-    ts_filter_cb = ttk.Combobox(filter_frame, textvariable=ts_filter_var, values=["V", "B"], state="readonly", width=5)
+    ts_filter_cb = ttk.Combobox(filter_frame, textvariable=ts_filter_var, values=["V", "B", "L"], state="readonly", width=5)
     ts_filter_cb.pack(side=tk.LEFT, padx=5)
     ts_widgets['filter_cb'] = ts_filter_cb
+    ts_filter_note = tk.Label(filter_frame, text="", fg="#555", font=("Arial", 8, "italic"), justify=tk.LEFT)
+    ts_filter_note.pack(side=tk.LEFT, padx=8)
+
+    def _ts_filter_changed(*_):
+        if ts_filter_var.get().upper() == "L":
+            ts_filter_note.config(text="L (luminance): calibrated magnitudes use the V magnitudes of the comparison stars "
+                                       "(AAVSO filter code CV).\nUse comparison stars of similar colour as the target; "
+                                       "relative flux / raw ADU work as usual.")
+        else:
+            ts_filter_note.config(text="")
+    ts_filter_var.trace_add("write", _ts_filter_changed)
+
+    # --- Light Curve Mode (v4.14) ---
+    lf_ts_mode = tk.LabelFrame(ts_container, text="Light Curve Mode")
+    lf_ts_mode.pack(fill="x", padx=10, pady=5)
+
+    ts_lc_mode_var = tk.StringVar(value="calibrated")
+    vars_dict["ts_lc_mode"] = (ts_lc_mode_var, str)
+    ttk.Radiobutton(lf_ts_mode, text="Calibrated magnitudes  (ensemble + catalogue magnitudes; AAVSO report)",
+                    variable=ts_lc_mode_var, value="calibrated").grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=10, pady=1)
+    ttk.Radiobutton(lf_ts_mode, text="Relative flux  (target ADU / \u03a3 reference-star ADU; catalogue magnitudes ignored)",
+                    variable=ts_lc_mode_var, value="relative").grid(row=1, column=0, columnspan=3, sticky=tk.W, padx=10, pady=1)
+    ttk.Radiobutton(lf_ts_mode, text="Raw ADU  (target net flux only; no reference or check stars needed)",
+                    variable=ts_lc_mode_var, value="raw").grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=10, pady=1)
+
+    ts_auto_raw_var = tk.BooleanVar(value=True)
+    vars_dict["ts_auto_raw"] = (ts_auto_raw_var, bool)
+    ttk.Checkbutton(lf_ts_mode, text="Automatically use Raw ADU when no reference stars are selected",
+                    variable=ts_auto_raw_var).grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(6, 1))
+
+    ts_per_second_var = tk.BooleanVar(value=False)
+    vars_dict["ts_flux_per_second"] = (ts_per_second_var, bool)
+    ttk.Checkbutton(lf_ts_mode, text="Raw ADU: normalise to ADU/s (divide by EXPTIME)",
+                    variable=ts_per_second_var).grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=10, pady=1)
+
+    ts_plot_flux_var = tk.BooleanVar(value=True)
+    vars_dict["ts_plot_flux"] = (ts_plot_flux_var, bool)
+
+    def get_ts_y_quantity():
+        return 'flux' if ts_plot_flux_var.get() else 'mag'
+
+    def on_plot_quantity_change():
+        try:
+            if vars_dict.get("ts_last_results"):
+                on_inline_toggle()
+        except NameError:
+            pass
+    ttk.Checkbutton(lf_ts_mode, text="Raw/Relative: plot flux (uncheck to plot instrumental magnitude)",
+                    variable=ts_plot_flux_var, command=on_plot_quantity_change).grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(1, 5))
+
+    # --- Faint target (v4.44) ---
+    lf_ts_faint = tk.LabelFrame(ts_container, text="Faint Target  (forced photometry at a fixed position, combine frames)")
+    lf_ts_faint.pack(fill="x", padx=10, pady=5)
+    ts_faint_var = tk.BooleanVar(value=False)
+    vars_dict["ts_faint"] = (ts_faint_var, bool)
+    ts_faint_fwhm_var = tk.DoubleVar(value=1.5)
+    vars_dict["ts_faint_fwhm_factor"] = (ts_faint_fwhm_var, float)
+    ts_faint_group_var = tk.IntVar(value=1)
+    vars_dict["ts_faint_group"] = (ts_faint_group_var, int)
+    ts_faint_snr_var = tk.DoubleVar(value=3.0)
+    vars_dict["ts_faint_snr_limit"] = (ts_faint_snr_var, float)
+    ttk.Checkbutton(lf_ts_faint, text="Faint target: no centroiding - aperture at the WCS position (corrected by the "
+                    "reference-star offset), same radius in all frames",
+                    variable=ts_faint_var).grid(row=0, column=0, columnspan=8, sticky=tk.W, padx=10, pady=(2, 1))
+    tk.Label(lf_ts_faint, text="Aperture radius:").grid(row=1, column=0, sticky=tk.W, padx=(28, 2))
+    ttk.Entry(lf_ts_faint, textvariable=ts_faint_fwhm_var, width=5).grid(row=1, column=1, sticky=tk.W)
+    tk.Label(lf_ts_faint, text="x median FWHM (0 = radius from Settings)").grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=2)
+    tk.Label(lf_ts_faint, text="Upper limit when S/N <").grid(row=1, column=4, sticky=tk.E, padx=(15, 2))
+    ttk.Entry(lf_ts_faint, textvariable=ts_faint_snr_var, width=5).grid(row=1, column=5, sticky=tk.W)
+    tk.Label(lf_ts_faint, text="Combine in groups of").grid(row=2, column=0, sticky=tk.W, padx=(28, 2), pady=(4, 2))
+    ttk.Spinbox(lf_ts_faint, from_=1, to=999, textvariable=ts_faint_group_var, width=5).grid(row=2, column=1, sticky=tk.W, pady=(4, 2))
+    tk.Label(lf_ts_faint, text="consecutive frames (1 = single frames)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 2))
+    ts_faint_btns = tk.Frame(lf_ts_faint)
+    ts_faint_btns.grid(row=3, column=0, columnspan=8, sticky=tk.W, padx=(24, 2), pady=(2, 4))
+    tk.Button(ts_faint_btns, text="Apply Groups", font=("Arial", 9), command=lambda: on_faint_apply_groups()).pack(side=tk.LEFT, padx=3)
+    tk.Button(ts_faint_btns, text="Combine Selected Rows", font=("Arial", 9), command=lambda: on_faint_combine_selected()).pack(side=tk.LEFT, padx=3)
+    tk.Button(ts_faint_btns, text="Split Selected Rows", font=("Arial", 9), command=lambda: on_faint_split_selected()).pack(side=tk.LEFT, padx=3)
+    tk.Button(ts_faint_btns, text="Single Frames", font=("Arial", 9), command=lambda: on_faint_single()).pack(side=tk.LEFT, padx=3)
+    tk.Label(ts_faint_btns, text="(uses the frames of the last run - no new measurement)", fg="#555").pack(side=tk.LEFT, padx=6)
     def get_coords_ts(mode, name, ra_s, dec_s):
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         if mode == "name":
             try:
-                return SkyCoord.from_name(name)
+                return _resolve_name(name)
             except Exception:
                 from photometry.calibration import resolve_auid
                 res = resolve_auid(name, verbose=False)
                 if res:
                     return SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
-                raise Exception(f"Could not resolve '{name}' via Simbad or VSX.")
+                raise Exception(f"Could not resolve '{name}' via the local GCVS list, Simbad or VSX.")
         else:
             return SkyCoord(f"{ra_s} {dec_s}", unit=(u.hourangle, u.deg))
 
@@ -3422,7 +4524,7 @@ def run_config_gui(pipeline_callback=None):
                 root.update_idletasks()
                 try:
                     from astropy.coordinates import SkyCoord
-                    c = SkyCoord.from_name(name)
+                    c = _resolve_name(name)
                 except: pass
                 
             # 3. Fallback to manual coords
@@ -3442,7 +4544,7 @@ def run_config_gui(pipeline_callback=None):
                     root.update_idletasks()
                     try:
                         from astropy.coordinates import SkyCoord
-                        c = SkyCoord.from_name(name)
+                        c = _resolve_name(name)
                     except Exception as e:
                         ts_status_var.set(f"Could not resolve '{name}': {e}")
                         return
@@ -3591,8 +4693,14 @@ def run_config_gui(pipeline_callback=None):
     def on_inline_toggle():
         from photometry.time_series import plot_light_curve
         v_state = {k: v.get() for k, v in vars_dict["ts_visibility_vars"].items()}
-        plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter)"
-        plot_light_curve(vars_dict["ts_last_results"], plot_title, "", ax=ts_ax, visibility_state=v_state)
+        results = vars_dict["ts_last_results"]
+        mode_lbl = ""
+        if results:
+            m = results[0].get('lc_mode', 'calibrated')
+            mode_lbl = {"raw": " - Raw ADU", "relative": " - Relative flux"}.get(m, "")
+        plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter){mode_lbl}"
+        plot_light_curve(results, plot_title, "", ax=ts_ax, visibility_state=v_state,
+                         plot_options={"y_quantity": get_ts_y_quantity()})
         ts_canvas.draw()
         
     def open_advanced_plot_window():
@@ -3601,7 +4709,11 @@ def run_config_gui(pipeline_callback=None):
         if c_idx >= 0:
             if hasattr(vars_dict.get(f"ts_ref_{c_idx}_name"), "__getitem__"):
                 check_name = vars_dict[f"ts_ref_{c_idx}_name"][0].get()
-        AdvancedPlotWindow(root, vars_dict["ts_last_results"], ts_target_name_var.get(), ts_filter_var.get(), check_name)
+        if not vars_dict["ts_last_results"]:
+            messagebox.showinfo("No Data", "Generate a light curve first.")
+            return
+        AdvancedPlotWindow(root, vars_dict["ts_last_results"], ts_target_name_var.get(), ts_filter_var.get(), check_name,
+                           y_quantity=get_ts_y_quantity())
         
     def rebuild_inline_toggles(results):
         vars_dict["ts_last_results"] = results
@@ -3636,7 +4748,21 @@ def run_config_gui(pipeline_callback=None):
     # 1. Selection (Handled by File Manager)
     lf_ts_target.pack(fill="x", padx=10, pady=5)
     lf_ts_ensemble.pack(fill="x", padx=10, pady=5)
-    lf_ts_coeff.pack(fill="x", padx=10, pady=5)
+    # v4.18: rarely changed section can be collapsed
+    ts_show_coeff_var = tk.BooleanVar(value=False)
+    vars_dict["ts_show_coeff"] = (ts_show_coeff_var, bool)
+    ts_coeff_toggle = tk.Button(ts_container, relief="flat", anchor="w", fg="#1a3a5f", font=("Arial", 9, "bold"))
+    def _apply_coeff_visibility(*_):
+        if ts_show_coeff_var.get():
+            ts_coeff_toggle.config(text="▾ Coefficients, AAVSO code & chart (click to hide)")
+            lf_ts_coeff.pack(fill="x", padx=10, pady=5, after=ts_coeff_toggle)
+        else:
+            ts_coeff_toggle.config(text="▸ Coefficients, AAVSO code & chart (click to show)")
+            lf_ts_coeff.pack_forget()
+    ts_coeff_toggle.config(command=lambda: (ts_show_coeff_var.set(not ts_show_coeff_var.get()), _apply_coeff_visibility()))
+    ts_coeff_toggle.pack(fill="x", padx=10, pady=(5, 0))
+    ts_show_coeff_var.trace_add("write", _apply_coeff_visibility)
+    _apply_coeff_visibility()
     
     ts_target_mode_var = tk.StringVar(value="name")
     vars_dict["ts_target_mode"] = (ts_target_mode_var, str)
@@ -3663,7 +4789,7 @@ def run_config_gui(pipeline_callback=None):
             
             c = None
             try:
-                c = SkyCoord.from_name(name)
+                c = _resolve_name(name)
             except Exception:
                 pass
                 
@@ -3672,7 +4798,7 @@ def run_config_gui(pipeline_callback=None):
                 if res:
                     c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
                 else:
-                    ts_status_var.set(f"Could not resolve '{name}' via Simbad or VSX.")
+                    ts_status_var.set(f"Could not resolve '{name}' via the local GCVS list, Simbad or VSX.")
                     return
             
             if c:
@@ -3701,7 +4827,44 @@ def run_config_gui(pipeline_callback=None):
         except Exception as e:
             ts_status_var.set(f"Target resolution failed: {e}")
 
-    def on_get_aavso_refs():
+    def aavso_crossmatch(stars, cat_name, radius):
+        """Catalogue V/B for the AAVSO sequence stars (cat_v, cat_b, cat_match) - local copy first."""
+        from photometry.calibration import fetch_online_catalog
+        cat_map = {"ATLAS refcat2": "ATLAS", "APASS DR9": "APASS",
+                   "Landolt Standard Star Catalogue": "LANDOLT", "GAIA_DR3": "GAIA_DR3"}
+        internal_cat_name = cat_map.get(cat_name, "ATLAS")
+        try:
+            center_ra = stars[0]['ra']
+            center_dec = stars[0]['dec']
+            cat_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin=radius*1.1, catalog_name=internal_cat_name)
+            if cat_stars:
+                from astropy.coordinates import SkyCoord
+                import astropy.units as u
+                aavso_coords = SkyCoord([s['ra'] for s in stars], [s['dec'] for s in stars], unit=u.deg)
+                cat_coords = SkyCoord([s['ra_deg'] for s in cat_stars], [s['dec_deg'] for s in cat_stars], unit=u.deg)
+                idx, d2d, _ = aavso_coords.match_to_catalog_sky(cat_coords)
+                for i, s in enumerate(stars):
+                    if d2d[i].arcsec < 3.0:
+                        match = cat_stars[idx[i]]
+                        s['cat_v'] = match.get('V_mag', np.nan)
+                        s['cat_b'] = match.get('B_mag', np.nan)
+                        s['cat_match'] = True
+                    else:
+                        s['cat_v'] = np.nan; s['cat_b'] = np.nan; s['cat_match'] = False
+                return True
+            for s in stars: s['cat_v'] = np.nan; s['cat_b'] = np.nan; s['cat_match'] = False
+        except Exception as e:
+            print(f"Catalog cross-match failed: {e}")
+            for s in stars: s['cat_v'] = np.nan; s['cat_b'] = np.nan; s['cat_match'] = False
+        return False
+
+    def stored_aavso_sequence(target, cat_name=None):
+        """v4.35: stored sequence of target (list of stars) or None - no query."""
+        from photometry import aavso_sequences as _aseq
+        d = _aseq.load(target)
+        return d['stars'] if d else None
+
+    def on_get_aavso_refs(refresh=False):
         if not hasattr(on_get_aavso_refs, "cache"):
             on_get_aavso_refs.cache = None
             on_get_aavso_refs.last_target = ""
@@ -3712,19 +4875,39 @@ def run_config_gui(pipeline_callback=None):
         if not target:
             messagebox.showwarning("Warning", "Please enter a target star name first.")
             return
+        try:
+            radius = get_catalog_radius()
+        except:
+            radius = 45.0
+        from photometry import aavso_sequences as _aseq
+        from photometry.local_catalogs import name_key as _nk
+        stored = None if refresh else _aseq.load(target)
+        if stored and float(stored.get('fov_arcmin', 0)) < 0.95 * radius:
+            stored = None                    # stored for a smaller field - fetch the larger one
             
         # Check if we can use cached results
-        if (on_get_aavso_refs.cache and 
-            on_get_aavso_refs.last_target == target and 
+        if (not refresh and on_get_aavso_refs.cache and 
+            _nk(on_get_aavso_refs.last_target) == _nk(target) and 
             on_get_aavso_refs.last_cat == cat_name):
             stars = on_get_aavso_refs.cache
             ts_status_var.set(f"Showing cached AAVSO sequence for {target}.")
+        elif stored:
+            # v4.35: sequence stored on disk - no query to AAVSO
+            stars = stored['stars']
+            if stored.get('catalog') != cat_name or not all('cat_match' in s_ for s_ in stars):
+                ts_status_var.set(f"Cross-matching the stored AAVSO sequence with {cat_name}...")
+                root.update_idletasks()
+                aavso_crossmatch(stars, cat_name, radius)
+                _aseq.update_crossmatch(target, stars, cat_name)
+            age = _aseq.age_days(stored)
+            msg = f"AAVSO sequence for {target} from file (fetched {stored.get('fetched', '?')[:10]}, {len(stars)} stars)."
+            if age is not None and age > _aseq.OLD_DAYS:
+                msg += " Older than a year - 'Refresh from AAVSO' gets the current sequence."
+            ts_status_var.set(msg)
+            on_get_aavso_refs.cache = stars
+            on_get_aavso_refs.last_target = target
+            on_get_aavso_refs.last_cat = cat_name
         else:
-            try:
-                radius = float(vars_dict["catalog_search_radius"][0].get())
-            except:
-                radius = 45.0
-                
             ts_status_var.set(f"Fetching AAVSO sequence for {target}...")
             root.update_idletasks()
             
@@ -3735,41 +4918,15 @@ def run_config_gui(pipeline_callback=None):
                 messagebox.showinfo("No Stars Found", f"Could not find any comparison stars for {target} in the AAVSO VSP.")
                 return
 
-            # Map catalog name for fetch_online_catalog
-            cat_map = {
-                "ATLAS refcat2": "ATLAS",
-                "APASS DR9": "APASS",
-                "Landolt Standard Star Catalogue": "LANDOLT",
-                "GAIA_DR3": "GAIA_DR3"
-            }
-            internal_cat_name = cat_map.get(cat_name, "ATLAS")
-            
             ts_status_var.set(f"Cross-matching AAVSO stars with {cat_name}...")
             root.update_idletasks()
-            
+            aavso_crossmatch(stars, cat_name, radius)
             try:
-                center_ra = stars[0]['ra']
-                center_dec = stars[0]['dec']
-                cat_stars = fetch_online_catalog(center_ra, center_dec, radius_arcmin=radius*1.1, catalog_name=internal_cat_name)
-                
-                if cat_stars:
-                    from astropy.coordinates import SkyCoord
-                    import astropy.units as u
-                    aavso_coords = SkyCoord([s['ra'] for s in stars], [s['dec'] for s in stars], unit=u.deg)
-                    cat_coords = SkyCoord([s['ra_deg'] for s in cat_stars], [s['dec_deg'] for s in cat_stars], unit=u.deg)
-                    idx, d2d, _ = aavso_coords.match_to_catalog_sky(cat_coords)
-                    for i, s in enumerate(stars):
-                        if d2d[i].arcsec < 3.0:
-                            match = cat_stars[idx[i]]
-                            s['cat_v'] = match.get('V_mag', np.nan)
-                            s['cat_b'] = match.get('B_mag', np.nan)
-                            s['cat_match'] = True
-                        else:
-                            s['cat_v'] = np.nan; s['cat_b'] = np.nan; s['cat_match'] = False
+                p_ = _aseq.save(target, stars, radius, cat_name)
+                ts_status_var.set(f"AAVSO sequence for {target}: {len(stars)} stars, stored in {p_} for later use.")
             except Exception as e:
-                print(f"Catalog cross-match failed: {e}")
-                for s in stars: s['cat_v'] = np.nan; s['cat_b'] = np.nan; s['cat_match'] = False
-            
+                print(f"AAVSO sequence could not be stored: {e}")
+
             # Update Cache
             on_get_aavso_refs.cache = stars
             on_get_aavso_refs.last_target = target
@@ -3782,6 +4939,15 @@ def run_config_gui(pipeline_callback=None):
         pop.transient(root)
         
         tk.Label(pop, text=f"Select stars for Ensemble (AAVSO values vs {cat_name}):", font=("Arial", 10, "bold")).pack(pady=10)
+        _st_ = _aseq.load(target)
+        _hdr = tk.Frame(pop); _hdr.pack(fill="x", padx=10)
+        tk.Label(_hdr, text=(f"Stored sequence, fetched {_st_.get('fetched', '?')[:16]} (field {float(_st_.get('fov_arcmin', 0)):g}')"
+                             if _st_ else "Sequence not stored"), fg="#555").pack(side=tk.LEFT)
+
+        def _refresh():
+            pop.destroy()
+            on_get_aavso_refs(refresh=True)
+        ttk.Button(_hdr, text="Refresh from AAVSO", command=_refresh).pack(side=tk.RIGHT)
         
         # Table of stars
         cols = ("AUID", "Name", "V (AAVSO)", "B (AAVSO)", "B-V (AAVSO)", f"V ({cat_name})", f"B ({cat_name})", "RA", "Dec")
@@ -3837,7 +5003,9 @@ def run_config_gui(pipeline_callback=None):
                     src_label = cat_name.split()[0] # Short name
                 
                 vars_dict[f"ts_ref_{count}_name"][0].set(star_data['auid'])
-                vars_dict[f"ts_ref_{count}_mag"][0].set(v_to_use)
+                # v4.23: B light curves need the B magnitudes of the comparison stars (V and L use V)
+                use_b = ts_filter_var.get().upper() == 'B'
+                vars_dict[f"ts_ref_{count}_mag"][0].set(b_to_use if use_b else v_to_use)
                 vars_dict[f"ts_ref_{count}_bv"][0].set(round(b_to_use - v_to_use, 3))
                 vars_dict[f"ts_ref_{count}_ra"][0].set(star_data['ra'])
                 vars_dict[f"ts_ref_{count}_dec"][0].set(star_data['dec'])
@@ -3850,6 +5018,7 @@ def run_config_gui(pipeline_callback=None):
                 vars_dict[f"ts_ref_{count}_use"][0].set(True)
                 count += 1
             
+            tidy_numbers()
             ts_status_var.set(f"Imported {count} stars to ensemble.")
             pop.destroy()
             
@@ -3858,25 +5027,34 @@ def run_config_gui(pipeline_callback=None):
         ttk.Button(btn_frame, text="Add Selected to Ensemble", command=do_import, width=30).pack(side=tk.LEFT, padx=10, expand=True)
         ttk.Button(btn_frame, text="Clear AAVSO Cache & Re-fetch", command=lambda: [pop.destroy(), setattr(on_get_aavso_refs, "cache", None), on_get_aavso_refs()], width=30).pack(side=tk.LEFT, padx=10, expand=True)
         
-        ts_status_var.set(f"Found {len(stars)} AAVSO comparison stars.")
+        _st2 = _aseq.load(target)
+        ts_status_var.set(f"Found {len(stars)} AAVSO comparison stars"
+                          + (f" (stored sequence, fetched {_st2.get('fetched', '?')[:10]})." if _st2 else "."))
 
     def on_reset_ensemble():
-        if not messagebox.askyesno("Confirm Reset", "Are you sure you want to completely clear the Ensemble star list?"):
+        # v4.15: single implementation used by both "Reset Ensemble" buttons
+        # (previously two different versions; one left the check-star index set).
+        # The target star is intentionally left unchanged.
+        if not messagebox.askyesno("Reset Ensemble", "Clear all reference stars and the check star?\n\n(The target star is not changed.)"):
             return
         for i in range(5):
+            vars_dict[f"ts_ref_{i}_use"][0].set(False)
             vars_dict[f"ts_ref_{i}_name"][0].set("")
             vars_dict[f"ts_ref_{i}_mag"][0].set(0.0)
             vars_dict[f"ts_ref_{i}_bv"][0].set(0.0)
             vars_dict[f"ts_ref_{i}_ra"][0].set(0.0)
             vars_dict[f"ts_ref_{i}_dec"][0].set(0.0)
             vars_dict[f"ts_ref_{i}_has_manual"][0].set(False)
-            vars_dict[f"ts_ref_{i}_coord_label"][0].set("(00:00:00, +00:00:00)")
-            vars_dict[f"ts_ref_{i}_use"][0].set(False)
-        ts_status_var.set("Ensemble list cleared.")
+            if f"ts_ref_{i}_coord_label" in vars_dict:
+                vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
+        ts_check_star_idx_var.set(-1)
+        ts_status_var.set("Ensemble and check star cleared.")
 
     ttk.Button(lf_ts_target, text="Fetch", command=on_fetch_target_ts, width=6).grid(row=0, column=2, sticky=tk.W, padx=2)
     ttk.Button(lf_ts_target, text="Get AAVSO Ref Stars", command=on_get_aavso_refs).grid(row=0, column=4, sticky=tk.W, padx=10)
     ttk.Button(lf_ts_target, text="Reset Ensemble", command=on_reset_ensemble).grid(row=0, column=5, sticky=tk.W, padx=2)
+    ttk.Button(lf_ts_target, text="APASS DR10...", command=lambda: vars_dict['apass_dr10_dialog']()).grid(
+        row=0, column=6, sticky=tk.W, padx=2)
     vars_dict['ts_target_fetch_func'] = on_fetch_target_ts
     
     ttk.Radiobutton(lf_ts_target, text="Manual RA/Dec", variable=ts_target_mode_var, value="manual").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
@@ -3905,25 +5083,24 @@ def run_config_gui(pipeline_callback=None):
     vars_dict["ts_coeff"] = (ts_coeff_var, float)
     ttk.Entry(lf_ts_coeff, textvariable=ts_coeff_var, width=10).grid(row=1, column=1, sticky=tk.W, padx=2)
     
-    tk.Label(lf_ts_coeff, text="Extinction (k):").grid(row=1, column=2, sticky=tk.W, padx=10, pady=2)
-    ts_k_var = tk.DoubleVar(value=0.15)
-    vars_dict["ts_k"] = (ts_k_var, float)
-    ttk.Entry(lf_ts_coeff, textvariable=ts_k_var, width=10).grid(row=1, column=3, sticky=tk.W, padx=2)
+    # v4.18: extinction is taken from Settings > Astro & Catalog (k_V or k_B by filter);
+    # the separate Light-Curve value (default 0.15) was removed.
+    tk.Label(lf_ts_coeff, text="Extinction k: from Settings (k_V / k_B)", fg="#555",
+             font=("Arial", 8, "italic")).grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=10, pady=2)
     
     tk.Label(lf_ts_coeff, text="AAVSO Observer Code:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=2)
     # Linked to global settings
     ts_obs_var = vars_dict["aavso_obs_code"][0]
     ttk.Entry(lf_ts_coeff, textvariable=ts_obs_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=2)
     
-    tk.Label(lf_ts_coeff, text="Site Lat:").grid(row=2, column=2, sticky=tk.W, padx=10, pady=2)
+    # v4.18: observing site lives in Settings > Operator & Session (same variables);
+    # it is only used when a FITS header has no SITELAT/SITELONG.
     ts_lat_var = tk.DoubleVar(value=59.8)
     vars_dict["ts_lat"] = (ts_lat_var, float)
-    ttk.Entry(lf_ts_coeff, textvariable=ts_lat_var, width=10).grid(row=2, column=3, sticky=tk.W, padx=2)
-    
-    tk.Label(lf_ts_coeff, text="Site Long:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=2)
     ts_lon_var = tk.DoubleVar(value=17.6)
     vars_dict["ts_lon"] = (ts_lon_var, float)
-    ttk.Entry(lf_ts_coeff, textvariable=ts_lon_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=2)
+    tk.Label(lf_ts_coeff, text="Site: from FITS header (SITELAT/SITELONG), else Settings > Operator & Session",
+             fg="#555", font=("Arial", 8, "italic")).grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=10, pady=2)
 
     tk.Label(lf_ts_coeff, text="AAVSO Chart ID:").grid(row=3, column=2, sticky=tk.W, padx=10, pady=2)
     ts_chart_var = tk.StringVar(value="na")
@@ -3938,13 +5115,17 @@ def run_config_gui(pipeline_callback=None):
                 with open(json_path, 'r') as f:
                     coeffs = json.load(f)
                 filt = ts_filter_var.get().upper()
+                if filt == 'L':
+                    ts_coeff_var.set(0.0)
+                    ts_status_var.set("L filter: no colour transformation available (coefficient set to 0).")
+                    return
                 if filt == 'B':
                     val = coeffs.get('Tb_bv', 0.0)
                     key_name = 'Tb_bv'
                 else:
                     val = coeffs.get('Tv_bv', 0.0)
                     key_name = 'Tv_bv'
-                ts_coeff_var.set(val)
+                ts_coeff_var.set(round(float(val), 4))
                 ts_status_var.set(f"Loaded {key_name} for {filt} filter.")
             except Exception as e:
                 ts_status_var.set(f"Error loading JSON: {e}")
@@ -3954,12 +5135,12 @@ def run_config_gui(pipeline_callback=None):
     tk.Button(lf_ts_coeff, text="Load Last Coeffs", command=load_ts_coefficients).grid(row=4, column=0, columnspan=4, pady=5)
 
     ts_status_var = tk.StringVar(value="Ready to process sequence.")
-    ts_status_label = SelectableLabel(ts_container, textvariable=ts_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
-    ts_status_label.pack(pady=5, fill="x")
+    ts_status_label = SelectableLabel(ts_topbar, textvariable=ts_status_var, font=("Arial", 9, "italic"), justify=tk.CENTER)
+    ts_status_label.pack(side=tk.BOTTOM, pady=2, fill="x")
     
     ts_progress_var = tk.DoubleVar(value=0)
-    ts_progress = ttk.Progressbar(ts_container, variable=ts_progress_var, maximum=100, length=400)
-    ts_progress.pack(pady=5)
+    ts_progress = ttk.Progressbar(ts_topbar, variable=ts_progress_var, maximum=100, length=400)
+    ts_progress.pack(side=tk.BOTTOM, pady=2)
     
     # Analysis Summary Panel (Persistent)
     lf_ts_summary = tk.LabelFrame(ts_container, text="Analysis Summary")
@@ -3984,10 +5165,310 @@ def run_config_gui(pipeline_callback=None):
             cancel_event.set()
             ts_status_var.set("Cancelling...")
 
-    cancel_btn = tk.Button(ts_container, text="Cancel Processing", command=on_cancel_ts, 
+    cancel_btn = tk.Button(ts_topbar, text="Cancel Processing", command=on_cancel_ts, 
                            bg="#f44336", fg="white", font=("Arial", 9))
     # Packed later during execution or hidden by default
     
+    # ---------------------------------------------------------------- v4.44: faint target
+    def _faint_params():
+        def f(var, default):
+            try:
+                return float(var.get())
+            except (tk.TclError, ValueError):
+                return default
+        return {'fwhm_factor': f(ts_faint_fwhm_var, 1.5), 'group': max(int(f(ts_faint_group_var, 1)), 1),
+                'snr_limit': f(ts_faint_snr_var, 3.0)}
+
+    def _faint_summary(state, groups):
+        info, prm = state['info'], state['params']
+        n_comb = sum(1 for g in groups if len(g) > 1)
+        txt = ("Faint target: forced photometry at the WCS position corrected by the reference-star offset; "
+               "fixed aperture for all frames and stars\n")
+        txt += (f"  Aperture r = {info['r_ap']:.2f} px, sky annulus {info['r_in']:.2f}-{info['r_out']:.2f} px"
+                + (f"  ({prm['fwhm_factor']:g} x median FWHM {info['median_fwhm']:.2f} px)" if info.get('median_fwhm') else "") + "\n")
+        dx, dy = info.get('offset_mean', (np.nan, np.nan))
+        sx, sy = info.get('offset_scatter', (np.nan, np.nan))
+        if np.isfinite(dx):
+            txt += (f"  Reference stars vs. WCS: mean offset dx={dx:+.2f} dy={dy:+.2f} px, "
+                    f"frame-to-frame scatter {sx:.2f}/{sy:.2f} px\n")
+        txt += (f"  Frames: {info['n_used']} of {info['n_files']} -> {len(groups)} points "
+                f"({n_comb} combined); upper limit (fainter than) when S/N < {prm['snr_limit']:g}\n")
+        return txt
+
+    def faint_publish(groups, state=None):
+        """(Re-)combine the frames of the last faint-target run into the given groups and show/save the result."""
+        from photometry.faint_target import combine
+        state = state or vars_dict.get("ts_faint_state")
+        if not state:
+            messagebox.showinfo("Faint Target", "Generate a light curve with 'Faint target' switched on first.")
+            return None
+        state['params']['snr_limit'] = _faint_params()['snr_limit']
+        a = state['args']
+        results = combine(state['frames'], groups, a['lc_mode'], a['ensemble'], a['check'], a['target_bv'],
+                          a['coeff_term'], a['flux_per_second'], state['params']['snr_limit'])
+        state['groups'] = [list(g) for g in groups]
+        ctx = {'state': state, 'summary': _faint_summary(state, groups)}
+        return results, ctx
+
+    def run_faint_target(files, tar_c, resolved_ensemble, check_star_data, lc_mode, flux_per_second,
+                         stack_mode, sky_factor, update_prog):
+        from photometry.faint_target import measure_frames, groups_consecutive
+        prm = _faint_params()
+        frames, info = measure_frames(
+            files, {'ra': tar_c.ra.deg, 'dec': tar_c.dec.deg}, resolved_ensemble, check_star_data,
+            aperture_radius=float(vars_dict["aperture_radius"][0].get()),
+            annulus_inner=float(vars_dict["annulus_inner"][0].get()),
+            annulus_outer=float(vars_dict["annulus_outer"][0].get()),
+            fwhm_factor=prm['fwhm_factor'],
+            annulus_inner_gap=float(vars_dict["annulus_inner_gap"][0].get()),
+            annulus_width=float(vars_dict["annulus_width"][0].get()),
+            gain=float(vars_dict["ccd_gain"][0].get()), stack_mode=stack_mode, sky_noise_factor=sky_factor,
+            max_shift=float(vars_dict['centroid_tracking_shift'][0].get()) if 'centroid_tracking_shift' in vars_dict else 4.0,
+            initial_radius=float(vars_dict['centroid_initial_radius'][0].get()) if 'centroid_initial_radius' in vars_dict else 15.0,
+            site_lat=ts_lat_var.get(), site_long=ts_lon_var.get(),
+            cancel_event=cancel_event, update_progress=update_prog)
+        if not frames:
+            return None, "No frame could be measured (WCS? target on the images?)", None
+        state = {'frames': frames, 'info': info, 'params': prm,
+                 'args': {'lc_mode': lc_mode, 'ensemble': resolved_ensemble, 'check': check_star_data,
+                          'target_bv': ts_target_bv_var.get(),
+                          'coeff_term': ts_coeff_var.get() if ts_do_trans_var.get() else 0.0,
+                          'flux_per_second': flux_per_second},
+                 'ensemble': resolved_ensemble, 'check_star': check_star_data}
+        results, ctx = faint_publish(groups_consecutive(frames, prm['group']), state)
+        return results, "Success", ctx
+
+    def _faint_regroup(make_groups):
+        state = vars_dict.get("ts_faint_state")
+        if not state:
+            messagebox.showinfo("Faint Target", "Generate a light curve with 'Faint target' switched on first.\n\n"
+                                "Combining works on the frames measured in that run (no new measurement needed).")
+            return
+        groups = make_groups(state)
+        if groups is None:
+            return
+        out = faint_publish(groups, state)
+        if out:
+            results, ctx = out
+            ts_publish(results, state['args']['lc_mode'], state['ensemble'], state['check_star'], ctx)
+
+    def on_faint_apply_groups():
+        from photometry.faint_target import groups_consecutive
+        _faint_regroup(lambda st: groups_consecutive(st['frames'], _faint_params()['group']))
+
+    def on_faint_single():
+        from photometry.faint_target import groups_single
+        _faint_regroup(lambda st: groups_single(st['frames']))
+
+    def _selected_rows():
+        return sorted(ts_tree.index(it) for it in ts_tree.selection())
+
+    def on_faint_combine_selected():
+        from photometry.faint_target import merge_groups
+        rows = _selected_rows()
+        if len(rows) < 2:
+            messagebox.showinfo("Combine Selected", "Select at least two rows in the result table "
+                                "(Ctrl+click or Shift+click), then press 'Combine Selected'.")
+            return
+        _faint_regroup(lambda st: merge_groups(st['groups'], rows))
+
+    def on_faint_split_selected():
+        from photometry.faint_target import split_groups
+        rows = _selected_rows()
+        if not rows:
+            messagebox.showinfo("Split Selected", "Select the combined row(s) in the result table first.")
+            return
+        _faint_regroup(lambda st: split_groups(st['groups'], rows))
+
+    def ts_publish(results, lc_mode, resolved_ensemble, check_star_data, faint=None):
+        """v4.44: write CSV / AAVSO report / plot and fill table + summary for a finished light curve
+        (normal run, or faint-target run / re-combination; `faint` = dict with info for the summary)."""
+        from photometry.time_series import save_aavso_report, plot_light_curve
+        base_name = ts_target_name_var.get().replace(' ','_')
+        suffix = {"calibrated": "", "relative": "_relflux", "raw": "_rawADU"}.get(lc_mode, "")
+        if faint:
+            suffix += "_faint"          # v4.44: own files for faint-target light curves
+        # v4.18: UT date of the first observation in the file names, so that
+        # light curves from different nights no longer overwrite each other
+        # (a re-run of the same night and mode replaces its own files).
+        # v4.20: data from several nights -> 'first_to_last'
+        try:
+            from photometry.time_series import date_label
+            night = date_label([r['jd'] for r in results])
+        except Exception:
+            night = "nodate"
+        out_csv = os.path.join("photometry_output", f"light_curve_{base_name}{suffix}_{night}.csv")
+        out_aavso = os.path.join("photometry_output", f"aavso_{base_name}{'_faint' if faint else ''}_{night}.txt")
+        out_plot = os.path.join("photometry_output", f"plot_{base_name}{suffix}_{night}.png")
+        vars_dict["ts_last_csv_path"] = os.path.abspath(out_csv)   # v4.21: for Period Analysis
+        if lc_mode == "calibrated":
+            vars_dict["ts_last_report_path"] = os.path.abspath(out_aavso)
+
+        # Save CSV (union of all keys, in first-seen order; v4.42: UT of mid-exposure instead of JD)
+        from photometry.time_series import csv_fields as _csv_fields
+        fieldnames = _csv_fields(results)
+        with open(out_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results)
+
+        check_stats = ""
+        if lc_mode == "calibrated":
+            # AAVSO Metadata
+            comp_name = "ENSEMBLE" if len(resolved_ensemble) > 1 else resolved_ensemble[0]['name']
+            comp_mag = "na" if len(resolved_ensemble) > 1 else resolved_ensemble[0]['mag_std']
+            check_name = check_star_data['name'] if check_star_data else "na"
+            check_mag = check_star_data['mag_std'] if check_star_data else "na"
+            is_trans = "YES" if ts_do_trans_var.get() and abs(ts_coeff_var.get()) > 1e-5 else "NO"
+
+            # Construct header comments (Fix)
+            cat_name = vars_dict.get("reference_catalog", (tk.StringVar(value="na"), None))[0].get()
+            report_comments = f"RefCat: {cat_name}"
+            if is_trans == "YES":
+                report_comments += " | Transformed to Johnson-Cousins"
+
+            # Construct observation notes (Ensemble details)
+            ens_names = " ".join([s['name'] for s in resolved_ensemble])
+            report_notes = f"Ensemble of {len(resolved_ensemble)}- {ens_names}"
+            if faint:
+                report_notes += " | forced photometry at fixed position; fluxes of the frames of a point summed (see n_frames in CSV)"
+
+            save_aavso_report(results, out_aavso, ts_target_name_var.get(), aavso_band(ts_filter_var.get()), ts_obs_var.get(),
+                              comp_name=comp_name, comp_mag=comp_mag, 
+                              check_name=check_name, check_mag=check_mag,
+                              trans=is_trans, software_version=APP_VERSION,
+                              comments=report_comments,
+                              notes=report_notes,
+                              chart=ts_chart_var.get())
+
+            # Calculate Stats for Check Star & Reference Stars
+            check_mags = [r['check_mag'] for r in results if isinstance(r.get('check_mag'), (int, float)) and not np.isnan(r['check_mag'])]
+            if check_mags and check_star_data:
+                avg_check = np.mean(check_mags)
+                std_check = np.std(check_mags)
+                bias = avg_check - check_star_data['mag_std']
+                check_stats += f"Check Star Stats ({check_star_data['name']}):\n"
+                check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_check:.3f} mag\n\n"
+
+            for ref_star in resolved_ensemble:
+                ref_name = ref_star['name']
+                cat_mag = ref_star['mag_std']
+                mags = [r['ref_mags'][ref_name] for r in results if 'ref_mags' in r and ref_name in r['ref_mags'] and not np.isnan(r['ref_mags'][ref_name])]
+                if mags:
+                    avg_mag = np.mean(mags)
+                    std_mag = np.std(mags)
+                    bias = avg_mag - cat_mag
+                    check_stats += f"Reference Star Stats ({ref_name}):\n"
+                    check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_mag:.3f} mag\n\n"
+        else:
+            # Uncalibrated modes: statistics in flux units (no catalogue comparison)
+            unit = results[0].get('flux_unit', 'ADU')
+            def flux_stats(vals):
+                v = np.array([x for x in vals if isinstance(x, (int, float)) and np.isfinite(x)], dtype=float)
+                if len(v) < 2: return None
+                mean = np.mean(v); std = np.std(v, ddof=1)
+                rel = 100.0 * std / abs(mean) if mean != 0 else np.nan
+                return mean, std, rel, len(v)
+            ok_res = [r for r in results if r.get('flag', 'OK') == 'OK']
+            st = flux_stats([r['flux'] for r in ok_res])
+            errs = [r['flux_err'] for r in ok_res if np.isfinite(r.get('flux_err', np.nan))]
+            if st:
+                check_stats += f"Target ({'raw net flux' if lc_mode == 'raw' else 'target / ensemble'}, OK points):\n"
+                check_stats += (f"Mean: {st[0]:.6g} {unit}  |  Std: {st[1]:.4g} ({st[2]:.2f} %)  |  "
+                                f"Median formal error: {np.median(errs):.4g} {unit}  |  N={st[3]}\n"
+                                f"Peak-to-peak: {np.nanmax([r['flux'] for r in ok_res]) - np.nanmin([r['flux'] for r in ok_res]):.6g} {unit}\n\n")
+            if check_star_data:
+                st = flux_stats([r.get('check_flux') for r in results])
+                if st:
+                    check_stats += f"Check Star Stats ({check_star_data['name']}):\n"
+                    check_stats += f"Mean: {st[0]:.6g} {unit}  |  Std: {st[1]:.4g}  |  Scatter: {st[2]:.2f} % (~{1.0857*st[2]/100:.3f} mag)\n\n"
+            ref_names = sorted({k for r in results for k in (r.get('ref_fluxes') or {}).keys()})
+            for ref_name in ref_names:
+                st = flux_stats([(r.get('ref_fluxes') or {}).get(ref_name, np.nan) for r in results])
+                if st:
+                    lbl = "flux" if lc_mode == "raw" else "flux / sum of other refs"
+                    check_stats += f"Reference Star Stats ({ref_name}, {lbl}):\n"
+                    check_stats += f"Mean: {st[0]:.6g}  |  Scatter: {st[2]:.2f} % (~{1.0857*st[2]/100:.3f} mag)\n\n"
+            if lc_mode == "raw" and resolved_ensemble:
+                check_stats += "Note: reference stars were measured for display only; they are NOT used in Raw ADU mode.\n"
+
+        check_stats = check_stats.strip()
+
+        # Save a plot file (thread-safe, object-oriented matplotlib)
+        try:
+            mode_lbl = {"raw": " - Raw ADU", "relative": " - Relative flux"}.get(lc_mode, "")
+            plot_light_curve(results, f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter){mode_lbl}", out_plot,
+                             plot_options={"y_quantity": get_ts_y_quantity()})
+        except Exception as e:
+            print(f"Warning: could not save plot: {e}")
+
+        # Update embedded plot
+        plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter)"
+        def update_viz():
+            rebuild_inline_toggles(results)
+            on_inline_toggle()
+        root.after(0, update_viz)
+
+        # Update table
+        def update_table():
+            # Clear existing
+            for item in ts_tree.get_children():
+                ts_tree.delete(item)
+            def fmt(v, f):
+                return format(v, f) if isinstance(v, (int, float)) and np.isfinite(v) else "N/A"
+            if lc_mode == "calibrated":
+                ts_tree.heading("Mag", text="Mag"); ts_tree.heading("Err", text="Err"); ts_tree.heading("Check Mag", text="Check Mag")
+                v_key, e_key, c_key, vf = 'mag', 'mag_err', 'check_mag', ".3f"
+            else:
+                unit = results[0].get('flux_unit', 'ADU')
+                lbl = f"Flux [{unit}]" if lc_mode == "raw" else "Rel. Flux"
+                ts_tree.heading("Mag", text=lbl); ts_tree.heading("Err", text="Err"); ts_tree.heading("Check Mag", text="Check Flux")
+                v_key, e_key, c_key = 'flux', 'flux_err', 'check_flux'
+                vf = ".1f" if lc_mode == "raw" else ".5g"
+            # Add new
+            for r in results:
+                val_txt = fmt(r.get(v_key), vf)
+                if r.get('upper_limit') and v_key == 'mag':
+                    val_txt = "<" + fmt(r.get('mag_limit'), ".3f")      # v4.44: fainter than
+                ts_tree.insert("", tk.END, values=(
+                    f"{r.get('date_ut', '')} {r.get('ut_mid', '')}".strip(),
+                    f"{r['hjd']:.5f}", 
+                    r.get('n_frames', 1),
+                    val_txt, 
+                    fmt(r.get(e_key), vf if lc_mode == "raw" else (".3f" if lc_mode == "calibrated" else ".3g")), 
+                    fmt(r.get(c_key), vf),
+                    f"{r['snr']:.1f}",
+                    fmt(r.get('fwhm', np.nan), ".2f"),
+                    r.get('flag', 'OK')
+                ))
+        root.after(0, update_table)
+
+        # Update summary
+        mode_names = {"calibrated": "Calibrated magnitudes", "relative": "Relative flux (ensemble ADU, no catalogue mags)", "raw": "Raw ADU (target only)"}
+        summary_text = f"Target: {ts_target_name_var.get()}  |  Filter: {ts_filter_var.get()}  |  " + (f"Points: {len(results)} (from {sum(r.get('n_frames', 1) for r in results)} frames)\n" if faint else f"Files: {len(results)}\n")
+        summary_text += f"Mode:         {mode_names.get(lc_mode, lc_mode)}\n"
+        summary_text += f"Saved CSV:    {os.path.abspath(out_csv)}\n"
+        summary_text += f"Saved Plot:   {os.path.abspath(out_plot)}\n"
+        if faint:
+            summary_text += faint.get('summary', '')
+        if lc_mode == "calibrated":
+            summary_text += f"AAVSO Report: {os.path.abspath(out_aavso)}\n"
+        else:
+            summary_text += "AAVSO Report: not written (only available in Calibrated mode)\n"
+        if check_stats:
+            summary_text += f"--------------------------------------------------------------------------------\n"
+            summary_text += check_stats
+
+        def update_summary():
+            ts_summary_text.config(state="normal")
+            ts_summary_text.delete("1.0", tk.END)
+            ts_summary_text.insert("1.0", summary_text)
+            ts_summary_text.config(state="disabled")
+        root.after(0, update_summary)
+
+        vars_dict["ts_faint_state"] = faint.get('state') if faint else None
+        ts_status_var.set(f"Complete! Results saved." + (f"  ({len(results)} points)" if faint else ""))
+
     def on_run_ts():
         selected_iids = [iid for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
         if not selected_iids:
@@ -4004,11 +5485,7 @@ def run_config_gui(pipeline_callback=None):
             filt_str = str(file_data['filter']).upper()
             
             # Determine translated filter of this file
-            trans_filt = filt_str
-            if v_key and v_key in filt_str:
-                trans_filt = "V"
-            elif b_key and b_key in filt_str:
-                trans_filt = "B"
+            trans_filt = lband_of(filt_str) or filt_str.strip()
             
             if selected_filter == trans_filt:
                 files.append(file_data['path'])
@@ -4040,9 +5517,33 @@ def run_config_gui(pipeline_callback=None):
                 if vars_dict[f"ts_ref_{i}_use"][0].get():
                     ensemble_data.append(s_dict)
         
-        if not ensemble_data:
-            messagebox.showerror("Error", "Please select at least one reference star in the ensemble.")
-            return
+        # --- Light curve mode selection (v4.14) ---
+        lc_mode = ts_lc_mode_var.get() or "calibrated"
+        if not ensemble_data and lc_mode in ("calibrated", "relative"):
+            if ts_auto_raw_var.get():
+                prev = "Calibrated" if lc_mode == "calibrated" else "Relative flux"
+                lc_mode = "raw"
+                ts_lc_mode_var.set("raw")
+                ts_status_var.set(f"No reference stars selected -> switched from {prev} to Raw ADU mode.")
+                messagebox.showinfo("Raw ADU Mode",
+                                    f"No reference stars are selected, so the {prev} mode cannot be used.\n\n"
+                                    "Calibra switched to 'Raw ADU' mode: the light curve will be the target's "
+                                    "background-subtracted net flux (ADU) with CCD-equation uncertainties.\n\n"
+                                    "(Untick 'Automatically use Raw ADU...' in 'Light Curve Mode' to disable this.)")
+            else:
+                messagebox.showerror("Error", "Please select at least one reference star in the ensemble,\n"
+                                     "or choose 'Raw ADU' mode (or enable automatic switching).")
+                return
+        flux_per_second = bool(ts_per_second_var.get()) and lc_mode == "raw"
+        lc_stack_mode = vars_dict["stack_mode"][0].get() if "stack_mode" in vars_dict else "average"
+        try:
+            lc_k_coeff = float(vars_dict["extinction_kb" if ts_filter_var.get().upper() == "B" else "extinction_kv"][0].get())
+        except (KeyError, tk.TclError, ValueError):
+            lc_k_coeff = 0.2
+        try:
+            lc_sky_factor = float(vars_dict["sky_noise_factor"][0].get()) if "sky_noise_factor" in vars_dict else 1.0
+        except (tk.TclError, ValueError):
+            lc_sky_factor = 1.0
 
         ts_status_var.set("Resolving target coordinates...")
         root.update_idletasks()
@@ -4073,33 +5574,74 @@ def run_config_gui(pipeline_callback=None):
                         s['dec'] = s['dec_man']
                     else:
                         try:
-                            c = SkyCoord.from_name(s['name'])
+                            c = _resolve_name(s['name'])
                         except Exception:
                             from photometry.calibration import resolve_auid
                             res = resolve_auid(s['name'], verbose=False)
                             if res:
                                 c = SkyCoord(ra=res['ra']*u.deg, dec=res['dec']*u.deg)
                             else:
-                                raise Exception(f"Could not resolve '{s['name']}' via Simbad or VSX.")
+                                raise Exception(f"Could not resolve '{s['name']}' via the local GCVS list, Simbad or VSX.")
                         s['ra'] = c.ra.deg
                         s['dec'] = c.dec.deg
                     
                     if s in ensemble_data:
                         resolved_ensemble.append(s)
                 except Exception as e:
-                    root.after(0, lambda: messagebox.showerror("Ensemble Error", f"Could not resolve star '{s['name']}': {e}"))
+                    root.after(0, lambda err=e, nm=s['name']: messagebox.showerror("Ensemble Error", f"Could not resolve star '{nm}': {err}"))
                     ts_status_var.set("Failed: Coordinate resolution error.")
                     return
+
+            # v4.20: are target and comparison stars on the images? (several nights may
+            # have different pointings; a star off an image cannot be measured there)
+            try:
+                from photometry.field_variables import image_footprints, in_footprints
+                fps = image_footprints(files)
+                good = [f for f in fps if f[1] is not None]
+                if len(good) < len(fps):
+                    print(f"Light Curves: {len(fps) - len(good)} image(s) without WCS will give no measurement.")
+                if good:
+                    t_in = in_footprints(tar_c.ra.deg, tar_c.dec.deg, good, margin_px=0)
+                    if not t_in.any():
+                        root.after(0, lambda: messagebox.showerror("Target not on the images",
+                            f"The target ({tar_c.ra.deg:.4f}, {tar_c.dec.deg:+.4f}) is not on any of the "
+                            f"{len(good)} selected images.\nCheck the coordinates/name and the selected files."))
+                        ts_status_var.set("Failed: target not on the images.")
+                        return
+                    notes = []
+                    if not t_in.all():
+                        notes.append(f"target outside {int((~t_in).sum())} of {len(good)} image(s) (skipped there)")
+                    for s in resolved_ensemble + ([check_star_data] if check_star_data else []):
+                        s_in = in_footprints(float(s['ra']), float(s['dec']), [f for f, k in zip(good, t_in) if k], margin_px=0)
+                        if not s_in.all():
+                            notes.append(f"{s['name']} outside {int((~s_in).sum())} image(s)")
+                    if notes:
+                        print("Light Curves - field check: " + "; ".join(notes))
+                        ts_status_var.set("Note: " + "; ".join(notes)[:150])
+            except Exception as e:
+                print(f"Field check skipped: {e}")
 
             ts_status_var.set(f"Processing {len(files)} files...")
             
             # Reset Phase 3 state
-            root.after(0, lambda: cancel_btn.pack(pady=5))
+            root.after(0, lambda: cancel_btn.pack(side=tk.BOTTOM, pady=2))
             root.after(0, lambda: ts_progress_var.set(0))
             cancel_event.clear()
             
             def update_prog(val):
                 root.after(0, lambda: ts_progress_var.set(val))
+
+            faint_ctx = None
+            if ts_faint_var.get():
+                # v4.44: faint target - forced photometry at a fixed position, frames combined afterwards
+                results, msg, faint_ctx = run_faint_target(files, tar_c, resolved_ensemble, check_star_data, lc_mode,
+                                                           flux_per_second, lc_stack_mode, lc_sky_factor, update_prog)
+                root.after(0, lambda: cancel_btn.pack_forget())
+                if results:
+                    ts_publish(results, lc_mode, resolved_ensemble, check_star_data, faint_ctx)
+                else:
+                    ts_status_var.set(f"Failed: {msg}")
+                return
 
             results, msg = run_time_series_photometry(
                 files, target_ra=tar_c.ra.deg, target_dec=tar_c.dec.deg,
@@ -4112,7 +5654,7 @@ def run_config_gui(pipeline_callback=None):
                 annulus_inner=float(vars_dict["annulus_inner"][0].get()),
                 annulus_outer=float(vars_dict["annulus_outer"][0].get()),
                 gain=float(vars_dict["ccd_gain"][0].get()),
-                k_coeff=ts_k_var.get(),
+                k_coeff=lc_k_coeff,
                 filter_name=ts_filter_var.get(),
                 site_lat=ts_lat_var.get(),
                 site_long=ts_lon_var.get(),
@@ -4124,113 +5666,17 @@ def run_config_gui(pipeline_callback=None):
                 aperture_fwhm_factor=float(vars_dict["aperture_fwhm_factor"][0].get()),
                 annulus_inner_gap=float(vars_dict["annulus_inner_gap"][0].get()),
                 annulus_width=float(vars_dict["annulus_width"][0].get()),
-                print_psf_fitting=bool(vars_dict.get("print_psf_fitting", [None, None])[0].get()) if "print_psf_fitting" in vars_dict else False
+                print_psf_fitting=bool(vars_dict.get("print_psf_fitting", [None, None])[0].get()) if "print_psf_fitting" in vars_dict else False,
+                lc_mode=lc_mode,
+                flux_per_second=flux_per_second,
+                stack_mode=lc_stack_mode,
+                sky_noise_factor=lc_sky_factor
             )
             
             root.after(0, lambda: cancel_btn.pack_forget())
             
             if results:
-                out_csv = os.path.join("photometry_output", f"light_curve_{ts_target_name_var.get().replace(' ','_')}.csv")
-                out_aavso = os.path.join("photometry_output", f"aavso_{ts_target_name_var.get().replace(' ','_')}.txt")
-                out_plot = os.path.join("photometry_output", f"plot_{ts_target_name_var.get().replace(' ','_')}.png")
-                
-                # Save CSV
-                with open(out_csv, 'w', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerows(results)
-                
-                # AAVSO Metadata
-                comp_name = "ENSEMBLE" if len(resolved_ensemble) > 1 else resolved_ensemble[0]['name']
-                comp_mag = "na" if len(resolved_ensemble) > 1 else resolved_ensemble[0]['mag_std']
-                check_name = check_star_data['name'] if check_star_data else "na"
-                check_mag = check_star_data['mag_std'] if check_star_data else "na"
-                is_trans = "YES" if ts_do_trans_var.get() and abs(ts_coeff_var.get()) > 1e-5 else "NO"
-                
-                # Construct header comments (Fix)
-                cat_name = vars_dict.get("reference_catalog", (tk.StringVar(value="na"), None))[0].get()
-                report_comments = f"RefCat: {cat_name}"
-                if is_trans == "YES":
-                    report_comments += " | Transformed to Johnson-Cousins"
-                
-                # Construct observation notes (Ensemble details)
-                ens_names = " ".join([s['name'] for s in resolved_ensemble])
-                report_notes = f"Ensemble of {len(resolved_ensemble)}- {ens_names}"
-                
-                save_aavso_report(results, out_aavso, ts_target_name_var.get(), ts_filter_var.get(), ts_obs_var.get(),
-                                  comp_name=comp_name, comp_mag=comp_mag, 
-                                  check_name=check_name, check_mag=check_mag,
-                                  trans=is_trans, software_version=APP_VERSION,
-                                  comments=report_comments,
-                                  notes=report_notes,
-                                  chart=ts_chart_var.get())
-                
-                # Calculate Stats for Check Star & Reference Stars
-                check_stats = ""
-                check_mags = [r['check_mag'] for r in results if isinstance(r.get('check_mag'), (int, float)) and not np.isnan(r['check_mag'])]
-                if check_mags and check_star_data:
-                    avg_check = np.mean(check_mags)
-                    std_check = np.std(check_mags)
-                    bias = avg_check - check_star_data['mag_std']
-                    check_stats += f"Check Star Stats ({check_star_data['name']}):\n"
-                    check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_check:.3f} mag\n\n"
-                    
-                for ref_star in resolved_ensemble:
-                    ref_name = ref_star['name']
-                    cat_mag = ref_star['mag_std']
-                    mags = [r['ref_mags'][ref_name] for r in results if 'ref_mags' in r and ref_name in r['ref_mags'] and not np.isnan(r['ref_mags'][ref_name])]
-                    if mags:
-                        avg_mag = np.mean(mags)
-                        std_mag = np.std(mags)
-                        bias = avg_mag - cat_mag
-                        check_stats += f"Reference Star Stats ({ref_name}):\n"
-                        check_stats += f"Average Bias: {bias:+.3f} (Meas - Cat)  |  Precision (1-sigma): {std_mag:.3f} mag\n\n"
-                
-                check_stats = check_stats.strip()
-                
-                # Update embedded plot
-                plot_title = f"{ts_target_name_var.get()} ({ts_filter_var.get()} Filter)"
-                def update_viz():
-                    rebuild_inline_toggles(results)
-                    on_inline_toggle()
-                root.after(0, update_viz)
-                
-                # Update table
-                def update_table():
-                    # Clear existing
-                    for item in ts_tree.get_children():
-                        ts_tree.delete(item)
-                    # Add new
-                    for r in results:
-                        ts_tree.insert("", tk.END, values=(
-                            f"{r['jd']:.5f}", 
-                            f"{r['hjd']:.5f}", 
-                            f"{r['mag']:.3f}", 
-                            f"{r['mag_err']:.3f}", 
-                            f"{r['check_mag']:.3f}" if isinstance(r.get('check_mag'), (int, float)) and not np.isnan(r.get('check_mag')) else "N/A",
-                            f"{r['snr']:.1f}",
-                            f"{r.get('fwhm', 0.0):.2f}",
-                            r.get('flag', 'OK')
-                        ))
-                root.after(0, update_table)
-
-                # Update summary
-                summary_text = f"Target: {ts_target_name_var.get()}  |  Filter: {ts_filter_var.get()}  |  Files: {len(results)}\n"
-                summary_text += f"Saved CSV:    {os.path.abspath(out_csv)}\n"
-                summary_text += f"Saved Plot:   {os.path.abspath(out_plot)}\n"
-                summary_text += f"AAVSO Report: {os.path.abspath(out_aavso)}\n"
-                if check_stats:
-                    summary_text += f"--------------------------------------------------------------------------------\n"
-                    summary_text += check_stats
-                
-                def update_summary():
-                    ts_summary_text.config(state="normal")
-                    ts_summary_text.delete("1.0", tk.END)
-                    ts_summary_text.insert("1.0", summary_text)
-                    ts_summary_text.config(state="disabled")
-                root.after(0, update_summary)
-                
-                ts_status_var.set(f"Complete! Results saved.")
+                ts_publish(results, lc_mode, resolved_ensemble, check_star_data, faint_ctx)
             else:
                 ts_status_var.set(f"Failed: {msg}")
 
@@ -4243,8 +5689,13 @@ def run_config_gui(pipeline_callback=None):
             messagebox.showinfo("Cache Cleared", "The photometry cache has been wiped.")
 
     def on_open_report():
+        # v4.18: the report of the last run; otherwise the newest report for this target
+        import glob as _glob
         target_name = ts_target_name_var.get().replace(' ','_')
-        report_path = os.path.abspath(os.path.join("photometry_output", f"aavso_{target_name}.txt"))
+        report_path = vars_dict.get("ts_last_report_path")
+        if not (isinstance(report_path, str) and os.path.exists(report_path)):
+            cands = sorted(_glob.glob(os.path.join("photometry_output", f"aavso_{target_name}*.txt")), key=os.path.getmtime)
+            report_path = os.path.abspath(cands[-1]) if cands else os.path.abspath(os.path.join("photometry_output", f"aavso_{target_name}.txt"))
         if os.path.exists(report_path):
             try:
                 if sys.platform == 'win32':
@@ -4260,44 +5711,92 @@ def run_config_gui(pipeline_callback=None):
         else:
             messagebox.showwarning("Not Found", f"No report file found at:\n{report_path}\n\nPlease generate a light curve first.")
 
-    def on_reset_ensemble():
-        if messagebox.askyesno("Reset Ensemble", "Are you sure you want to clear all selected reference stars and the check star?"):
-            # Clear all TS ref vars
-            for i in range(5):
-                vars_dict[f"ts_ref_{i}_use"][0].set(False)
-                vars_dict[f"ts_ref_{i}_name"][0].set("")
-                vars_dict[f"ts_ref_{i}_mag"][0].set(0.0)
-                vars_dict[f"ts_ref_{i}_bv"][0].set(0.0)
-                vars_dict[f"ts_ref_{i}_ra"][0].set(0.0)
-                vars_dict[f"ts_ref_{i}_dec"][0].set(0.0)
-                vars_dict[f"ts_ref_{i}_has_manual"][0].set(False)
-                if f"ts_ref_{i}_coord_label" in vars_dict:
-                    vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
-            
-            # Clear check star
-            ts_check_star_idx_var.set(-1)
-            
-            # Reset target defaults if needed
-            ts_target_name_var.set("Target")
-            
-            messagebox.showinfo("Reset Complete", "Ensemble and check star configuration has been cleared.")
+    # (second on_reset_ensemble definition removed in v4.15 - see above)
+
+    # v4.18: named Light-Curve setups (target, comparison/check stars, mode, coefficients)
+    SETUP_DIR = "setups"
+    def _lc_setup_keys():
+        exclude = {"ts_lat", "ts_lon", "ts_show_coeff"}   # site and layout are global, not per target
+        return [k for k, v in vars_dict.items()
+                if k.startswith("ts_") and k not in exclude
+                and isinstance(v, (tuple, list)) and len(v) >= 2 and isinstance(v[0], tk.Variable)]
+
+    def save_lc_setup():
+        import json
+        from tkinter import filedialog
+        os.makedirs(SETUP_DIR, exist_ok=True)
+        default = ts_target_name_var.get().strip().replace(' ', '_') or "setup"
+        path = filedialog.asksaveasfilename(title="Save Light-Curve Setup", initialdir=os.path.abspath(SETUP_DIR),
+                                            initialfile=f"{default}.json", defaultextension=".json",
+                                            filetypes=[("Calibra setup", "*.json")])
+        if not path:
+            return
+        data = {'calibra_setup_version': 1, 'values': {}}
+        for k in _lc_setup_keys():
+            try:
+                data['values'][k] = vars_dict[k][0].get()
+            except tk.TclError:
+                pass
+        cache = getattr(on_get_aavso_refs, 'cache', None)
+        if cache and getattr(on_get_aavso_refs, 'last_target', '') == ts_target_name_var.get().strip():
+            data['aavso_cache'] = cache
+            data['aavso_last_target'] = on_get_aavso_refs.last_target
+            data['aavso_last_cat'] = getattr(on_get_aavso_refs, 'last_cat', '')
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2, default=float)
+            ts_status_var.set(f"Setup saved: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save Setup", f"Could not save the setup:\n{e}")
+
+    def open_lc_setup():
+        import json
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(title="Open Light-Curve Setup",
+                                          initialdir=os.path.abspath(SETUP_DIR) if os.path.isdir(SETUP_DIR) else ".",
+                                          filetypes=[("Calibra setup", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            values = data.get('values', {})
+            n = 0
+            for k, v in values.items():
+                if k in vars_dict and isinstance(vars_dict[k], (tuple, list)) and hasattr(vars_dict[k][0], 'set'):
+                    try:
+                        vars_dict[k][0].set(v); n += 1
+                    except tk.TclError:
+                        pass
+            if data.get('aavso_cache'):
+                on_get_aavso_refs.cache = data['aavso_cache']
+                on_get_aavso_refs.last_target = data.get('aavso_last_target', '')
+                on_get_aavso_refs.last_cat = data.get('aavso_last_cat', '')
+            tidy_numbers()
+            ts_status_var.set(f"Setup loaded: {os.path.basename(path)} ({n} values)")
+        except Exception as e:
+            messagebox.showerror("Open Setup", f"Could not read the setup:\n{e}")
+
+    ts_btn_row1 = tk.Frame(ts_topbar, bg="#e8eef5")
+    ts_btn_row1.pack(side=tk.TOP, pady=4, before=ts_progress)
 
     ts_btn_container = ttk.Frame(ts_container)
     ts_btn_container.pack(pady=10)
-
-    ts_btn_row1 = ttk.Frame(ts_btn_container)
-    ts_btn_row1.pack(pady=5)
-
     ts_btn_row2 = ttk.Frame(ts_btn_container)
     ts_btn_row2.pack(pady=5)
 
     run_ts_btn = tk.Button(ts_btn_row1, text="Generate Light Curve", command=on_run_ts,
-                           bg="#00796b", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
-    run_ts_btn.pack(side=tk.LEFT, padx=10)
+                           bg="#00796b", fg="white", font=("Arial", 11, "bold"), pady=6, width=22)
+    run_ts_btn.pack(side=tk.LEFT, padx=8)
 
-    ts_open_viewer_btn = tk.Button(ts_btn_row1, text="🔍 Open Selected FITS in Viewer", command=on_open_viewer_button,
-                                   bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, padx=15)
-    ts_open_viewer_btn.pack(side=tk.LEFT, padx=10)
+    ts_open_viewer_btn = tk.Button(ts_btn_row1, text=f"{get_icon('🔍', '')} Open Selected FITS in Viewer".strip(), command=on_open_viewer_button,
+                                   bg="#1a3a5f", fg="white", font=("Arial", 10, "bold"), pady=6, padx=10)
+    ts_open_viewer_btn.pack(side=tk.LEFT, padx=8)
+
+    tk.Button(ts_btn_row1, text="Save Target Setup...", command=lambda: save_lc_setup(), font=("Arial", 9), pady=6).pack(side=tk.LEFT, padx=4)
+    tk.Button(ts_btn_row1, text="Open Target Setup...", command=lambda: open_lc_setup(), font=("Arial", 9), pady=6).pack(side=tk.LEFT, padx=4)
+    tk.Button(ts_btn_row1, text="Open Output Folder", command=lambda: open_path(os.path.abspath("photometry_output")),
+              font=("Arial", 9), pady=6).pack(side=tk.LEFT, padx=4)
 
     clear_cache_btn = tk.Button(ts_btn_row2, text="Clear Photometry Cache", command=on_clear_cache,
                                 bg="#f57c00", fg="white", font=("Arial", 9), pady=10)
@@ -4322,9 +5821,11 @@ def run_config_gui(pipeline_callback=None):
     lf_ts_table = tk.LabelFrame(ts_container, text="Numerical Results")
     lf_ts_table.pack(fill="both", expand=True, padx=10, pady=5)
     
-    ts_tree = ttk.Treeview(lf_ts_table, columns=("JD", "HJD", "Mag", "Err", "Check Mag", "SNR", "FWHM", "Flag"), show='headings', height=10)
-    ts_tree.heading("JD", text="JD")
+    ts_tree = ttk.Treeview(lf_ts_table, columns=("JD", "HJD", "N", "Mag", "Err", "Check Mag", "SNR", "FWHM", "Flag"), show='headings', height=10,
+                           selectmode="extended")
+    ts_tree.heading("JD", text="UT (mid)")          # v4.42/4.43: UT date + time of mid-exposure instead of JD
     ts_tree.heading("HJD", text="HJD")
+    ts_tree.heading("N", text="N")                  # v4.44: frames per point (faint-target combining)
     ts_tree.heading("Mag", text="Mag")
     ts_tree.heading("Err", text="Err")
     ts_tree.heading("Check Mag", text="Check Mag")
@@ -4332,8 +5833,9 @@ def run_config_gui(pipeline_callback=None):
     ts_tree.heading("FWHM", text="FWHM")
     ts_tree.heading("Flag", text="Flag")
     
-    ts_tree.column("JD", width=100, anchor=tk.CENTER)
+    ts_tree.column("JD", width=150, anchor=tk.CENTER)
     ts_tree.column("HJD", width=100, anchor=tk.CENTER)
+    ts_tree.column("N", width=35, anchor=tk.CENTER)
     ts_tree.column("Mag", width=70, anchor=tk.CENTER)
     ts_tree.column("Err", width=70, anchor=tk.CENTER)
     ts_tree.column("Check Mag", width=80, anchor=tk.CENTER)
@@ -4370,7 +5872,7 @@ def run_config_gui(pipeline_callback=None):
                 new_flag = 'OK' if r.get('flag', 'OK') == 'SUSPECT' else 'SUSPECT'
                 r['flag'] = new_flag
                 vals = list(ts_tree.item(item, 'values'))
-                vals[7] = new_flag
+                vals[-1] = new_flag
                 ts_tree.item(item, values=vals)
         on_inline_toggle()
 
@@ -4424,7 +5926,7 @@ def run_config_gui(pipeline_callback=None):
 
     # Column 1
     add_dm_setting("Detection Sigma Threshold:", "dm_detect_sigma", 5.0, 0, 0, "How many times above the background noise a star must be to be detected.")
-    add_dm_setting("Detection FWHM (px):", "dm_fwhm", 3.5, 1, 0, "The assumed Full Width at Half Maximum of stars in pixels for the DAOStarFinder algorithm.")
+    add_dm_setting("Detection FWHM (px):", "detect_fwhm", 3.5, 1, 0, "The assumed Full Width at Half Maximum of stars in pixels for the DAOStarFinder algorithm. Same value as Settings > Detection (one setting since v4.18).")
     add_dm_setting("Edge Boundary Buffer (px):", "dm_edge_buffer", 50, 2, 0, "Ignore stars closer to the image edge than this many pixels.", vtype=int)
     add_dm_setting("Min Valid Frames Fraction:", "dm_min_valid_pct", 0.7, 3, 0, "A star must be successfully measured in at least this fraction (0.0 - 1.0) of frames to be kept.")
     
@@ -4434,9 +5936,24 @@ def run_config_gui(pipeline_callback=None):
     add_dm_setting("Suspect Minimum Excess (Mag):", "dm_suspect_excess", 0.03, 2, 3, "A star's absolute RMS must exceed the expected noise floor by at least this many magnitudes to be flagged as a Suspect. Prevents flagging micro-variations in ultra-bright stars.")
     
     # Fast Test Mode Checkbox (placed under Column 2)
-    var_fast = tk.BooleanVar(value=True)
+    var_fast = tk.BooleanVar(value=False)  # v4.16: default off (was on and silently limited the analysis)
     vars_dict["dm_fast_test"] = (var_fast, bool)
-    ttk.Checkbutton(lf_dm_config, text="Fast Test Mode (limit tracking to top 100 stars)", variable=var_fast).grid(row=3, column=3, columnspan=3, sticky=tk.W, padx=10, pady=5)
+    ttk.Checkbutton(lf_dm_config, text="Fast Test Mode (only the 100 brightest stars - quick check, not a full analysis)", variable=var_fast).grid(row=3, column=3, columnspan=3, sticky=tk.W, padx=10, pady=5)
+
+    # v4.17: reuse stored per-frame measurements (photometry_output/dm_cache)
+    var_dm_cache = tk.BooleanVar(value=True)
+    vars_dict["dm_use_cache"] = (var_dm_cache, bool)
+    ttk.Checkbutton(lf_dm_config, text="Reuse stored measurements (re-analysis without re-reading the FITS files)",
+                    variable=var_dm_cache).grid(row=4, column=3, columnspan=3, sticky=tk.W, padx=10, pady=5)
+
+    def on_clear_dm_cache():
+        import shutil as _sh
+        from photometry.data_mining import DM_CACHE_DIR
+        if os.path.isdir(DM_CACHE_DIR) and messagebox.askyesno("Clear Data Mining Cache",
+                f"Delete all stored Data Mining measurements in\n{os.path.abspath(DM_CACHE_DIR)} ?"):
+            _sh.rmtree(DM_CACHE_DIR, ignore_errors=True)
+            messagebox.showinfo("Cache Cleared", "Data Mining measurement cache deleted.")
+    ttk.Button(lf_dm_config, text="Clear Measurement Cache", command=on_clear_dm_cache).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=5)
     
     dm_status_var = tk.StringVar(value="Ready to discover.")
     tk.Label(dm_container, textvariable=dm_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold")).pack(pady=5)
@@ -4480,7 +5997,7 @@ def run_config_gui(pipeline_callback=None):
         ref_file = fits_files[0]
         
         detect_sig = float(vars_dict["dm_detect_sigma"][0].get())
-        dm_fwhm_val = float(vars_dict["dm_fwhm"][0].get())
+        dm_fwhm_val = float(vars_dict["detect_fwhm"][0].get())
         sat_limit = int(vars_dict["saturation_limit"][0].get())
         edge_buf = int(vars_dict["dm_edge_buffer"][0].get())
         min_pct = float(vars_dict["dm_min_valid_pct"][0].get())
@@ -4504,20 +6021,33 @@ def run_config_gui(pipeline_callback=None):
         
         run_dm_btn.config(state=tk.DISABLED)
         
+        # v4.16: read all Tk settings on the GUI thread (tkinter is not thread-safe)
+        sharplo_val = float(vars_dict["dao_sharplo"][0].get())
+        sharphi_val = float(vars_dict["dao_sharphi"][0].get())
+        roundlo_val = float(vars_dict["dao_roundlo"][0].get())
+        roundhi_val = float(vars_dict["dao_roundhi"][0].get())
+        dm_centroid_shift = vars_dict['centroid_tracking_shift'][0].get() if 'centroid_tracking_shift' in vars_dict else 4.0
+        dm_gain = float(vars_dict["ccd_gain"][0].get())
+        dm_stack_mode = vars_dict["stack_mode"][0].get() if "stack_mode" in vars_dict else "average"
+        dm_sky_factor = float(vars_dict["sky_noise_factor"][0].get()) if "sky_noise_factor" in vars_dict else 1.0
+        dm_use_cache = bool(var_dm_cache.get())
+
+        class _ThreadSafeStatus:
+            """Forwards .set() to the GUI thread."""
+            def set(self, text):
+                root.after(0, lambda t=text: dm_status_var.set(t))
+
         def dm_thread():
+            dm_status = _ThreadSafeStatus()
             try:
-                # Fetch DAOStarFinder parameters from the Settings tab
+                # DAOStarFinder parameters were read from the Settings tab above
                 fwhm_val = dm_fwhm_val
-                sharplo_val = float(vars_dict["dao_sharplo"][0].get())
-                sharphi_val = float(vars_dict["dao_sharphi"][0].get())
-                roundlo_val = float(vars_dict["dao_roundlo"][0].get())
-                roundhi_val = float(vars_dict["dao_roundhi"][0].get())
                 
-                dm_status_var.set("Phase 1/3: Detecting stars in reference frame...")
+                dm_status.set("Phase 1/3: Detecting stars in reference frame...")
                 master_cat = detect_all_stars(
                     ref_file, detect_sigma=detect_sig, saturation_limit=sat_limit, edge_buffer=edge_buf,
                     fwhm=fwhm_val, sharplo=sharplo_val, sharphi=sharphi_val, 
-                    roundlo=roundlo_val, roundhi=roundhi_val
+                    roundlo=roundlo_val, roundhi=roundhi_val, use_cache=dm_use_cache
                 )
                 
                 if cancel_event.is_set(): return
@@ -4526,10 +6056,10 @@ def run_config_gui(pipeline_callback=None):
                     master_cat = master_cat[:100]
                     
                 if not master_cat:
-                    dm_status_var.set("Error: No stars detected in reference frame.")
+                    dm_status.set("Error: No stars detected in reference frame.")
                     return
                     
-                dm_status_var.set(f"Phase 2/3: Tracking {len(master_cat)} stars across {len(fits_files)} frames...")
+                dm_status.set(f"Phase 2/3: Tracking {len(master_cat)} stars across {len(fits_files)} frames...")
                 
                 def update_prog(val):
                     root.after(0, lambda: dm_progress.configure(value=val))
@@ -4538,8 +6068,10 @@ def run_config_gui(pipeline_callback=None):
                     fits_files, master_cat, 
                     aperture_radius=ap_rad, annulus_inner=ann_in, annulus_outer=ann_out,
                     saturation_limit=sat_limit, edge_buffer=edge_buf,
-                    centroid_tracking_shift=vars_dict.get('centroid_tracking_shift', [None])[0].get() if 'centroid_tracking_shift' in vars_dict else 4.0,
-                    cancel_event=cancel_event, progress_callback=update_prog
+                    centroid_tracking_shift=dm_centroid_shift,
+                    cancel_event=cancel_event, progress_callback=update_prog,
+                    gain=dm_gain, stack_mode=dm_stack_mode, sky_noise_factor=dm_sky_factor,
+                    fwhm=dm_fwhm_val, use_cache=dm_use_cache
                 )
                 
                 if cancel_event.is_set(): return
@@ -4560,7 +6092,7 @@ def run_config_gui(pipeline_callback=None):
                 except Exception:
                     pass
 
-                dm_status_var.set("Phase 3/3: Calibrating and Analyzing Statistics...")
+                dm_status.set("Phase 3/3: Calibrating and Analyzing Statistics...")
                 
                 out_csv = os.path.abspath(os.path.join("photometry_output", "data_mining_suspects.csv"))
                 final_stats, exp_func = calibrate_and_analyze(
@@ -4570,10 +6102,10 @@ def run_config_gui(pipeline_callback=None):
                 )
                 
                 if not final_stats:
-                    dm_status_var.set("Analysis complete, but no valid stars survived filters.")
+                    dm_status.set("Analysis complete, but no valid stars survived filters.")
                     return
                 
-                dm_status_var.set("Cross-matching suspects with AAVSO VSX catalog...")
+                dm_status.set("Cross-matching suspects with AAVSO VSX catalog...")
                 known_count = cross_match_vsx_suspects(final_stats, center_ra_dm, center_dec_dm, radius_arcmin=30.0, verbose=True)
                     
                 # Update UI
@@ -4673,13 +6205,13 @@ def run_config_gui(pipeline_callback=None):
                     if n_new > 0:
                         status_parts.append(f"{n_new} potential new discovery!")
                     status_parts.append(f"Saved to {out_csv}")
-                    dm_status_var.set(" | ".join(status_parts))
+                    dm_status.set(" | ".join(status_parts))
                 
                 root.after(0, update_ui)
                 
             except Exception as e:
-                root.after(0, lambda: messagebox.showerror("Error", str(e)))
-                dm_status_var.set("Error occurred.")
+                root.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
+                dm_status.set("Error occurred.")
             finally:
                 root.after(0, lambda: dm_progress.pack_forget())
                 root.after(0, lambda: btn_cancel.pack_forget())
@@ -4694,41 +6226,120 @@ def run_config_gui(pipeline_callback=None):
                            bg="#1a3a5f", fg="white", font=("Arial", 11, "bold"), pady=10, width=25)
     run_dm_btn.pack(side=tk.LEFT, padx=10)
     
+    def choose_dm_comparisons(target, stats, n_comp=4, n_check=1):
+        """
+        v4.18: pick comparison and check stars for a Data-Mining star from the stored
+        Data-Mining statistics: constant stars (not suspect/noisy, no disturbed
+        background, RMS close to their own photometric error), measured in (almost)
+        all frames, similar brightness (within 1 mag, widened if necessary) and
+        close on the sky. Returns (comps, checks) lists of stat dicts.
+        """
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        n_max = max((int(s_.get('n_valid', 0)) for s_ in stats), default=0)
+        pool = []
+        for s_ in stats:
+            if s_ is target or s_.get('id') == target.get('id'):
+                continue
+            if s_.get('is_suspect') or s_.get('is_noisy') or s_.get('high_bg_var'):
+                continue
+            if str(s_.get('vsx_name', '')).strip():
+                continue                                  # known variable
+            if int(s_.get('n_valid', 0)) < 0.95 * n_max:
+                continue
+            nr = s_.get('noise_ratio', np.nan)
+            if np.isfinite(nr) and nr > 1.5:
+                continue
+            if not np.isfinite(s_.get('mean_mag', np.nan)):
+                continue
+            pool.append(s_)
+        if not pool:
+            return [], []
+        tc = SkyCoord(target['ra_deg'] * u.deg, target['dec_deg'] * u.deg)
+        pc = SkyCoord([p_['ra_deg'] for p_ in pool] * u.deg, [p_['dec_deg'] for p_ in pool] * u.deg)
+        dist = tc.separation(pc).arcmin
+        dmag = np.abs(np.array([p_['mean_mag'] for p_ in pool]) - target['mean_mag'])
+        need = n_comp + n_check
+        for window in (1.0, 1.5, 2.5, 99.0):
+            ok = np.where(dmag <= window)[0]
+            if len(ok) >= need:
+                break
+        score = dmag[ok] + dist[ok] / 30.0               # 1 mag ~ 30 arcmin
+        order = ok[np.argsort(score)]
+        chosen = [pool[i] for i in order[:need]]
+        return chosen[:n_comp], chosen[n_comp:need]
+
+    def send_dm_star_to_lc(star_id, auto_comps=True):
+        """v4.18: send a Data-Mining star to Light Curves; optionally also fill the
+        comparison/check star slots automatically (Relative-flux mode)."""
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        stats = getattr(dm_tree, 'final_stats', []) or []
+        target = next((s_ for s_ in stats if str(s_['id']) == str(star_id)), None)
+        if target is None:
+            messagebox.showwarning("Not Found", f"Star {star_id} not found in the Data Mining results.")
+            return
+        coord = SkyCoord(ra=target['ra_deg'] * u.deg, dec=target['dec_deg'] * u.deg)
+        vars_dict["ts_target_ra"][0].set(coord.ra.to_string(unit=u.hourangle, sep=':', precision=2))
+        vars_dict["ts_target_dec"][0].set(coord.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True))
+        vars_dict["ts_target_mode"][0].set("manual")
+        def _dm_name(st_):
+            sid = str(st_['id'])
+            return sid if sid.startswith("DM_") else f"DM_{sid}"
+        name = str(target.get('vsx_name', '')).strip() or str(target.get('catalog_id', '')).strip() or _dm_name(target)
+        ts_target_name_var.set(name)
+
+        msg = f"Target {target['id']} ({name}) sent to the Light Curves tab."
+        if auto_comps:
+            comps, checks = choose_dm_comparisons(target, stats)
+            if comps:
+                slots = comps + checks
+                for i in range(5):
+                    if i < len(slots):
+                        c_ = slots[i]
+                        cn = str(c_.get('catalog_id', '')).strip() or _dm_name(c_)
+                        cc = SkyCoord(c_['ra_deg'] * u.deg, c_['dec_deg'] * u.deg)
+                        vars_dict[f"ts_ref_{i}_name"][0].set(cn)
+                        vars_dict[f"ts_ref_{i}_ra"][0].set(float(c_['ra_deg']))
+                        vars_dict[f"ts_ref_{i}_dec"][0].set(float(c_['dec_deg']))
+                        vars_dict[f"ts_ref_{i}_has_manual"][0].set(True)
+                        vars_dict[f"ts_ref_{i}_mag"][0].set(0.0)
+                        vars_dict[f"ts_ref_{i}_bv"][0].set(0.0)
+                        vars_dict[f"ts_ref_{i}_use"][0].set(i < len(comps))
+                        if f"ts_ref_{i}_coord_label" in vars_dict:
+                            vars_dict[f"ts_ref_{i}_coord_label"][0].set(
+                                f"({cc.ra.to_string(unit='hour', sep=':', precision=1)}, "
+                                f"{cc.dec.to_string(unit='degree', sep=':', precision=1, alwayssign=True)}) [DM, dm={c_['mean_mag'] - target['mean_mag']:+.2f}]")
+                    else:
+                        vars_dict[f"ts_ref_{i}_name"][0].set("")
+                        vars_dict[f"ts_ref_{i}_has_manual"][0].set(False)
+                        vars_dict[f"ts_ref_{i}_use"][0].set(False)
+                        if f"ts_ref_{i}_coord_label" in vars_dict:
+                            vars_dict[f"ts_ref_{i}_coord_label"][0].set("")
+                ts_check_star_idx_var.set(len(comps) if checks else -1)
+                vars_dict["ts_lc_mode"][0].set("relative")
+                msg += (f"\n\n{len(comps)} comparison star(s){' and 1 check star' if checks else ''} were chosen automatically "
+                        f"(constant in the Data Mining analysis, similar brightness, close on the sky) and the mode was set to "
+                        f"'Relative flux'.\n\nFor calibrated magnitudes use 'Fetch' on each star (catalogue values) or "
+                        f"'Get AAVSO Ref Stars', then switch to 'Calibrated magnitudes'.")
+            else:
+                msg += "\n\nNo suitable comparison stars were found automatically - please add them manually."
+        messagebox.showinfo("Sent to Light Curves", msg)
+        switch_tab("ts")
+
     def on_send_suspect():
         selected = dm_tree.selection()
         if not selected:
             messagebox.showwarning("No Selection", "Please select a star from the table first.")
             return
         vals = dm_tree.item(selected[0], 'values')
-        ra_deg, dec_deg = float(vals[3]), float(vals[4])
-        
-        from astropy.coordinates import SkyCoord
-        import astropy.units as u
-        coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg))
-        ra_hms = coord.ra.to_string(unit=u.hourangle, sep=':', precision=2)
-        dec_dms = coord.dec.to_string(unit=u.deg, sep=':', precision=2, alwayssign=True)
-        
-        vars_dict["ts_target_ra"][0].set(ra_hms)
-        vars_dict["ts_target_dec"][0].set(dec_dms)
-        vars_dict["ts_target_mode"][0].set("manual")
-        
-        vsx_name = str(vals[10]).strip() if len(vals) > 10 else ""
-        cat_id = str(vals[12]).strip() if len(vals) > 12 else ""
-        
-        if vsx_name:
-            target_name = vsx_name
-        elif cat_id:
-            target_name = cat_id
-        else:
-            target_name = f"DM_{vals[0]}"
-            
-        ts_target_name_var.set(target_name)
-        messagebox.showinfo("Sent", f"Target {vals[0]} coordinates sent to Light Curves tab!")
-        switch_tab("ts")
+        send_dm_star_to_lc(vals[0], auto_comps=True)
 
-    send_btn = tk.Button(dm_btn_frame, text="Send Suspect to Light Curves", command=on_send_suspect,
+    send_btn = tk.Button(dm_btn_frame, text="Send to Light Curves (+ comp stars)", command=on_send_suspect,
                            bg="#f57c00", fg="white", font=("Arial", 10, "bold"), pady=10, padx=15)
     send_btn.pack(side=tk.LEFT, padx=10)
+    tk.Button(dm_btn_frame, text="Open Output Folder", command=lambda: open_path(os.path.abspath("photometry_output")),
+              font=("Arial", 9), pady=10).pack(side=tk.RIGHT, padx=10)
 
     # Task 5: Added Preview Light Curve button
     def on_preview_click():
@@ -5092,22 +6703,7 @@ def run_config_gui(pipeline_callback=None):
         menu.add_command(label="Copy RA/Dec", command=lambda: root.clipboard_clear() or root.clipboard_append(f"{ra}, {dec}"))
         
         def local_send_to_lc():
-            vars_dict["ts_target_ra"][0].set(vals[1])
-            vars_dict["ts_target_dec"][0].set(vals[2])
-            vars_dict["ts_target_mode"][0].set("manual")
-            
-            vsx_name = str(vals[10]).strip() if len(vals) > 10 else ""
-            cat_id = str(vals[12]).strip() if len(vals) > 12 else ""
-            
-            if vsx_name:
-                target_name = vsx_name
-            elif cat_id:
-                target_name = cat_id
-            else:
-                target_name = f"DM_{vals[0]}"
-                
-            ts_target_name_var.set(target_name)
-            switch_tab("ts")
+            send_dm_star_to_lc(vals[0], auto_comps=True)
             
         menu.add_command(label="Send to Light Curves", command=local_send_to_lc)
         
@@ -5137,10 +6733,20 @@ def run_config_gui(pipeline_callback=None):
                     'use_flexible_aperture': vars_dict["use_flexible_aperture"][0].get(),
                     'aperture_fwhm_factor': float(vars_dict["aperture_fwhm_factor"][0].get()),
                     'annulus_inner_gap': float(vars_dict["annulus_inner_gap"][0].get()),
-                    'annulus_width': float(vars_dict["annulus_width"][0].get())
+                    'annulus_width': float(vars_dict["annulus_width"][0].get()),
+                    'filter_v_keyword': vars_dict["filter_v_keyword"][0].get(),
+                    'filter_b_keyword': vars_dict["filter_b_keyword"][0].get(),
                 }
+                # v4.15: pass the configured catalogue and the matching default ZP
+                dm_band = band_of(loaded_files[int(selected_iids[0])].get('filter', ''))
+                dm_zp_key = "default_zp_b" if dm_band == 'B' else "default_zp_v"
+                try:
+                    dm_def_zp = float(vars_dict[dm_zp_key][0].get())
+                except (tk.TclError, ValueError, KeyError):
+                    dm_def_zp = 23.399
                 
                 FITSViewer(viewer_win, file_path, config=viewer_config,
+                           ref_catalog=vars_dict["reference_catalog"][0].get(), default_zp=dm_def_zp,
                            initial_stars={'variable': {'ra': target_stat['ra_deg'], 'dec': target_stat['dec_deg'], 'name': star_id, 'zoom': True}, 'check': None, 'refs': []})
         
         menu.add_command(label="Open in FITS Viewer", command=open_in_viewer)
@@ -5307,11 +6913,18 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_ccd, "Read Noise (e-):", "ccd_read_noise", 3.3, 1)
     add_entry(lf_ccd, "Dark Current (e-/s/px):", "ccd_dark_current", 0.0007, 2)
     add_entry(lf_ccd, "Saturation Limit (ADU):", "saturation_limit", 63000, 3, vtype=int)
+    # v4.16 noise model (see photometry/noise.py and manual section 2.3)
+    add_dropdown(lf_ccd, "Stacked images (STACKCNT):", "stack_mode", ["average", "sum", "none"], "average", 4)
+    add_entry(lf_ccd, "Sky Noise Factor (>=1):", "sky_noise_factor", 1.0, 5)
+    tk.Label(lf_ccd, text="'average': effective gain = gain x STACKCNT. Sky noise factor: correlated noise in stacks "
+                          "(the pipeline log prints a measured value).", fg="#555", font=("Arial", 8, "italic"),
+             wraplength=600, justify=tk.LEFT).grid(row=6, column=0, columnspan=4, sticky=tk.W, padx=10)
 
     # Detection (from old TAB 2)
     lf_det = tk.LabelFrame(sub_phot, text="Detection (DAOStarFinder)")
     lf_det.pack(fill="x", padx=10, pady=10)
     add_entry(lf_det, "Detection Sigma:", "detect_sigma", 5.0, 0)
+    add_entry(lf_det, "Detection FWHM (px):", "detect_fwhm", 3.5, 0, col_offset=1)
     add_entry(lf_det, "Sharpness Low:", "dao_sharplo", 0.2, 1, col_offset=0)
     add_entry(lf_det, "Sharpness High:", "dao_sharphi", 1.0, 1, col_offset=1)
     add_entry(lf_det, "Roundness Low:", "dao_roundlo", -1.2, 2, col_offset=0)
@@ -5347,6 +6960,10 @@ def run_config_gui(pipeline_callback=None):
     add_entry(lf_cal, "Default Zero Point (B):", "default_zp_b", 24.0, 1, col_offset=1)
     add_entry(lf_cal, "Min SNR for Calib:", "calib_snr_threshold", 10.0, 2)
     add_entry(lf_cal, "Catalog Search Radius (arcmin):", "catalog_search_radius", 15.0, 3)
+    tk.Label(lf_cal, text="0 = automatic (image half-diagonal)", fg="#555", font=("Arial", 8, "italic")).grid(row=3, column=2, sticky=tk.W)
+    # v4.16: calibration-star selection
+    add_entry(lf_cal, "Max Peak for Calib Stars (ADU):", "calib_peak_limit", 30000, 4, vtype=int)
+    add_check(lf_cal, "Exclude stars with a neighbour inside the annulus (blends) from calibration", "calib_exclude_blended", True, 5)
     # Checkboxes moved to Pipeline Configuration section.
 
     # Global Extinction (Shared)
@@ -5360,6 +6977,9 @@ def run_config_gui(pipeline_callback=None):
     lf_obs.pack(fill="x", padx=10, pady=10)
     add_entry(lf_obs, "AAVSO Observer Code (4 chars):", "aavso_obs_code", "XXXX", 0, vtype=str)
     add_entry(lf_obs, "Observer Name (Report Header):", "observer_name", "Calibra User", 1, vtype=str)
+    # v4.18: observing site (single place; used only if the FITS header lacks SITELAT/SITELONG)
+    add_entry(lf_obs, "Site Latitude (deg, fallback):", "ts_lat", 59.8, 2)
+    add_entry(lf_obs, "Site Longitude (deg E, fallback):", "ts_lon", 17.6, 3)
 
 
     # Output Toggles (from old TAB 4)
@@ -5371,6 +6991,1814 @@ def run_config_gui(pipeline_callback=None):
     add_check(lf_out, "Display Matplotlib Plots (Blocking)", "display_plots", False, 3)
     add_entry(lf_out, "Max PSF plots to show/save per file:", "max_plots_to_show_per_file", 3, 4, vtype=int)
 
+
+    # =========================================================================
+    # --- TAB: FIELD VARIABLES (v4.19) ---
+    # Light curves of several known variables in the field (long and short
+    # periods): targets from a list file or from VSX / GCVS for the image field.
+    # =========================================================================
+    import re as _fv_re
+    from tkinter import filedialog as _fv_fd
+    fv_container = tk.Frame(tab_fieldvars, bg="white")
+    fv_container.pack(fill="both", expand=True, padx=20, pady=10)
+    tk.Label(fv_container, text=f"{get_icon('✨', '')}  Field Variables - light curves of several known variables".strip(),
+             font=("Segoe UI", 16, "bold"), fg="#1a3a5f", bg="white").pack(anchor="w", pady=(0, 4))
+    tk.Label(fv_container, bg="white", justify="left", fg="#444", font=("Segoe UI", 9),
+             text="Measures light curves for many variables at once - e.g. long-period variables over several nights.\n"
+                  "Targets: load a list (name + RA/Dec) or query AAVSO VSX / GCVS for the field of the checked images. "
+                  "Uses the checked File Manager images of the chosen filter and the aperture settings.",
+             wraplength=800).pack(anchor="w", pady=(0, 6))
+
+    fv_targets = []          # list of target dicts (name, ra, dec, type, period, max, min, source, use, x, y, stats)
+    fv_last = {}             # paths of the last run
+
+    def _fv_var(name, default, vtype=str):
+        if name in vars_dict:
+            return vars_dict[name][0]
+        var = {str: tk.StringVar, int: tk.IntVar, bool: tk.BooleanVar}.get(vtype, tk.DoubleVar)(value=default)
+        vars_dict[name] = (var, vtype)
+        return var
+
+    # ---- 1. Targets -------------------------------------------------------
+    lf_fv_tg = tk.LabelFrame(fv_container, text="1. Targets", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_fv_tg.pack(fill="x", pady=5)
+
+    fv_filter_var = _fv_var("fv_filter", "V")
+    fv_faint_var = _fv_var("fv_faintest_max", "14.0")
+    fv_amp_var = _fv_var("fv_min_amplitude", "0.1")
+    fv_pmin_var = _fv_var("fv_min_period", "")
+    fv_pmax_var = _fv_var("fv_max_period", "")
+    fv_types_var = _fv_var("fv_types", "")
+    fv_unknown_p_var = _fv_var("fv_include_unknown_period", True, bool)
+    fv_edge_var = _fv_var("fv_edge_px", "30")
+
+    row_q = tk.Frame(lf_fv_tg, bg="white"); row_q.pack(fill="x", padx=8, pady=(6, 2))
+    tk.Label(row_q, text="Filter:", bg="white").pack(side=tk.LEFT)
+    ttk.Combobox(row_q, textvariable=fv_filter_var, values=["V", "B", "L"], width=4, state="readonly").pack(side=tk.LEFT, padx=(2, 12))
+    for lbl, var, w in (("Brighter than (at max):", fv_faint_var, 6), ("Min. amplitude (mag):", fv_amp_var, 5),
+                        ("Period from (d):", fv_pmin_var, 7), ("to (d):", fv_pmax_var, 7)):
+        tk.Label(row_q, text=lbl, bg="white").pack(side=tk.LEFT)
+        ttk.Entry(row_q, textvariable=var, width=w).pack(side=tk.LEFT, padx=(2, 10))
+    row_q2 = tk.Frame(lf_fv_tg, bg="white"); row_q2.pack(fill="x", padx=8, pady=2)
+    tk.Label(row_q2, text="Types (e.g. 'M SR L', empty = all):", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_q2, textvariable=fv_types_var, width=14).pack(side=tk.LEFT, padx=(2, 10))
+    ttk.Checkbutton(row_q2, text="keep stars without catalogued period", variable=fv_unknown_p_var).pack(side=tk.LEFT, padx=(0, 10))
+    tk.Label(row_q2, text="Edge margin (px):", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_q2, textvariable=fv_edge_var, width=5).pack(side=tk.LEFT, padx=2)
+
+    row_b = tk.Frame(lf_fv_tg, bg="white"); row_b.pack(fill="x", padx=8, pady=(4, 4))
+
+    fv_cols = ("use", "name", "type", "period", "range", "source", "imgs", "n", "mean", "std", "p2p", "chi2")
+    fv_heads = {"use": "Use", "name": "Name", "type": "Type", "period": "Period (d)", "range": "Range (mag)",
+                "source": "Source", "imgs": "On images", "n": "N", "mean": "Mean", "std": "Std", "p2p": "5-95% range",
+                "chi2": "chi2_red"}
+    fv_widths = {"use": 36, "name": 140, "type": 60, "period": 70, "range": 100, "source": 75, "imgs": 80, "n": 35,
+                 "mean": 65, "std": 55, "p2p": 75, "chi2": 60}
+    fv_tree_frame = tk.Frame(lf_fv_tg, bg="white"); fv_tree_frame.pack(fill="x", padx=8, pady=4)
+    fv_tree = ttk.Treeview(fv_tree_frame, columns=fv_cols, show="headings", height=10, selectmode="extended")
+    for c in fv_cols:
+        fv_tree.heading(c, text=fv_heads[c])
+        fv_tree.column(c, width=fv_widths[c], minwidth=fv_widths[c], anchor="w" if c in ("name", "type", "source") else "center", stretch=False)
+    fv_sb = ttk.Scrollbar(fv_tree_frame, orient="vertical", command=fv_tree.yview)
+    fv_tree.configure(yscrollcommand=fv_sb.set)
+    fv_tree.pack(side=tk.LEFT, fill="x", expand=True)
+    fv_sb.pack(side=tk.LEFT, fill="y")
+
+    fv_status_var = tk.StringVar(value="Load a target list or query a catalogue.")
+
+    def _fmt(v, nd=3):
+        try:
+            v = float(v)
+            return f"{v:.{nd}f}" if np.isfinite(v) else ""
+        except (TypeError, ValueError):
+            return ""
+
+    def fv_refresh_tree():
+        fv_tree.delete(*fv_tree.get_children())
+        for i, t in enumerate(fv_targets):
+            mx, mn = t.get('max'), t.get('min')
+            rng = f"{_fmt(mx, 2)} - {_fmt(mn, 2)}" if (_fmt(mx) or _fmt(mn)) else ""
+            xy = f"{t['n_in']}/{t['n_img']}" if t.get('n_img') else ""
+            st = t.get('stats') or {}
+            nd = 3 if st.get('mode', 'calibrated') == 'calibrated' else 4
+            fv_tree.insert("", "end", iid=str(i), values=(
+                "[X]" if t.get('use', True) else "[ ]", t.get('name', ''), t.get('type') or '',
+                _fmt(t.get('period'), 4), rng, t.get('source', ''), xy,
+                st.get('n', '') if st else '', _fmt(st.get('mean'), nd) if st else '',
+                _fmt(st.get('std'), nd) if st else '', _fmt(st.get('p2p'), nd) if st else '',
+                _fmt(st.get('chi2_red'), 1) if st else ''))
+        n_use = sum(1 for t in fv_targets if t.get('use', True))
+        fv_status_var.set(f"{len(fv_targets)} target(s) in the list, {n_use} selected.")
+
+    def fv_toggle(event):
+        if fv_tree.identify_column(event.x) != "#1":
+            return
+        iid = fv_tree.identify_row(event.y)
+        if iid:
+            t = fv_targets[int(iid)]
+            t['use'] = not t.get('use', True)
+            fv_refresh_tree()
+    fv_tree.bind("<Button-1>", fv_toggle)
+
+    def fv_checked_files():
+        """Checked File Manager files of the chosen filter (paths)."""
+        want = fv_filter_var.get().upper()
+        out = []
+        for iid in tree.get_children():
+            if tree.item(iid, 'values')[0] != '[X]':
+                continue
+            fd = loaded_files[int(iid)]
+            filt = str(fd['filter']).upper()
+            if (lband_of(filt) or filt.strip()) == want:
+                out.append(fd['path'])
+        return out
+
+    fv_fp_cache = {}
+
+    def fv_footprints(files):
+        """WCS footprints of the images (headers only; cached per file and mtime)."""
+        from photometry.field_variables import image_footprints
+        out = []
+        for p in files:
+            try:
+                key = (p, os.path.getmtime(p))
+            except OSError:
+                key = (p, None)
+            if key not in fv_fp_cache:
+                fv_fp_cache[key] = image_footprints([p])[0]
+            out.append(fv_fp_cache[key])
+        return out
+
+    def fv_field(quiet=False):
+        """Sky region covered by ALL checked images of the chosen filter (several nights
+        may have different pointings). Returns (field, files, footprints); field =
+        (centre_ra, centre_dec, radius_arcmin) or None."""
+        files = fv_checked_files()
+        if not files:
+            if not quiet:
+                messagebox.showwarning("No Images", f"Please check images of filter {fv_filter_var.get()} in the File Manager.")
+            return None, files, []
+        fps = fv_footprints(files)
+        good = [f for f in fps if f[1] is not None]
+        if not good:
+            if not quiet:
+                messagebox.showerror("No WCS", "None of the checked images has an astrometric solution (WCS).\n"
+                                               "Please plate-solve them first (Pre-processing).")
+            return None, files, fps
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        cen, corners = [], []
+        for _, w, (ny, nx) in good:
+            cen.append(w.pixel_to_world((nx - 1) / 2.0, (ny - 1) / 2.0))
+            corners += [w.pixel_to_world(x, y) for x, y in ((0, 0), (nx - 1, 0), (0, ny - 1), (nx - 1, ny - 1))]
+        cc = SkyCoord(cen)
+        v = cc.cartesian.xyz.value.mean(axis=1)
+        centre = SkyCoord(x=v[0], y=v[1], z=v[2], representation_type='cartesian').spherical
+        c0 = SkyCoord(centre.lon.to(u.deg), centre.lat.to(u.deg))
+        radius = max(c0.separation(c).arcmin for c in corners)
+        n_nowcs = len(fps) - len(good)
+        if n_nowcs and not quiet:
+            messagebox.showwarning("Images without WCS", f"{n_nowcs} of the {len(fps)} checked images have no WCS "
+                                   "and are ignored. Plate-solve them to include them.")
+        return (float(c0.ra.deg), float(c0.dec.deg), float(radius)), files, fps
+
+    def _opt_float(var):
+        txt = str(var.get()).strip()
+        if not txt:
+            return None
+        try:
+            return float(txt)
+        except ValueError:
+            raise ValueError(f"'{txt}' is not a number")
+
+    def fv_add_targets(new, replace=False):
+        """Add targets; a star already in the list (same name, or within 5 arcsec)
+        is not added twice - missing catalogue data (type, period, range) is merged."""
+        if replace:
+            fv_targets.clear()
+        for t in new:
+            dup = None
+            for o in fv_targets:
+                if o['name'].strip().lower() == t['name'].strip().lower():
+                    dup = o
+                elif None not in (o.get('ra'), t.get('ra')):
+                    dra = (o['ra'] - t['ra']) * np.cos(np.radians(t['dec']))
+                    if np.hypot(dra, o['dec'] - t['dec']) * 3600.0 < 5.0:
+                        dup = o
+                if dup is not None:
+                    break
+            if dup is None:
+                t.setdefault('use', True)
+                fv_targets.append(t)
+            else:
+                for k in ('type', 'period', 'max', 'min', 'ra', 'dec'):
+                    if dup.get(k) in (None, '') and t.get(k) not in (None, ''):
+                        dup[k] = t[k]
+        fv_refresh_tree()
+
+    def fv_mark_positions(fps, margin=None):
+        """Count on how many of the images each target lies (>= edge margin from the
+        border); targets on none of them are deselected. Returns that number."""
+        if not fps:
+            return 0
+        from photometry.field_variables import in_footprints
+        if margin is None:
+            try:
+                margin = float(fv_edge_var.get() or 0)
+            except ValueError:
+                margin = 0.0
+        good = [f for f in fps if f[1] is not None]
+        off = 0
+        for t in fv_targets:
+            if t.get('ra') is None:
+                continue
+            inside = in_footprints(t['ra'], t['dec'], good, margin_px=margin) if good else np.zeros(0, bool)
+            t['n_in'], t['n_img'] = int(inside.sum()), len(fps)
+            if t['n_in'] == 0 and t.get('use', True):
+                t['use'] = False
+                off += 1
+        return off
+
+    def on_fv_load_list():
+        path = _fv_fd.askopenfilename(title="Load target list",
+                                          filetypes=(("Lists", "*.csv *.txt *.dat *.lst"), ("all files", "*.*")))
+        if not path:
+            return
+        from photometry.field_variables import parse_target_list, resolve_missing_coordinates
+        try:
+            new, problems = parse_target_list(path)
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Could not read {path}:\n{e}")
+            return
+        if any(t['ra'] is None for t in new):
+            fv_status_var.set("Resolving names without coordinates (SIMBAD / VSX)...")
+            root.update_idletasks()
+            problems += resolve_missing_coordinates(new)
+            new = [t for t in new if t.get('ra') is not None]
+        fv_add_targets(new)
+        if loaded_files:
+            try:
+                _, _, fps = fv_field(quiet=True)
+                off = fv_mark_positions(fps)
+                fv_refresh_tree()
+                if off:
+                    problems.append(f"{off} target(s) are not on any of the checked images and were deselected.")
+            except Exception:
+                pass
+        if problems:
+            messagebox.showwarning("Target List", f"{len(new)} target(s) read.\n\n" + "\n".join(problems[:15]) +
+                                   ("\n..." if len(problems) > 15 else ""))
+
+    def on_fv_query(source, quiet=False):
+        field, files, fps = fv_field(quiet=quiet)
+        if not field:
+            return
+        try:
+            filt_kw = dict(faintest_max=_opt_float(fv_faint_var), min_amplitude=_opt_float(fv_amp_var),
+                           min_period=_opt_float(fv_pmin_var), max_period=_opt_float(fv_pmax_var),
+                           include_unknown_period=bool(fv_unknown_p_var.get()), type_filter=fv_types_var.get(),
+                           edge_px=_opt_float(fv_edge_var) or 0.0)
+        except ValueError as e:
+            if not quiet:
+                messagebox.showerror("Input Error", str(e))
+            return
+        ra_c, dec_c, rad = field
+        edge = filt_kw.pop('edge_px')
+        fv_status_var.set(f"Querying {source} within {rad:.1f}' of the field centre...")
+        root.update_idletasks()
+
+        def worker():
+            from photometry.field_variables import query_field_variables, filter_variables
+            try:
+                stars = query_field_variables(source, ra_c, dec_c, rad)
+            except Exception as e:
+                if quiet:
+                    root.after(0, lambda err=e: fv_status_var.set(f"{source} query failed: {err}"))
+                else:
+                    root.after(0, lambda err=e: (fv_status_var.set(f"{source} query failed."),
+                                                 messagebox.showerror("Query Error", f"{source} query failed:\n{err}\n\n"
+                                                                      "(An internet connection is needed for the first query of a field.)")))
+                return
+            from photometry.field_variables import in_footprints
+            sel = filter_variables(stars, None, None, **filt_kw)
+            good = [f for f in fps if f[1] is not None]
+            if sel and good:
+                ins = in_footprints(np.array([x['ra'] for x in sel]), np.array([x['dec'] for x in sel]), good, margin_px=edge)
+                sel = [x for x, k in zip(sel, ins.any(axis=0)) if k]
+
+            def done():
+                n_before = len(fv_targets)
+                fv_add_targets(sel)
+                fv_mark_positions(fps)
+                fv_refresh_tree()
+                src_lbl = "GCVS (local list)" if (stars and stars[0].get('source') == 'GCVS (local)') else source
+                fv_status_var.set(f"{src_lbl}: {len(stars)} variable(s) in the field, {len(sel)} pass the filters, "
+                                  f"{len(fv_targets) - n_before} new ({len(fv_targets)} in the list)."
+                                  + ("  [added automatically]" if quiet else ""))
+                if not quiet and stars and not any(s.get('type') for s in stars):
+                    messagebox.showinfo("Limited catalogue data",
+                                        "Only names and positions are available (old cache, no internet?) - "
+                                        "the type/brightness/period filters could not be applied.")
+            root.after(0, done)
+        import threading as _th
+        _th.Thread(target=worker, daemon=True).start()
+
+    def on_fv_add_manual():
+        pop = tk.Toplevel(root); pop.title("Add target"); pop.transient(root)
+        nv, rv, dv = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        for r, (lbl, var) in enumerate((("Name:", nv), ("RA (hh:mm:ss or deg, empty = resolve name):", rv), ("Dec (dd:mm:ss or deg):", dv))):
+            ttk.Label(pop, text=lbl).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            ttk.Entry(pop, textvariable=var, width=20).grid(row=r, column=1, padx=8, pady=4)
+
+        def ok():
+            from photometry.field_variables import parse_coordinates, resolve_missing_coordinates
+            t = {'name': nv.get().strip() or "Target", 'ra': None, 'dec': None, 'source': 'manual',
+                 'type': None, 'period': None, 'max': None, 'min': None}
+            try:
+                if rv.get().strip():
+                    t['ra'], t['dec'] = parse_coordinates(rv.get(), dv.get())
+                else:
+                    pr = resolve_missing_coordinates([t])
+                    if pr:
+                        raise ValueError(pr[0])
+            except Exception as e:
+                messagebox.showerror("Add target", str(e), parent=pop)
+                return
+            fv_add_targets([t])
+            pop.destroy()
+        ttk.Button(pop, text="Add", command=ok).grid(row=3, column=0, columnspan=2, pady=8)
+
+    def on_fv_remove():
+        sel = sorted((int(i) for i in fv_tree.selection()), reverse=True)
+        for i in sel:
+            del fv_targets[i]
+        fv_refresh_tree()
+
+    def on_fv_select(flag):
+        for t in fv_targets:
+            t['use'] = flag and t.get('ra') is not None
+        fv_refresh_tree()
+
+    def on_fv_save_list():
+        if not fv_targets:
+            return
+        path = _fv_fd.asksaveasfilename(title="Save target list", defaultextension=".csv",
+                                            initialfile="field_variables.csv", filetypes=(("CSV", "*.csv"),))
+        if path:
+            from photometry.field_variables import save_target_list
+            save_target_list(path, fv_targets)
+            fv_status_var.set(f"Target list saved: {path}")
+
+    row_b2 = tk.Frame(lf_fv_tg, bg="white"); row_b2.pack(fill="x", padx=8, pady=(0, 4), after=row_b)
+    for frm, items in ((row_b, (("Load List...", on_fv_load_list), ("Query VSX (incl. GCVS)", lambda: on_fv_query("VSX")),
+                                ("GCVS (local list / online)", lambda: on_fv_query("GCVS")), ("Add...", on_fv_add_manual),
+                                ("APASS DR10...", lambda: vars_dict['apass_dr10_dialog']()))),
+                       (row_b2, (("Remove Selected", on_fv_remove), ("Select All", lambda: on_fv_select(True)),
+                                 ("Select None", lambda: on_fv_select(False)), ("Save List...", on_fv_save_list)))):
+        for txt, cmd in items:
+            ttk.Button(frm, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
+    # v4.26: automatically add the variables of the local GCVS list (catalogue folder)
+    fv_autogcvs_var = _fv_var("fv_auto_gcvs", True, bool)
+    fv_auto_state = {'key': None}
+    ttk.Checkbutton(lf_fv_tg, text="Add variables from the local GCVS list automatically (field of the checked images; "
+                                   "filters above apply)", variable=fv_autogcvs_var).pack(anchor="w", padx=8)
+
+    def fv_auto_gcvs():
+        """Called when the tab is shown: adds GCVS stars in the field once per set of checked images."""
+        try:
+            from photometry import local_catalogs as _lc
+            if not fv_autogcvs_var.get() or not _lc.gcvs_available():
+                return
+        except Exception:
+            return
+        files = fv_checked_files()
+        key = (fv_filter_var.get(), tuple(files))
+        if not files or key == fv_auto_state['key']:
+            return
+        fv_auto_state['key'] = key
+        on_fv_query("GCVS", quiet=True)
+    vars_dict['fv_auto_gcvs'] = fv_auto_gcvs
+
+    tk.Label(lf_fv_tg, text="Click in the 'Use' column to include/exclude a target. "
+                            "List format: one star per line - name, RA, Dec (sexagesimal or degrees), "
+                            "optionally with a header line (name,ra,dec,type,period,...).",
+             bg="white", fg="#666", font=("Segoe UI", 8), wraplength=800, justify="left").pack(anchor="w", padx=8, pady=(0, 6))
+
+    # ---- 2. Light curves --------------------------------------------------
+    lf_fv_run = tk.LabelFrame(fv_container, text="2. Light Curves", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_fv_run.pack(fill="x", pady=5)
+    fv_mode_var = _fv_var("fv_lc_mode", "calibrated")
+    fv_ncomp_var = _fv_var("fv_n_comp", 5, int)
+    fv_comp_rad_var = _fv_var("fv_comp_radius", "12")
+    fv_win_var = _fv_var("fv_mag_window", "1.5")
+    fv_aavso_var = _fv_var("fv_aavso_reports", False, bool)
+
+    row_m = tk.Frame(lf_fv_run, bg="white"); row_m.pack(fill="x", padx=8, pady=(6, 2))
+    for txt, val in (("Calibrated magnitudes (comparison stars from the reference catalogue)", "calibrated"),
+                     ("Relative flux (same comparison stars, no calibration)", "relative"),
+                     ("Raw ADU (no comparison stars)", "raw")):
+        ttk.Radiobutton(row_m, text=txt, variable=fv_mode_var, value=val).pack(anchor="w")
+    row_c = tk.Frame(lf_fv_run, bg="white"); row_c.pack(fill="x", padx=8, pady=2)
+    tk.Label(row_c, text="Comparison stars per target:", bg="white").pack(side=tk.LEFT)
+    ttk.Spinbox(row_c, from_=1, to=10, textvariable=fv_ncomp_var, width=4).pack(side=tk.LEFT, padx=(2, 10))
+    tk.Label(row_c, text="within (arcmin):", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_c, textvariable=fv_comp_rad_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+    tk.Label(row_c, text="brightness window (+/- mag):", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_c, textvariable=fv_win_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+    ttk.Checkbutton(lf_fv_run, text="Also write AAVSO reports (calibrated mode)", variable=fv_aavso_var).pack(anchor="w", padx=8)
+    tk.Label(lf_fv_run, bg="white", fg="#666", font=("Segoe UI", 8), justify="left", wraplength=800,
+             text="Comparison stars are chosen automatically for every target: isolated catalogue stars "
+                  "(Settings > reference catalogue) close in brightness and position, not known variables; "
+                  "one further star serves as check star. Light curves of several nights: check the images of "
+                  "all nights in the File Manager.").pack(anchor="w", padx=8, pady=(0, 4))
+
+    row_r = tk.Frame(lf_fv_run, bg="white"); row_r.pack(fill="x", padx=8, pady=6)
+    fv_progress_var = tk.DoubleVar(value=0)
+    fv_cancel = threading.Event()
+    fv_run_btn = tk.Button(row_r, text="Run Light Curves for Selected Targets", bg="#2e7d32", fg="white",
+                           font=("Segoe UI", 10, "bold"), padx=10)
+    fv_run_btn.pack(side=tk.LEFT)
+    fv_cancel_btn = ttk.Button(row_r, text="Cancel", command=fv_cancel.set)
+    fv_cancel_btn.pack(side=tk.LEFT, padx=6)
+    ttk.Progressbar(row_r, variable=fv_progress_var, maximum=100, length=250).pack(side=tk.LEFT, padx=8)
+    tk.Label(fv_container, textvariable=fv_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold"),
+             wraplength=800, justify="left").pack(anchor="w", pady=4)
+
+    def on_fv_run():
+        use = [t for t in fv_targets if t.get('use', True) and t.get('ra') is not None]
+        if not use:
+            messagebox.showwarning("No Targets", "No targets selected.")
+            return
+        field, files, fps = fv_field()
+        if not field:
+            return
+        # v4.20: only images with WCS; every target must be on at least one of them
+        good_fp = [f for f in fps if f[1] is not None]
+        files = [f[0] for f in good_fp]
+        fv_mark_positions(fps)
+        off = [t for t in use if t.get('n_in', 1) == 0]
+        use = [t for t in use if t.get('n_in', 1) > 0]
+        fv_refresh_tree()
+        if not use:
+            messagebox.showwarning("Field Variables", "None of the selected targets lies on the checked images.")
+            return
+        mode = fv_mode_var.get()
+        filt = fv_filter_var.get().upper()
+        try:
+            n_comp = max(1, int(fv_ncomp_var.get()))
+            comp_rad = float(fv_comp_rad_var.get())
+            win = float(fv_win_var.get())
+            settings = dict(
+                aperture_radius=float(vars_dict["aperture_radius"][0].get()),
+                annulus_inner=float(vars_dict["annulus_inner"][0].get()),
+                annulus_outer=float(vars_dict["annulus_outer"][0].get()),
+                gain=float(vars_dict["ccd_gain"][0].get()),
+                filter_name=filt, site_lat=float(ts_lat_var.get()), site_long=float(ts_lon_var.get()),
+                use_flexible_aperture=bool(vars_dict["use_flexible_aperture"][0].get()),
+                aperture_fwhm_factor=float(vars_dict["aperture_fwhm_factor"][0].get()),
+                annulus_inner_gap=float(vars_dict["annulus_inner_gap"][0].get()),
+                annulus_width=float(vars_dict["annulus_width"][0].get()),
+                centroid_initial_radius=float(vars_dict["centroid_initial_radius"][0].get()) if "centroid_initial_radius" in vars_dict else 15.0,
+                centroid_tracking_shift=float(vars_dict["centroid_tracking_shift"][0].get()) if "centroid_tracking_shift" in vars_dict else 4.0,
+                stack_mode=vars_dict["stack_mode"][0].get() if "stack_mode" in vars_dict else "average",
+                sky_noise_factor=float(vars_dict["sky_noise_factor"][0].get()) if "sky_noise_factor" in vars_dict else 1.0,
+                coeff_term=float(ts_coeff_var.get()) if ts_do_trans_var.get() else 0.0)
+            try:
+                settings['k_coeff'] = float(vars_dict["extinction_kb" if filt == "B" else "extinction_kv"][0].get())
+            except (KeyError, tk.TclError, ValueError):
+                settings['k_coeff'] = 0.2
+        except (tk.TclError, ValueError) as e:
+            messagebox.showerror("Input Error", f"Invalid setting: {e}")
+            return
+        cat_type = vars_dict["reference_catalog"][0].get() if "reference_catalog" in vars_dict else "ATLAS"
+        obs_code, chart = ts_obs_var.get(), ts_chart_var.get()
+        write_aavso = bool(fv_aavso_var.get())
+        is_trans = "YES" if ts_do_trans_var.get() and abs(float(ts_coeff_var.get())) > 1e-5 else "NO"
+        ra_c, dec_c, rad = field
+        w0, shape0 = good_fp[0][1], good_fp[0][2]
+        fv_cancel.clear()
+        fv_progress_var.set(0)
+        fv_run_btn.config(state=tk.DISABLED)
+
+        def status(txt):
+            root.after(0, lambda: fv_status_var.set(txt))
+
+        def worker():
+            import csv as _csv
+            from photometry import field_variables as fvm
+            from photometry.time_series import run_multi_target_photometry, plot_light_curve, save_aavso_report
+            from photometry.calibration import get_ref_stars
+            try:
+                targets = []
+                skipped = [f"{t['name']}: not on any of the checked images" for t in off]
+                known_vars = [t for t in fv_targets if t.get('ra') is not None]
+                if mode in ("calibrated", "relative"):
+                    # reference catalogue: one query for a small field, else one per target
+                    cat_cache = {}
+                    if rad <= 45.0:
+                        status(f"Loading {cat_type} catalogue for the field ({rad + 2:.0f}')...")
+                        cat_all = get_ref_stars(cat_type, ra_c, dec_c, radius_arcmin=round(rad + 2.0, 1), verbose=False) or []
+                    for k, t in enumerate(use):
+                        if fv_cancel.is_set():
+                            status("Cancelled."); return
+                        if rad <= 45.0:
+                            cat = cat_all
+                        else:
+                            status(f"Loading {cat_type} catalogue around {t['name']} ({k + 1}/{len(use)})...")
+                            cat = get_ref_stars(cat_type, t['ra'], t['dec'], radius_arcmin=round(2 * comp_rad + 3, 1), verbose=False) or []
+                        comps, chk, tmag, tbv = fvm.choose_catalog_comparisons(
+                            t, cat, known_vars, w0, shape0, band=filt, n_comp=n_comp,
+                            radius_arcmin=comp_rad, mag_window=win, footprints=good_fp)
+                        if not comps:
+                            skipped.append(f"{t['name']}: no suitable comparison stars in the catalogue")
+                            continue
+                        t['comps'] = comps
+                        targets.append({'name': t['name'], 'ra': t['ra'], 'dec': t['dec'], 'ensemble': comps,
+                                        'check': chk, 'target_bv': tbv if tbv is not None else 0.5,
+                                        'lc_mode': mode, '_t': t})
+                else:
+                    targets = [{'name': t['name'], 'ra': t['ra'], 'dec': t['dec'], 'ensemble': [], 'check': None,
+                                'target_bv': 0.5, 'lc_mode': 'raw', '_t': t} for t in use]
+                if not targets:
+                    status("No target could be prepared.")
+                    root.after(0, lambda: messagebox.showwarning("Field Variables", "\n".join(skipped[:20])))
+                    return
+
+                status(f"Measuring {len(targets)} target(s) in {len(files)} image(s)...")
+                out = run_multi_target_photometry(
+                    files, [{k: v for k, v in t.items() if k != '_t'} for t in targets],
+                    cancel_event=fv_cancel,
+                    update_progress=lambda v: root.after(0, lambda: fv_progress_var.set(v)),
+                    verbose=False, **settings)
+                if fv_cancel.is_set():
+                    status("Cancelled."); return
+
+                # ---- output ----
+                from photometry.time_series import date_label, count_nights
+                all_jd = [r['jd'] for res, _ in out if res for r in res if 'jd' in r]
+                night = date_label(all_jd)
+                n_nights = count_nights(all_jd)
+                outdir = os.path.join("photometry_output", "field_variables", f"{night}_{filt}")
+                os.makedirs(outdir, exist_ok=True)
+                suffix = {"calibrated": "", "relative": "_relflux", "raw": "_rawADU"}[mode]
+                curves, summary, used_names = [], [], set()
+                for tg, (res, msg) in zip(targets, out):
+                    t = tg['_t']
+                    safe = _fv_re.sub(r'[^A-Za-z0-9_.+-]+', '_', t['name']).strip('_') or "target"
+                    base_safe, n_dup = safe, 2
+                    while safe in used_names:
+                        safe = f"{base_safe}_{n_dup}"; n_dup += 1
+                    used_names.add(safe)
+                    if not res:
+                        t['stats'] = None
+                        skipped.append(f"{t['name']}: {msg}")
+                        continue
+                    st = fvm.summarize_light_curve(res) or {}
+                    t['stats'] = st
+                    from photometry.time_series import csv_fields as _csv_fields
+                    keys = _csv_fields(res)                 # v4.42: UT (mid-exposure) instead of JD
+                    t['csv'] = os.path.join(outdir, f"lc_{safe}{suffix}.csv")
+                    with open(t['csv'], 'w', newline='') as f:
+                        wr = _csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+                        wr.writeheader(); wr.writerows(res)
+                    t['plot'] = os.path.join(outdir, f"plot_{safe}{suffix}.png")
+                    plot_light_curve(res, t['name'], t['plot'])
+                    if write_aavso and mode == "calibrated":
+                        ens = tg['ensemble']
+                        save_aavso_report(res, os.path.join(outdir, f"aavso_{safe}.txt"), t['name'], aavso_band(filt), obs_code,
+                                          comp_name="ENSEMBLE" if len(ens) > 1 else ens[0]['name'],
+                                          comp_mag="na" if len(ens) > 1 else ens[0]['mag_std'],
+                                          check_name=tg['check']['name'] if tg['check'] else "na",
+                                          check_mag=tg['check']['mag_std'] if tg['check'] else "na",
+                                          trans=is_trans, software_version=APP_VERSION,
+                                          comments=f"RefCat: {cat_type}",
+                                          notes=f"Ensemble of {len(ens)}- " + " ".join(s['name'] for s in ens),
+                                          chart=chart)
+                    curves.append((t['name'], res))
+                    summary.append([t['name'], t.get('type') or '', t.get('period') or '', t['ra'], t['dec'], mode,
+                                    st.get('n', 0), st.get('mean', ''), st.get('std', ''), st.get('p2p', ''),
+                                    st.get('med_err', ''), st.get('chi2_red', ''), st.get('t0', ''), st.get('t1', ''),
+                                    len(tg['ensemble']), os.path.basename(t['csv'])])
+                sum_path = os.path.join(outdir, f"summary{suffix}.csv")
+                with open(sum_path, 'w', newline='') as f:
+                    wr = _csv.writer(f)
+                    wr.writerow(['name', 'type', 'period_d', 'ra_deg', 'dec_deg', 'mode', 'n_ok', 'mean', 'std',
+                                 'range_5_95', 'median_err', 'chi2_red', 'hjd_first', 'hjd_last', 'n_comp', 'file'])
+                    wr.writerows(summary)
+                ov = os.path.join(outdir, f"overview{suffix}.png")
+                fvm.plot_overview(curves, ov, f"Field variables - {filt} - {night}  ({len(files)} images"
+                                  + (f", {n_nights} nights)" if n_nights > 1 else ")"))
+                fv_last.update(outdir=outdir, overview=ov if curves else None, summary=sum_path)
+
+                def done():
+                    fv_refresh_tree()
+                    fv_progress_var.set(100)
+                    fv_status_var.set(f"Done: {len(curves)} light curve(s) in {os.path.abspath(outdir)}"
+                                      + (f"  ({len(skipped)} target(s) skipped)" if skipped else ""))
+                    if skipped:
+                        messagebox.showwarning("Field Variables", "Skipped:\n" + "\n".join(skipped[:20]) +
+                                               ("\n..." if len(skipped) > 20 else ""))
+                root.after(0, done)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                root.after(0, lambda err=e: (fv_status_var.set(f"Error: {err}"),
+                                             messagebox.showerror("Field Variables", f"Error: {err}")))
+            finally:
+                root.after(0, lambda: fv_run_btn.config(state=tk.NORMAL))
+
+        import threading as _th
+        _th.Thread(target=worker, daemon=True).start()
+    fv_run_btn.config(command=on_fv_run)
+
+    # ---- 3. Results ------------------------------------------------------
+    lf_fv_res = tk.LabelFrame(fv_container, text="3. Results", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_fv_res.pack(fill="x", pady=5)
+
+    def _sel_target():
+        sel = fv_tree.selection()
+        if not sel:
+            messagebox.showinfo("Field Variables", "Please select a target in the list first.")
+            return None
+        return fv_targets[int(sel[0])]
+
+    def on_fv_open_selected():
+        t = _sel_target()
+        if t is None:
+            return
+        if t.get('plot') and os.path.exists(t['plot']):
+            open_path(os.path.abspath(t['plot']))
+        else:
+            messagebox.showinfo("Field Variables", f"No light curve for {t['name']} yet.")
+
+    def on_fv_to_period():
+        t = _sel_target()
+        if t is None:
+            return
+        if not (t.get('csv') and os.path.exists(t['csv'])):
+            messagebox.showinfo("Field Variables", f"No light curve for {t['name']} yet."); return
+        vars_dict['pa_open_files']([t['csv']])
+
+    def on_fv_to_lc():
+        t = _sel_target()
+        if t is None or t.get('ra') is None:
+            return
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        c = SkyCoord(t['ra'] * u.deg, t['dec'] * u.deg)
+        ts_target_name_var.set(t['name'])
+        ts_target_mode_var.set("manual")
+        ts_target_ra_var.set(c.ra.to_string(unit=u.hour, sep=':', precision=2, pad=True))
+        ts_target_dec_var.set(c.dec.to_string(unit=u.deg, sep=':', precision=1, pad=True, alwayssign=True))
+        ts_filter_var.set(fv_filter_var.get())
+        switch_tab("ts")
+        messagebox.showinfo("Light Curves", f"{t['name']} was set as the target of the Light Curves tab "
+                                            "(manual RA/Dec). Choose its comparison stars there for a detailed analysis.")
+
+    for _k, (txt, cmd) in enumerate((("Open Overview Plot", lambda: open_path(os.path.abspath(fv_last['overview'])) if fv_last.get('overview')
+                      else messagebox.showinfo("Field Variables", "No results yet.")),
+                     ("Open Plot of Selected", on_fv_open_selected),
+                     ("Open Summary (CSV)", lambda: open_path(os.path.abspath(fv_last['summary'])) if fv_last.get('summary')
+                      else messagebox.showinfo("Field Variables", "No results yet.")),
+                     ("Open Output Folder", lambda: open_path(os.path.abspath(fv_last.get('outdir') or os.path.join("photometry_output", "field_variables")))),
+                     ("Use Selected in Light Curves Tab", on_fv_to_lc),
+                     ("Period Analysis of Selected", on_fv_to_period))):
+        ttk.Button(lf_fv_res, text=txt, command=cmd).grid(row=_k // 3, column=_k % 3, padx=4, pady=3, sticky="ew")
+
+    # =========================================================================
+    # --- TAB: PERIOD ANALYSIS (v4.21) ---
+    # Periodogram (Lomb-Scargle / PDM / BLS), spectral window, prewhitening with
+    # a multi-frequency fit, phase plots. Input: light-curve CSV files.
+    # =========================================================================
+    from matplotlib.figure import Figure as _PA_Figure
+    from tkinter import filedialog as _pa_fd
+    pa_container = tk.Frame(tab_period, bg="white")
+    pa_container.pack(fill="both", expand=True, padx=20, pady=10)
+    tk.Label(pa_container, text=f"{get_icon('〰', '')}  Period Analysis".strip(), font=("Segoe UI", 16, "bold"),
+             fg="#1a3a5f", bg="white").pack(anchor="w", pady=(0, 4))
+    tk.Label(pa_container, bg="white", justify="left", fg="#444", font=("Segoe UI", 9), wraplength=820,
+             text="Find periods in light curves (one or several CSV files, e.g. several nights or seasons): periodogram, "
+                  "spectral window (aliases), prewhitening of further frequencies and phase plots. "
+                  "Time in days (HJD), frequency in cycles/day.").pack(anchor="w", pady=(0, 2))
+    ttk.Button(pa_container, text="Open Period Analysis Guide",
+               command=lambda: open_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "period_analysis_guide.md"))
+               ).pack(anchor="w", pady=(0, 6))
+
+    pa = {'sets': [], 't': None, 'y': None, 'e': None, 'idx': None, 'freq': None, 'spec': None,
+          'spec_kind': None, 'window': None, 'fit': None, 'freqs': [], 'nharm': [], 'preview': None,
+          'busy': False, 'unit': ''}
+
+    def _pa_var(name, default, vtype=str):
+        if name in vars_dict:
+            return vars_dict[name][0]
+        var = {str: tk.StringVar, int: tk.IntVar, bool: tk.BooleanVar}.get(vtype, tk.DoubleVar)(value=default)
+        vars_dict[name] = (var, vtype)
+        return var
+
+    pa_status_var = tk.StringVar(value="Load one or more light-curve CSV files.")
+    pa_info_var = tk.StringVar(value="")
+
+    # ---- 1. Data ----------------------------------------------------------
+    lf_pa_data = tk.LabelFrame(pa_container, text="1. Data", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_pa_data.pack(fill="x", pady=5)
+    row_d = tk.Frame(lf_pa_data, bg="white"); row_d.pack(fill="x", padx=8, pady=(6, 2))
+    pa_quant_var = tk.StringVar(value="")
+    pa_only_ok_var = _pa_var("pa_only_ok", True, bool)
+    pa_submean_var = _pa_var("pa_subtract_mean", False, bool)
+    pa_files_lb = tk.Listbox(lf_pa_data, height=4, font=("Consolas", 9), activestyle="none")
+
+    def pa_prepare():
+        """Combine the loaded sets into t, y, e with the chosen options; reset fits."""
+        from photometry import period_analysis as pam
+        if not pa['sets']:
+            pa.update(t=None, y=None, e=None)
+            pa_info_var.set("")
+            return False
+        col = pa_quant_var.get() or pa['sets'][0]['value_col']
+        series = []
+        for lc in pa['sets']:
+            c = col if col in lc['columns'] else lc['value_col']
+            series.append(pam.extract_series(lc, c, 'auto', only_ok=bool(pa_only_ok_var.get())))
+        t, y, e, idx = pam.combine_series(series, subtract_mean=bool(pa_submean_var.get()))
+        if t.size < 5:
+            pa_status_var.set("Too few data points (< 5).")
+            return False
+        pa.update(t=t, y=y, e=e, idx=idx, unit=('mag' if 'mag' in col.lower() else col),
+                  fit=None, freqs=[], nharm=[], spec=None, window=None, preview=None, oc=None)
+        s = pam.data_summary(t)
+        pa_info_var.set(f"N = {s['n']}   span T = {s['span']:.2f} d   nights = {s['nights']}   "
+                        f"median spacing = {s['dt_med'] * 1440:.1f} min   "
+                        f"resolution 1/T = {s['resolution']:.4g} c/d   pseudo-Nyquist = {s['nyquist']:.4g} c/d"
+                        + ("" if s['span'] <= 0 else f"   (longest useful period ~ {s['span'] / 2:.3g} d)"))
+        pa_refresh_table(); pa_draw()
+        return True
+
+    def pa_refresh_files():
+        pa_files_lb.delete(0, tk.END)
+        for lc in pa['sets']:
+            pa_files_lb.insert(tk.END, f"{lc['name']}   ({len(lc['rows'])} rows, mode: {lc.get('lc_mode') or '?'})")
+        cols = []
+        for lc in pa['sets']:
+            cols += [c for c in lc['columns'] if c not in cols]
+        pa_quant_cb['values'] = cols
+        if pa['sets'] and (pa_quant_var.get() not in cols):
+            pa_quant_var.set(pa['sets'][0]['value_col'] or (cols[0] if cols else ""))
+
+    def pa_load_paths(paths, replace=False):
+        from photometry import period_analysis as pam
+        if replace:
+            pa['sets'].clear()
+        errs = []
+        for p in paths:
+            try:
+                pa['sets'].append(pam.read_light_curve(p))
+            except Exception as ex:
+                errs.append(f"{os.path.basename(p)}: {ex}")
+        pa_refresh_files()
+        ok = pa_prepare()
+        if errs:
+            messagebox.showwarning("Period Analysis", "Some files could not be read:\n" + "\n".join(errs))
+        if ok:
+            pa_status_var.set(f"{len(pa['sets'])} data set(s) loaded. Press 'Compute Periodogram'.")
+        return ok
+
+    def on_pa_load():
+        paths = _pa_fd.askopenfilenames(title="Load light curve(s)", initialdir=os.path.abspath("photometry_output"),
+                                        filetypes=(("CSV", "*.csv"), ("Text", "*.txt *.dat"), ("all files", "*.*")))
+        if paths:
+            pa_load_paths(list(paths))
+
+    def on_pa_load_last():
+        p = vars_dict.get("ts_last_csv_path")
+        if isinstance(p, str) and os.path.exists(p):
+            pa_load_paths([p])
+        else:
+            messagebox.showinfo("Period Analysis", "No light curve from the Light Curves tab in this session yet.")
+
+    def on_pa_clear():
+        pa['sets'].clear(); pa_refresh_files(); pa_prepare(); pa_refresh_table(); pa_draw()
+        pa_status_var.set("Load one or more light-curve CSV files.")
+
+    for txt, cmd in (("Load Light Curve(s)...", on_pa_load), ("Load Last Light Curve", on_pa_load_last),
+                     ("Clear", on_pa_clear)):
+        ttk.Button(row_d, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
+    tk.Label(row_d, text="   Quantity:", bg="white").pack(side=tk.LEFT)
+    pa_quant_cb = ttk.Combobox(row_d, textvariable=pa_quant_var, width=14, state="readonly")
+    pa_quant_cb.pack(side=tk.LEFT, padx=2)
+    pa_quant_cb.bind("<<ComboboxSelected>>", lambda e: pa_prepare())
+    row_d2 = tk.Frame(lf_pa_data, bg="white"); row_d2.pack(fill="x", padx=8, pady=2)
+    ttk.Checkbutton(row_d2, text="only OK points (flag)", variable=pa_only_ok_var, command=pa_prepare).pack(side=tk.LEFT, padx=(0, 10))
+    ttk.Checkbutton(row_d2, text="subtract the mean of each file (different zero points, e.g. relative flux or other comparison stars)",
+                    variable=pa_submean_var, command=pa_prepare).pack(side=tk.LEFT, padx=2)
+    pa_files_lb.pack(fill="x", padx=8, pady=2)
+    tk.Label(lf_pa_data, textvariable=pa_info_var, bg="white", fg="#1a3a5f", font=("Segoe UI", 9),
+             wraplength=820, justify="left").pack(anchor="w", padx=8, pady=(0, 6))
+
+    # ---- 2. Periodogram ---------------------------------------------------
+    lf_pa_per = tk.LabelFrame(pa_container, text="2. Periodogram", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_pa_per.pack(fill="x", pady=5)
+    row_p = tk.Frame(lf_pa_per, bg="white"); row_p.pack(fill="x", padx=8, pady=6)
+    pa_method_var = _pa_var("pa_method", "Lomb-Scargle")
+    pa_terms_var = _pa_var("pa_nterms", 1, int)
+    pa_pmin_var = _pa_var("pa_period_min", "")
+    pa_pmax_var = _pa_var("pa_period_max", "")
+    pa_over_var = _pa_var("pa_oversample", 10, int)
+    pa_xper_var = _pa_var("pa_axis_period", False, bool)
+    tk.Label(row_p, text="Method:", bg="white").pack(side=tk.LEFT)
+    ttk.Combobox(row_p, textvariable=pa_method_var, values=["Lomb-Scargle", "PDM", "BLS (eclipses)"],
+                 width=14, state="readonly").pack(side=tk.LEFT, padx=(2, 8))
+    tk.Label(row_p, text="harmonics:", bg="white").pack(side=tk.LEFT)
+    ttk.Spinbox(row_p, from_=1, to=6, textvariable=pa_terms_var, width=3).pack(side=tk.LEFT, padx=(2, 8))
+    for lbl, var, w_ in (("Period from (d):", pa_pmin_var, 8), ("to (d):", pa_pmax_var, 8)):
+        tk.Label(row_p, text=lbl, bg="white").pack(side=tk.LEFT)
+        ttk.Entry(row_p, textvariable=var, width=w_).pack(side=tk.LEFT, padx=(2, 8))
+    tk.Label(row_p, text="oversampling:", bg="white").pack(side=tk.LEFT)
+    ttk.Spinbox(row_p, from_=2, to=50, textvariable=pa_over_var, width=4).pack(side=tk.LEFT, padx=(2, 8))
+    row_p2 = tk.Frame(lf_pa_per, bg="white"); row_p2.pack(fill="x", padx=8, pady=(0, 6))
+    pa_compute_btn = ttk.Button(row_p2, text="Compute Periodogram")
+    pa_compute_btn.pack(side=tk.LEFT, padx=2)
+    pa_window_btn = ttk.Button(row_p2, text="Show Spectral Window")
+    pa_window_btn.pack(side=tk.LEFT, padx=2)
+    ttk.Checkbutton(row_p2, text="x-axis as period (log)", variable=pa_xper_var, command=lambda: pa_draw()).pack(side=tk.LEFT, padx=8)
+    tk.Label(row_p2, text="   Curve in phase plot:", bg="white").pack(side=tk.LEFT)
+    pa_phasecurve_var = _pa_var("pa_phase_curve", "Fit (sine + harmonics)")
+    _pc_cb = ttk.Combobox(row_p2, textvariable=pa_phasecurve_var, width=22, state="readonly",
+                          values=["Fit (sine + harmonics)", "Binned mean (no model)", "None"])
+    _pc_cb.pack(side=tk.LEFT, padx=2)
+    pa_phasecurve_var.trace_add("write", lambda *_: pa_draw())
+    pa_bottom_var = tk.StringVar(value="Phase plot")      # v4.25: radio buttons directly above the plot
+    pa_bottom_var.trace_add("write", lambda *_: pa_draw())
+    tk.Label(lf_pa_per, bg="white", fg="#666", font=("Segoe UI", 8), wraplength=820, justify="left",
+             text="Empty period limits = automatic (from 2 x the median spacing up to 2 x the time span). "
+                  "Lomb-Scargle is shown as amplitude spectrum of the current residuals (after subtracting the "
+                  "frequencies in the table); 'harmonics' > 1 fits non-sinusoidal shapes. PDM: 1 - theta is shown "
+                  "(maxima = good periods). Click into the periodogram to preview the phase plot at that frequency."
+             ).pack(anchor="w", padx=8, pady=(0, 6))
+
+    # ---- 3. Frequencies -----------------------------------------------------
+    lf_pa_fr = tk.LabelFrame(pa_container, text="3. Frequencies (prewhitening)", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_pa_fr.pack(fill="x", pady=5)
+    row_f = tk.Frame(lf_pa_fr, bg="white"); row_f.pack(fill="x", padx=8, pady=6)
+    pa_newharm_var = _pa_var("pa_new_harmonics", 1, int)
+    pa_cols = ("id", "freq", "ferr", "period", "perr", "amp", "aerr", "harm", "snr", "note")
+    pa_heads = {"id": "", "freq": "Freq (c/d)", "ferr": "+/-", "period": "Period (d)", "perr": "+/-",
+                "amp": "Amplitude", "aerr": "+/-", "harm": "Harm.", "snr": "S/N", "note": "Note"}
+    pa_widths = {"id": 34, "freq": 95, "ferr": 75, "period": 95, "perr": 75, "amp": 75, "aerr": 60,
+                 "harm": 45, "snr": 50, "note": 190}
+    pa_tree = ttk.Treeview(lf_pa_fr, columns=pa_cols, show="headings", height=5, selectmode="browse")
+    for c in pa_cols:
+        pa_tree.heading(c, text=pa_heads[c])
+        pa_tree.column(c, width=pa_widths[c], minwidth=pa_widths[c], stretch=(c == "note"),
+                       anchor="w" if c == "note" else "center")
+
+    def pa_refresh_table():
+        pa_tree.delete(*pa_tree.get_children())
+        fit = pa['fit']
+        pa_update_quality()
+        if not fit:
+            return
+        for i, (f, fe, comps) in enumerate(zip(fit['freqs'], fit['freq_err'], fit['components'])):
+            amp, sa = comps[0][1], comps[0][2]
+            snr = fit.get('snr', [np.nan] * len(fit['freqs']))[i]
+            pa_tree.insert("", "end", iid=str(i), values=(
+                f"f{i + 1}", f"{f:.6f}", f"{fe:.2g}", f"{1 / f:.6g}", f"{fe / f ** 2:.2g}",
+                f"{amp:.4f}", f"{sa:.4f}", fit['nharm'][i], f"{snr:.1f}" if np.isfinite(snr) else "",
+                fit.get('notes', [''] * len(fit['freqs']))[i]))
+
+    def pa_selected_freq():
+        sel = pa_tree.selection()
+        if sel and pa['fit']:
+            return int(sel[0])
+        return None
+
+    def _pa_on_select(e=None):
+        pa['preview'] = None
+        if pa_bottom_var.get() != "Phase plot":
+            pa_bottom_var.set("Phase plot")        # redraws via the trace
+        else:
+            pa_draw()
+    pa_tree.bind("<<TreeviewSelect>>", _pa_on_select)
+
+    pa_quality_var = tk.StringVar(value="")
+
+    def pa_update_quality():
+        """v4.24: how well do the fitted frequencies describe the data?"""
+        fit = pa['fit']
+        if not fit or pa['t'] is None:
+            pa_quality_var.set("")
+            return
+        from photometry.period_analysis import fit_quality
+        q = fit_quality(fit, pa['t'], pa['e'])
+        u_ = pa['unit']
+        txt = f"Fit quality:  residual rms = {q['rms']:.4g} {u_}"
+        if q['med_err'] is not None:
+            txt += (f"   median photometric error = {q['med_err']:.4g} {u_}   rms/error = {q['ratio']:.2f}"
+                    f"   reduced chi2 = {q['chi2_red']:.2f}")
+            r = q['ratio']
+            if r < 0.8:
+                verdict = "rms below the errors: errors probably overestimated (or over-fitting)."
+            elif r <= 1.3:
+                verdict = "the fitted frequencies describe the data to within the noise."
+            elif r <= 2.0:
+                verdict = "some signal left: look for further peaks (S/N >= 4), more harmonics, or night offsets."
+            else:
+                verdict = "clearly more signal than noise left: further frequencies, harmonics or zero-point problems."
+            txt += "\n  -> " + verdict
+        if np.isfinite(q['night_scatter']) and len(q['nights']) > 1:
+            txt += (f"\n  Night-to-night scatter of the mean residual: {q['night_scatter']:.4g} {u_} "
+                    f"({len(q['nights'])} nights) - compare with the rms; large values point to zero-point "
+                    "differences or a slow variation (see 'Residuals vs time').")
+        pa_quality_var.set(txt)
+
+    # ---- plots -------------------------------------------------------------
+    pa_fig = _PA_Figure(figsize=(9.5, 8.0), dpi=90)
+    pa_plot_frame = tk.Frame(pa_container, bg="white")
+    pa_canvas = FigureCanvasTkAgg(pa_fig, master=pa_plot_frame)
+
+    def _fmt_period_axis(ax):
+        if pa_xper_var.get():
+            ax.set_xscale('log')
+            ax.set_xlabel("Period (d)", fontsize=8)
+        else:
+            ax.set_xlabel("Frequency (c/d)", fontsize=8)
+
+    def pa_phase_data(i=None, use_preview=True):
+        """v4.25: data for a phase plot. Returns dict with f, t0, phase, value (data minus all
+        other, non-harmonic frequencies), err, set index, label, 'only' (sub-fit of the frequency
+        and its harmonic frequencies, or None), times. None if there is nothing to fold."""
+        from photometry.period_analysis import model_curve, phase_fold, harmonic_family
+        t, y, fit = pa['t'], pa['y'], pa['fit']
+        if t is None:
+            return None
+        only = None
+        if use_preview and pa['preview'] is not None:
+            f = pa['preview']
+            val = (fit['residuals'] + fit['offset']) if fit else y
+            label = f"f = {f:.6f} c/d (P = {1 / f:.6g} d)" + (" - residuals of the fit" if fit else "")
+        elif fit:
+            i = (pa_selected_freq() if i is None else i)
+            i = 0 if i is None else i
+            f = fit['freqs'][i]
+            keep = harmonic_family(fit, i)
+            only = dict(fit, freqs=[fit['freqs'][j] for j in keep], components=[fit['components'][j] for j in keep],
+                        nharm=[fit['nharm'][j] for j in keep], offset=fit['offset'])
+            val = fit['residuals'] + model_curve(only, t)
+            extra = [f"f{j + 1}" for j in keep if j != i]
+            others = len(fit['freqs']) - len(keep)
+            label = (f"f{i + 1} = {f:.6f} c/d (P = {1 / f:.6g} d)"
+                     + (f", {others} other frequenc{'y' if others == 1 else 'ies'} subtracted" if others else "")
+                     + (f", harmonics {', '.join(extra)} kept" if extra else ""))
+        else:
+            return None
+        t0 = fit['t0'] if fit else float(np.round(np.mean(t), 1))
+        return {'f': f, 't0': t0, 'phase': phase_fold(t, f, t0), 'value': val, 'err': pa['e'], 'idx': pa['idx'],
+                'label': label, 'only': only, 't': t, 'i': (i if only is not None else None)}
+
+    def pa_open_phase_window():
+        """v4.25: separate, editable phase plot (labels, ranges, symbols, curve, cycles) that
+        can be saved as PNG/PDF/SVG, plus the folded data as CSV."""
+        if pa['t'] is None or (not pa['fit'] and pa['preview'] is None):
+            messagebox.showinfo("Phase plot", "Fit a frequency (or click a peak in the periodogram) first.")
+            return
+        from photometry.period_analysis import model_curve
+        sel_i = pa_selected_freq()
+        d0 = pa_phase_data(sel_i)
+        if d0 is None:
+            return
+        mag = 'mag' in pa['unit'].lower()
+        star = pa['sets'][0]['name'] if pa['sets'] else ""
+        win = tk.Toplevel(root)
+        win.title("Phase plot")
+        win.geometry("1000x760")
+        ctrl = tk.Frame(win); ctrl.pack(side=tk.TOP, fill="x", padx=6, pady=4)
+        V = {}
+        def sv(name, val, kind=str):
+            V[name] = {str: tk.StringVar, bool: tk.BooleanVar, int: tk.IntVar}[kind](value=val)
+            return V[name]
+        freq_choices = []
+        if pa['fit']:
+            freq_choices = [f"f{k + 1} = {f:.6f} c/d" for k, f in enumerate(pa['fit']['freqs'])]
+        if pa['preview'] is not None:
+            freq_choices.append(f"preview {pa['preview']:.6f} c/d")
+        cur = (f"preview {pa['preview']:.6f} c/d" if pa['preview'] is not None
+               else freq_choices[sel_i if sel_i is not None else 0])
+        sv('freq', cur)
+        sv('title', f"{star}   {d0['label']}")
+        sv('xlabel', f"Phase (T0 = HJD {d0['t0']})")
+        sv('ylabel', pa['unit'] if mag else f"{pa['unit']}")
+        sv('ymin', ""); sv('ymax', ""); sv('xmin', "0"); sv('xmax', "2")
+        sv('curve', pa_phasecurve_var.get() if pa_phasecurve_var.get() else "Fit (sine + harmonics)")
+        sv('bins', "0")
+        sv('ms', "3"); sv('errbars', False, bool); sv('colors', True, bool); sv('invert', mag, bool)
+        sv('grid', True, bool); sv('legend', True, bool); sv('width', "8"); sv('height', "5"); sv('dpi', "150")
+        sv('fontsize', "10"); sv('phase0max', True, bool)
+        rows = [
+            [("Frequency:", 'freq', 'combo', freq_choices, 26), ("Curve:", 'curve', 'combo',
+              ["Fit (sine + harmonics)", "Binned mean (no model)", "None"], 22), ("bins (0 = auto):", 'bins', 'entry', None, 4)],
+            [("Title:", 'title', 'entry', None, 70)],
+            [("x label:", 'xlabel', 'entry', None, 30), ("y label:", 'ylabel', 'entry', None, 22)],
+            [("phase from:", 'xmin', 'entry', None, 5), ("to:", 'xmax', 'entry', None, 5),
+             ("y from:", 'ymin', 'entry', None, 8), ("to:", 'ymax', 'entry', None, 8), ("(empty = auto)", None, 'label', None, 0)],
+            [("point size:", 'ms', 'entry', None, 4), ("font size:", 'fontsize', 'entry', None, 4),
+             ("error bars", 'errbars', 'check', None, 0), ("colour per file", 'colors', 'check', None, 0),
+             ("invert y (magnitudes)", 'invert', 'check', None, 0), ("grid", 'grid', 'check', None, 0),
+             ("legend", 'legend', 'check', None, 0), ("phase 0 = maximum light", 'phase0max', 'check', None, 0)],
+            [("figure size (inch) w:", 'width', 'entry', None, 4), ("h:", 'height', 'entry', None, 4),
+             ("dpi (PNG):", 'dpi', 'entry', None, 5)],
+        ]
+        for r_, items in enumerate(rows):
+            fr_ = tk.Frame(ctrl); fr_.pack(fill="x", pady=1)
+            for lbl, key, kind, vals, w_ in items:
+                if kind == 'check':
+                    ttk.Checkbutton(fr_, text=lbl, variable=V[key]).pack(side=tk.LEFT, padx=(0, 8))
+                    continue
+                tk.Label(fr_, text=lbl).pack(side=tk.LEFT, padx=(0, 2))
+                if kind == 'entry':
+                    ttk.Entry(fr_, textvariable=V[key], width=w_).pack(side=tk.LEFT, padx=(0, 8))
+                elif kind == 'combo':
+                    ttk.Combobox(fr_, textvariable=V[key], values=vals, width=w_, state="readonly").pack(side=tk.LEFT, padx=(0, 8))
+        fig = _PA_Figure(figsize=(8, 5), dpi=90)
+        cv = FigureCanvasTkAgg(fig, master=win)
+        state = {}
+
+        def current_data():
+            from photometry.period_analysis import ephemeris, phase_fold
+            txt = V['freq'].get()
+            if txt.startswith("preview"):
+                d = pa_phase_data(None, use_preview=True)
+            else:
+                k = int(txt.split()[0][1:]) - 1
+                d = pa_phase_data(k, use_preview=False)
+            if d is not None and V['phase0max'].get() and d['i'] is not None:
+                # phase 0 at maximum light (ephemeris from the fitted light-curve shape)
+                T0max, _, _ = ephemeris(pa['fit'], d['i'], mag)
+                d['t0'] = round(T0max, 5)
+                d['phase'] = phase_fold(d['t'], d['f'], d['t0'])
+            return d
+
+        def num(key, default=None):
+            try:
+                return float(V[key].get())
+            except (ValueError, tk.TclError):
+                return default
+
+        def redraw(*_):
+            d = current_data()
+            if d is None:
+                return
+            state['d'] = d
+            fs = num('fontsize', 10)
+            fig.clear()
+            ax = fig.add_subplot(111)
+            x0, x1 = num('xmin', 0.0), num('xmax', 2.0)
+            ph, v_, e_ = d['phase'], d['value'], d['err']
+            cols = ['#1f4e8c', '#c45c00', '#2e7d32', '#7b1fa2', '#00838f', '#6d4c41']
+            ms_ = num('ms', 3)
+            # repeat the cycle to cover [x0, x1]
+            shifts = range(int(np.floor(x0)) - 1, int(np.ceil(x1)) + 1)
+            for k in np.unique(d['idx']):
+                m = d['idx'] == k
+                X = np.concatenate([ph[m] + s_ for s_ in shifts]); Y = np.concatenate([v_[m] for _ in shifts])
+                keep_ = (X >= x0) & (X <= x1)
+                c_ = cols[int(k) % len(cols)] if V['colors'].get() else '#1f4e8c'
+                lab = (pa['sets'][int(k)]['name'] if (len(pa['sets']) > 1 and V['colors'].get()) else
+                       ("data" if k == np.unique(d['idx'])[0] else None))
+                if V['errbars'].get() and e_ is not None:
+                    E_ = np.concatenate([e_[m] for _ in shifts])
+                    ax.errorbar(X[keep_], Y[keep_], yerr=E_[keep_], fmt='o', ms=ms_, color=c_, ecolor='#bbbbbb',
+                                elinewidth=0.6, label=lab)
+                else:
+                    ax.plot(X[keep_], Y[keep_], 'o', ms=ms_, color=c_, label=lab)
+            curve = V['curve'].get()
+            if curve.startswith("Fit") and d['only'] is not None:
+                pp = np.linspace(x0, x1, 1000)
+                mm = model_curve(d['only'], d['t0'] + pp / d['f'])
+                nh_ = sum(len(c) for c in d['only']['components'])
+                ax.plot(pp, mm, '-', color='red', lw=1.4, zorder=5,
+                        label=f"fit (sine + {nh_ - 1} harmonics)" if nh_ > 1 else "fit (sine)")
+            elif curve.startswith("Binned"):
+                nb = int(num('bins', 0) or 0)
+                if nb <= 0:
+                    nb = int(max(8, min(50, round(np.sqrt(len(ph)) * 1.5))))
+                edges = np.linspace(0, 1, nb + 1)
+                cen, med = [], []
+                for a_, b_ in zip(edges[:-1], edges[1:]):
+                    m_ = (ph >= a_) & (ph < b_)
+                    if m_.sum() >= 2:
+                        cen.append(0.5 * (a_ + b_)); med.append(np.median(v_[m_]))
+                if cen:
+                    cen = np.array(cen); med = np.array(med)
+                    X = np.concatenate([cen + s_ for s_ in shifts]); Y = np.concatenate([med for _ in shifts])
+                    o_ = np.argsort(X); X, Y = X[o_], Y[o_]
+                    k_ = (X >= x0) & (X <= x1)
+                    ax.plot(X[k_], Y[k_], '-o', ms=3, color='black', lw=1.4, zorder=5, label=f"median of {nb} phase bins")
+                state['binned'] = (cen, med)
+            ax.set_xlim(x0, x1)
+            y0, y1 = num('ymin'), num('ymax')
+            if y0 is not None and y1 is not None:
+                ax.set_ylim(y0, y1)
+            if V['invert'].get():
+                if not ax.yaxis_inverted():
+                    ax.invert_yaxis()
+            ax.set_title(V['title'].get(), fontsize=fs)
+            ax.set_xlabel(V['xlabel'].get(), fontsize=fs); ax.set_ylabel(V['ylabel'].get(), fontsize=fs)
+            ax.tick_params(labelsize=fs * 0.85)
+            if V['grid'].get():
+                ax.grid(alpha=0.3)
+            if V['legend'].get():
+                ax.legend(fontsize=fs * 0.8, loc='best')
+            fig.tight_layout()
+            cv.draw_idle()
+
+        def on_freq_change(*_):
+            d = current_data()
+            if d is not None:
+                V['title'].set(f"{star}   {d['label']}")
+                V['xlabel'].set(f"Phase (T0 = HJD {d['t0']}" + (", maximum light)" if (V['phase0max'].get() and d['i'] is not None) else ")"))
+            redraw()
+        V['freq'].trace_add("write", on_freq_change)
+
+        def save_fig():
+            outdir = os.path.join("photometry_output", "period_analysis"); os.makedirs(outdir, exist_ok=True)
+            path = _pa_fd.asksaveasfilename(parent=win, title="Save phase plot", initialdir=os.path.abspath(outdir),
+                                            initialfile=f"phase_{star}.png", defaultextension=".png",
+                                            filetypes=(("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("all", "*.*")))
+            if not path:
+                return
+            w0, h0 = fig.get_size_inches()
+            try:
+                fig.set_size_inches(num('width', 8), num('height', 5))
+                fig.tight_layout()
+                fig.savefig(path, dpi=num('dpi', 150))
+            finally:
+                fig.set_size_inches(w0, h0)
+                fig.tight_layout(); cv.draw_idle()
+            pa_status_var.set(f"Phase plot saved: {path}")
+
+        def save_data():
+            d = state.get('d')
+            if d is None:
+                return
+            outdir = os.path.join("photometry_output", "period_analysis"); os.makedirs(outdir, exist_ok=True)
+            path = _pa_fd.asksaveasfilename(parent=win, title="Save phase data", initialdir=os.path.abspath(outdir),
+                                            initialfile=f"phase_{star}.csv", defaultextension=".csv",
+                                            filetypes=(("CSV", "*.csv"),))
+            if not path:
+                return
+            with open(path, 'w', newline='') as fh:
+                fh.write(f"# phase plot of {star}: {d['label']}\n# frequency = {d['f']:.8f} c/d, period = {1 / d['f']:.9f} d, "
+                         f"T0 (phase 0) = HJD {d['t0']}\n# value = data minus all other (non-harmonic) fitted frequencies\n")
+                w_ = csv.writer(fh)
+                hdr = ['hjd', 'phase', 'value', 'error', 'file']
+                if d['only'] is not None:
+                    hdr.append('model')
+                    mod = model_curve(d['only'], d['t'])
+                w_.writerow(hdr)
+                for k_ in np.argsort(d['phase']):
+                    row = [f"{d['t'][k_]:.6f}", f"{d['phase'][k_]:.5f}", f"{d['value'][k_]:.6f}",
+                           f"{d['err'][k_]:.6f}" if d['err'] is not None else "", pa['sets'][int(d['idx'][k_])]['name']]
+                    if d['only'] is not None:
+                        row.append(f"{mod[k_]:.6f}")
+                    w_.writerow(row)
+            pa_status_var.set(f"Phase data saved: {path}")
+
+        btns = tk.Frame(ctrl); btns.pack(fill="x", pady=(4, 2))
+        ttk.Button(btns, text="Apply / Redraw", command=redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Save Figure (PNG/PDF/SVG)...", command=save_fig).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Save Phase Data (CSV)...", command=save_data).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=2)
+        tk.Label(btns, text="Changes of text fields take effect with 'Apply / Redraw' (or Enter).",
+                 fg="#666", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=10)
+        for k_ in ('curve', 'errbars', 'colors', 'invert', 'grid', 'legend'):
+            V[k_].trace_add("write", redraw)
+        V['phase0max'].trace_add("write", on_freq_change)
+        win.bind("<Return>", redraw)
+        tb = NavigationToolbar2Tk(cv, win, pack_toolbar=False); tb.update()
+        tb.pack(side=tk.BOTTOM, fill="x")
+        cv.get_tk_widget().pack(side=tk.TOP, fill="both", expand=True)
+        win._pa_state = (fig, V, redraw, save_fig, save_data)   # (for tests)
+        on_freq_change()
+
+    def _pa_draw_residuals(ax, t, y, fit, mag, tz, cols):
+        """v4.24: residuals (data - all fitted frequencies) against time, with the mean of
+        every night - shows night-to-night offsets, trends and beating of unfitted modes."""
+        from photometry.period_analysis import nights_of
+        res = fit['residuals'] if fit else y - np.mean(y)
+        for k in np.unique(pa['idx']):
+            m = pa['idx'] == k
+            ax.plot(t[m] - tz, res[m], 'o', ms=2, color=cols[int(k) % len(cols)])
+        ni = nights_of(t)
+        xs, ms_, es = [], [], []
+        for k in np.unique(ni):
+            m = ni == k
+            if m.sum() >= 3:
+                xs.append(np.mean(t[m]) - tz); ms_.append(np.mean(res[m])); es.append(np.std(res[m], ddof=1) / np.sqrt(m.sum()))
+        if xs:
+            ax.errorbar(xs, ms_, yerr=es, fmt='s', ms=5, color='black', capsize=2, label="night mean")
+            ax.legend(fontsize=7, loc='upper right')
+        ax.axhline(0, color='red', lw=0.7)
+        if mag:
+            ax.invert_yaxis()
+        rms = float(np.std(res))
+        ax.set_title(("Residuals after " + ", ".join(f"f{i + 1}" for i in range(len(fit['freqs']))) if fit
+                      else "Data minus mean (no frequency fitted yet)") + f"   rms = {rms:.4g} {pa['unit']}", fontsize=8)
+        ax.set_xlabel(f"HJD - {tz}", fontsize=8); ax.set_ylabel(f"residual ({pa['unit']})", fontsize=8)
+
+    def _pa_draw_oc(ax):
+        """v4.24: O-C diagram of the times of maximum."""
+        oc = pa.get('oc')
+        if not oc or oc.get('n', 0) == 0:
+            ax.text(0.5, 0.5, "O-C: press 'Times of Maximum / O-C'", ha='center', va='center',
+                    transform=ax.transAxes, color='#888')
+            return
+        E, o, s_ = oc['E'], oc['oc'], oc['err']
+        ax.errorbar(E, o, yerr=s_, fmt='o', ms=3, color='#1a3a5f', ecolor='#999', capsize=1, label="O-C of each maximum")
+        if 'coef' in oc:
+            ee = np.linspace(E.min(), E.max(), 200)
+            ax.plot(ee, np.polyval(oc['coef'][::-1], ee), 'r-', lw=1,
+                    label="parabola (period change)" if len(oc['coef']) == 3 else "straight line (period correction)")
+        ax.axhline(0, color='#888', lw=0.6)
+        ax.legend(fontsize=7, loc='best')
+        ax.set_xlabel(f"Cycle E   (ephemeris: T0 = HJD {oc['T0']:.5f}, P = {oc['P']:.7f} d)", fontsize=8)
+        ax.set_ylabel("O - C (d)", fontsize=8)
+        ax.set_title(oc.get('title', ''), fontsize=8)
+
+    def pa_draw():
+        pa_fig.clear()
+        if pa['t'] is None:
+            pa_canvas.draw_idle()
+            return
+        t, y, fit = pa['t'], pa['y'], pa['fit']
+        mag = 'mag' in pa['unit'].lower()
+        ax1 = pa_fig.add_subplot(3, 1, 1)
+        tz = int(t.min())
+        cols = ['#1f4e8c', '#c45c00', '#2e7d32', '#7b1fa2', '#00838f', '#6d4c41']
+        for k in np.unique(pa['idx']):
+            m = pa['idx'] == k
+            ax1.errorbar(t[m] - tz, y[m], yerr=pa['e'][m] if pa['e'] is not None else None, fmt='o', ms=2,
+                         color=cols[int(k) % len(cols)], ecolor='#bbbbbb', elinewidth=0.6,
+                         label=pa['sets'][int(k)]['name'] if len(pa['sets']) > 1 else None)
+        if fit:
+            from photometry.period_analysis import model_curve
+            # model drawn densely only within the observed intervals (gaps stay empty)
+            tt = []
+            starts = np.concatenate([[0], np.where(np.diff(t) > 0.3)[0] + 1])
+            ends = np.concatenate([starts[1:], [t.size]])
+            fmax = max(fit['freqs']) * max(fit['nharm'])
+            for a, b in zip(starts, ends):
+                n = int(min(2000, max(50, (t[b - 1] - t[a]) * fmax * 40)))
+                tt.append(np.linspace(t[a], t[b - 1], n)); tt.append([np.nan])
+            tt = np.concatenate(tt)
+            yy = model_curve(fit, np.nan_to_num(tt, nan=t[0]))
+            yy[np.isnan(tt)] = np.nan
+            ax1.plot(tt - tz, yy, '-', color='red', lw=0.9, label="model")
+        if mag:
+            ax1.invert_yaxis()
+        ax1.set_xlabel(f"HJD - {tz}", fontsize=8); ax1.set_ylabel(pa['unit'], fontsize=8)
+        ax1.tick_params(labelsize=7); ax1.grid(alpha=0.3)
+        if len(pa['sets']) > 1 or fit:
+            ax1.legend(fontsize=7, loc='best')
+
+        ax2 = pa_fig.add_subplot(3, 1, 2)
+        if pa['spec'] is not None:
+            fr = pa['freq']
+            x = 1.0 / fr if pa_xper_var.get() else fr
+            ax2.plot(x, pa['spec'], '-', lw=0.7, color='#1a3a5f')
+            ax2.set_ylabel(pa['spec_kind'], fontsize=8)
+            if pa['window'] is not None:
+                # spectral window centred on the highest peak, scaled to its height
+                f0 = fr[int(np.nanargmax(pa['spec']))]
+                wv = pa['window'] * np.nanmax(pa['spec'])
+                xw = (f0 + pa['window_freq'])
+                ok = (xw >= fr[0]) & (xw <= fr[-1])
+                ax2.plot((1.0 / xw[ok]) if pa_xper_var.get() else xw[ok], wv[ok], '-', lw=0.7,
+                         color='orange', alpha=0.8, label="spectral window (at highest peak)")
+                ax2.legend(fontsize=7, loc='upper right')
+            if fit:
+                for i, f in enumerate(fit['freqs']):
+                    xf = 1.0 / f if pa_xper_var.get() else f
+                    ax2.axvline(xf, color='red', lw=0.6, ls=':')
+                    ax2.text(xf, ax2.get_ylim()[1] * 0.95, f"f{i + 1}", color='red', fontsize=7, ha='center', va='top')
+            if pa['preview'] is not None:
+                xf = 1.0 / pa['preview'] if pa_xper_var.get() else pa['preview']
+                ax2.axvline(xf, color='green', lw=0.8)
+            _fmt_period_axis(ax2)
+        else:
+            ax2.text(0.5, 0.5, "Press 'Compute Periodogram'", ha='center', va='center', transform=ax2.transAxes, color='#888')
+        ax2.tick_params(labelsize=7); ax2.grid(alpha=0.3)
+
+        ax3 = pa_fig.add_subplot(3, 1, 3)
+        bottom = pa_bottom_var.get()
+        if bottom.startswith("Residuals"):
+            _pa_draw_residuals(ax3, t, y, fit, mag, tz, cols)
+        elif bottom.startswith("O"):
+            _pa_draw_oc(ax3)
+        else:
+            f_ph, others, label = None, None, ""
+            sel = pa_selected_freq()
+            if pa['preview'] is not None:
+                f_ph, label = pa['preview'], f"preview f = {pa['preview']:.6f} c/d (P = {1 / pa['preview']:.6g} d)"
+                yres = fit['residuals'] if fit else y - np.mean(y)
+            elif fit:
+                i = sel if sel is not None else 0
+                f_ph = fit['freqs'][i]
+                # data minus all OTHER frequencies; v4.23: frequencies that are harmonics of the
+                # selected one (2f, 3f, ...) are kept, they belong to the shape of its light curve
+                from photometry.period_analysis import model_curve
+                res_ = 1.0 / max(t.max() - t.min(), 1e-6)
+                keep = [j for j, fj in enumerate(fit['freqs'])
+                        if j == i or (fj > f_ph and abs(fj / f_ph - round(fj / f_ph)) * f_ph < res_ and round(fj / f_ph) >= 2)]
+                only = dict(fit, freqs=[fit['freqs'][j] for j in keep], components=[fit['components'][j] for j in keep],
+                            nharm=[fit['nharm'][j] for j in keep], offset=0.0)
+                yres = fit['residuals'] + model_curve(only, t)
+                extra = [f"f{j + 1}" for j in keep if j != i]
+                label = (f"f{i + 1} = {f_ph:.6f} c/d (P = {1 / f_ph:.6g} d), other frequencies subtracted"
+                         + (f" (harmonic{'s' if len(extra) > 1 else ''} {', '.join(extra)} kept)" if extra else ""))
+            if f_ph:
+                from photometry.period_analysis import phase_fold
+                t0 = fit['t0'] if fit else float(np.round(np.mean(t), 1))
+                ph = phase_fold(t, f_ph, t0)
+                for k in np.unique(pa['idx']):
+                    m = pa['idx'] == k
+                    ax3.plot(np.concatenate([ph[m], ph[m] + 1]), np.concatenate([yres[m], yres[m]]), 'o', ms=2,
+                             color=cols[int(k) % len(cols)])
+                curve = pa_phasecurve_var.get()
+                if curve.startswith("Fit") and fit and pa['preview'] is None:
+                    pp = np.linspace(0, 2, 400)
+                    # model of the selected frequency incl. its own harmonics and harmonic frequencies
+                    # kept above (evaluated as a function of phase)
+                    mm = model_curve(only, t0 + pp / f_ph) if fit else 0 * pp
+                    nh_ = sum(len(c_) for c_ in only['components'])
+                    ax3.plot(pp, mm, '-', color='red', lw=1,
+                             label=f"fit: sine + {nh_ - 1} harmonic(s)" if nh_ > 1 else "fit: pure sine")
+                    ax3.legend(fontsize=7, loc='upper right')
+                elif curve.startswith("Binned"):
+                    # v4.23: model-free mean curve (median per phase bin) - shows the real shape
+                    # (e.g. the sawtooth of a delta Scuti star) without assuming a sinusoid
+                    nb = int(max(8, min(50, round(np.sqrt(len(ph)) * 1.5))))
+                    edges = np.linspace(0, 1, nb + 1)
+                    cen, med = [], []
+                    for a_, b_ in zip(edges[:-1], edges[1:]):
+                        m_ = (ph >= a_) & (ph < b_)
+                        if m_.sum() >= 2:
+                            cen.append(0.5 * (a_ + b_)); med.append(np.median(yres[m_]))
+                    if cen:
+                        cen = np.array(cen); med = np.array(med)
+                        ax3.plot(np.concatenate([cen, cen + 1]), np.concatenate([med, med]), '-o', ms=3,
+                                 color='black', lw=1.2, label=f"median of {nb} phase bins")
+                        ax3.legend(fontsize=7, loc='upper right')
+                if mag:
+                    ax3.invert_yaxis()
+                ax3.set_title(label, fontsize=8)
+                ax3.set_xlabel(f"Phase (t0 = HJD {t0})", fontsize=8)
+                ax3.set_ylabel(f"{pa['unit']} (residual)" if fit or pa['preview'] else pa['unit'], fontsize=8)
+            else:
+                ax3.text(0.5, 0.5, "Phase plot: add a frequency or click into the periodogram", ha='center',
+                         va='center', transform=ax3.transAxes, color='#888')
+        ax3.tick_params(labelsize=7); ax3.grid(alpha=0.3)
+        pa_fig.tight_layout()
+        pa_canvas.draw_idle()
+
+    def on_pa_click(event):
+        if event.inaxes is None or pa['spec'] is None or len(pa_fig.axes) < 2 or event.inaxes is not pa_fig.axes[1]:
+            return
+        tb = getattr(pa_canvas, 'toolbar', None)
+        if tb is not None and getattr(tb, 'mode', ''):
+            return     # zoom/pan active
+        x = event.xdata
+        if x is None or x <= 0:
+            return
+        f = 1.0 / x if pa_xper_var.get() else x
+        # snap to the local maximum within +/- 0.5 resolution
+        fr, sp = pa['freq'], pa['spec']
+        T = pa['t'].max() - pa['t'].min()
+        m = np.abs(fr - f) <= 0.5 / T
+        if np.any(m):
+            f = float(fr[m][np.nanargmax(sp[m])])
+        pa['preview'] = f
+        pa_status_var.set(f"Preview: f = {f:.6f} c/d, P = {1 / f:.6g} d  -  'Add Preview Frequency' adds it to the fit.")
+        if pa_bottom_var.get() != "Phase plot":
+            pa_bottom_var.set("Phase plot")
+        else:
+            pa_draw()
+    pa_canvas.mpl_connect('button_press_event', on_pa_click)
+
+    # ---- computations (in a worker thread) --------------------------------
+    def _pa_grid():
+        from photometry.period_analysis import frequency_grid, data_summary
+        def opt(v):
+            s_ = str(v.get()).strip()
+            return float(s_) if s_ else None
+        pmin, pmax = opt(pa_pmin_var), opt(pa_pmax_var)
+        s = data_summary(pa['t'])
+        fmax = 1.0 / pmin if pmin else None
+        fmin = 1.0 / pmax if pmax else (0.5 / s['span'] if s['span'] > 0 else None)
+        return frequency_grid(pa['t'], fmin=fmin, fmax=fmax, oversample=max(2, int(pa_over_var.get())))
+
+    def _pa_run(job, done, msg):
+        if pa['busy']:
+            return
+        pa['busy'] = True
+        pa_status_var.set(msg)
+        for b in (pa_compute_btn, pa_window_btn, pa_prew_btn):
+            b.config(state=tk.DISABLED)
+
+        def worker():
+            try:
+                res = job()
+                root.after(0, lambda: done(res))
+            except Exception as ex:
+                import traceback; traceback.print_exc()
+                root.after(0, lambda err=ex: (pa_status_var.set(f"Error: {err}"),
+                                              messagebox.showerror("Period Analysis", str(err))))
+            finally:
+                def _end():
+                    pa['busy'] = False
+                    for b in (pa_compute_btn, pa_window_btn, pa_prew_btn):
+                        b.config(state=tk.NORMAL)
+                root.after(0, _end)
+        import threading as _th
+        _th.Thread(target=worker, daemon=True).start()
+
+    def _pa_spectrum(freq, resid, method, nterms):
+        from photometry import period_analysis as pam
+        t, e = pa['t'], pa['e']
+        if method.startswith("PDM"):
+            return 1.0 - pam.pdm(t, resid, freq), "1 - theta (PDM)", None
+        if method.startswith("BLS"):
+            p, _ = pam.bls(t, resid, freq, e, magnitudes=('mag' in pa['unit'].lower()))
+            return p, "BLS power (S/N)", None
+        spec = pam.amplitude_spectrum(t, resid, freq, nterms=nterms)
+        p, ls = pam.lomb_scargle(t, resid, freq, e, nterms=1)
+        fap = pam.false_alarm_probability(ls, float(np.nanmax(p)), freq) if nterms == 1 else np.nan
+        return spec, f"Amplitude ({pa['unit']})", fap
+
+    def on_pa_compute():
+        try:
+            pa_preflight()
+            freq = _pa_grid()
+        except ValueError as ex:
+            messagebox.showerror("Period Analysis", str(ex)); return
+        method, nterms = pa_method_var.get(), max(1, int(pa_terms_var.get()))
+        resid = pa['fit']['residuals'] if pa['fit'] else pa['y'] - np.mean(pa['y'])
+
+        def job():
+            return freq, _pa_spectrum(freq, resid, method, nterms)
+
+        def done(res):
+            freq_, (spec, kind, fap) = res
+            pa.update(freq=freq_, spec=spec, spec_kind=kind, window=None, preview=None)
+            i = int(np.nanargmax(spec))
+            txt = (f"{method}: {len(freq_)} frequencies {freq_[0]:.4g}-{freq_[-1]:.4g} c/d; highest peak "
+                   f"f = {freq_[i]:.6f} c/d (P = {1 / freq_[i]:.6g} d)")
+            if fap is not None and np.isfinite(fap):
+                txt += f", false-alarm probability {fap:.2g}"
+            pa_status_var.set(txt + ("  [residuals after the fitted frequencies]" if pa['fit'] else ""))
+            pa_draw()
+        _pa_run(job, done, f"Computing {method} periodogram...")
+
+    def on_pa_window():
+        if pa['t'] is None:
+            return
+        try:
+            freq = _pa_grid()
+        except ValueError as ex:
+            messagebox.showerror("Period Analysis", str(ex)); return
+        from photometry.period_analysis import spectral_window
+        T = pa['t'].max() - pa['t'].min()
+        span = min(5.0, freq[-1] - freq[0])
+        wf = np.arange(-span, span, 1.0 / (10 * T)) if T > 0 else np.linspace(-span, span, 2000)
+
+        def job():
+            return wf, spectral_window(pa['t'], wf)
+
+        def done(res):
+            pa['window_freq'], pa['window'] = res
+            if pa['spec'] is None:
+                pa_status_var.set("Spectral window computed - compute a periodogram to see it overlaid.")
+            else:
+                side = res[0][(res[1] > 0.3) & (np.abs(res[0]) > 1.5 / T)] if T > 0 else []
+                strong = sorted({round(abs(x), 2) for x in side})[:6]
+                pa_status_var.set("Spectral window (orange) shifted to the highest peak. Side peaks (aliases) at "
+                                  f"+/- {', '.join(str(x) for x in strong) or 'none > 30 %'} c/d from every true peak.")
+            pa_draw()
+        _pa_run(job, done, "Computing spectral window...")
+
+    def pa_preflight():
+        if pa['t'] is None:
+            raise ValueError("Please load a light curve first.")
+
+    def _pa_refit(freqs, nharm, then_msg):
+        from photometry import period_analysis as pam
+        t, y, e = pa['t'], pa['y'], pa['e']
+        method, nterms = pa_method_var.get(), max(1, int(pa_terms_var.get()))
+        freq = pa['freq'] if pa['freq'] is not None else _pa_grid()
+
+        def job():
+            if not freqs:
+                return None, None
+            fit = pam.fit_frequencies(t, y, freqs, nharm, e, refine=True)
+            fit['snr'], _ = pam.snr_all(t, fit, freq)
+            res_ = pam.data_summary(t)['resolution']
+            fit['notes'] = [pam.identify(f, fit['freqs'][:i], res_) for i, f in enumerate(fit['freqs'])]
+            for i, snr in enumerate(fit['snr']):
+                if np.isfinite(snr) and snr < 4:
+                    fit['notes'][i] = ("S/N < 4 (not significant); " + fit['notes'][i]).strip("; ")
+            spec = _pa_spectrum(freq, fit['residuals'], method, nterms)
+            return fit, spec
+
+        def done(res):
+            fit, spec = res
+            pa.update(fit=fit, freqs=list(fit['freqs']) if fit else [], nharm=list(nharm),
+                      preview=None, window=None, freq=freq)
+            if spec is not None:
+                pa['spec'], pa['spec_kind'] = spec[0], spec[1]
+            elif pa['spec'] is not None and not fit:
+                pa['spec'], pa['spec_kind'], _ = _pa_spectrum(freq, pa['y'] - np.mean(pa['y']), method, nterms)
+            pa_refresh_table(); pa_draw()
+            if fit:
+                pa_status_var.set(then_msg + f"  Residual rms = {fit['rms']:.4g} {pa['unit']}. "
+                                  "The periodogram now shows the residuals.")
+            else:
+                pa_status_var.set("No frequencies.")
+        _pa_run(job, done, "Fitting frequencies...")
+
+    def on_pa_prewhiten():
+        try:
+            pa_preflight()
+        except ValueError as ex:
+            messagebox.showerror("Period Analysis", str(ex)); return
+        if pa['spec'] is None:
+            messagebox.showinfo("Period Analysis", "Compute a periodogram first."); return
+        from photometry.period_analysis import find_peak, data_summary
+        res_ = data_summary(pa['t'])['resolution']
+        f = find_peak(pa['freq'], pa['spec'], exclude=pa['freqs'], resolution=res_)
+        nh = max(1, int(pa_newharm_var.get()))
+        _pa_refit(pa['freqs'] + [f], pa['nharm'] + [nh], f"Added f{len(pa['freqs']) + 1} = {f:.6f} c/d (all refitted).")
+
+    def on_pa_add_preview():
+        if pa['preview'] is None:
+            messagebox.showinfo("Period Analysis", "Click into the periodogram first (or use 'Add Frequency...')."); return
+        nh = max(1, int(pa_newharm_var.get()))
+        _pa_refit(pa['freqs'] + [pa['preview']], pa['nharm'] + [nh], f"Added f = {pa['preview']:.6f} c/d.")
+
+    def on_pa_add_manual():
+        if pa['t'] is None:
+            return
+        from tkinter import simpledialog
+        txt = simpledialog.askstring("Add frequency", "Frequency in c/d, or period in days followed by 'd' (e.g. 0.0860169d):",
+                                     parent=root)
+        if not txt:
+            return
+        try:
+            txt = txt.strip().lower()
+            f = 1.0 / float(txt[:-1]) if txt.endswith('d') else float(txt)
+            if f <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Add frequency", f"'{txt}' is not a valid frequency/period."); return
+        nh = max(1, int(pa_newharm_var.get()))
+        _pa_refit(pa['freqs'] + [f], pa['nharm'] + [nh], f"Added f = {f:.6f} c/d.")
+
+    def on_pa_remove():
+        i = pa_selected_freq()
+        if i is None:
+            if not pa['freqs']:
+                return
+            i = len(pa['freqs']) - 1
+        fr = pa['freqs'][:i] + pa['freqs'][i + 1:]
+        nh = pa['nharm'][:i] + pa['nharm'][i + 1:]
+        if fr:
+            _pa_refit(fr, nh, f"Removed f{i + 1}.")
+        else:
+            pa.update(fit=None, freqs=[], nharm=[])
+            pa_refresh_table(); on_pa_compute()
+
+    def on_pa_set_harm():
+        i = pa_selected_freq()
+        if i is None:
+            messagebox.showinfo("Period Analysis", "Select a frequency in the table."); return
+        nh = list(pa['nharm']); nh[i] = max(1, int(pa_newharm_var.get()))
+        _pa_refit(list(pa['freqs']), nh, f"f{i + 1} now fitted with {nh[i]} harmonic(s).")
+
+    def on_pa_reset():
+        pa.update(fit=None, freqs=[], nharm=[], preview=None, oc=None)
+        pa_refresh_table()
+        if pa['spec'] is not None:
+            on_pa_compute()
+        else:
+            pa_draw()
+
+    def on_pa_save():
+        if not pa['fit'] and pa['spec'] is None:
+            messagebox.showinfo("Period Analysis", "Nothing to save yet."); return
+        from photometry import period_analysis as pam
+        base = pa['sets'][0]['name'] if pa['sets'] else "light_curve"
+        outdir = os.path.join("photometry_output", "period_analysis")
+        os.makedirs(outdir, exist_ok=True)
+        path = _pa_fd.asksaveasfilename(title="Save period analysis", initialdir=os.path.abspath(outdir),
+                                        initialfile=f"periods_{base}.csv", defaultextension=".csv",
+                                        filetypes=(("CSV", "*.csv"),))
+        if not path:
+            return
+        s = pam.data_summary(pa['t'])
+        info = {'files': "; ".join(lc['path'] for lc in pa['sets']), 'quantity': pa_quant_var.get(),
+                'only OK points': bool(pa_only_ok_var.get()), 'mean subtracted per file': bool(pa_submean_var.get()),
+                'N': s['n'], 'time span (d)': f"{s['span']:.4f}", 'nights': s['nights'],
+                'frequency resolution 1/T (c/d)': f"{s['resolution']:.5g}",
+                'method': pa_method_var.get(), 'frequency range (c/d)':
+                    f"{pa['freq'][0]:.5g}-{pa['freq'][-1]:.5g}" if pa['freq'] is not None else "",
+                'software': f"Calibra {APP_VERSION}"}
+        if pa['fit']:
+            pam.save_results(path, pa['fit'], info)
+        else:
+            with open(path, 'w') as fh:
+                for k, v in info.items():
+                    fh.write(f"# {k}: {v}\n")
+        png = os.path.splitext(path)[0] + ".png"
+        pa_fig.savefig(png, dpi=130)
+        if pa['spec'] is not None:
+            with open(os.path.splitext(path)[0] + "_periodogram.csv", 'w', newline='') as fh:
+                w_ = csv.writer(fh); w_.writerow(['frequency_c_per_d', 'period_d', pa['spec_kind']])
+                step = max(1, len(pa['freq']) // 200000)
+                for f, p in zip(pa['freq'][::step], pa['spec'][::step]):
+                    w_.writerow([f"{f:.7f}", f"{1 / f:.7f}", f"{p:.6g}"])
+        if pa['fit']:
+            with open(os.path.splitext(path)[0] + "_residuals.csv", 'w', newline='') as fh:
+                w_ = csv.writer(fh); w_.writerow(['hjd', 'value', 'model', 'residual', 'set'])
+                for tt_, yy_, rr_, k_ in zip(pa['t'], pa['y'], pa['fit']['residuals'], pa['idx']):
+                    w_.writerow([f"{tt_:.6f}", f"{yy_:.6f}", f"{yy_ - rr_:.6f}", f"{rr_:.6f}", pa['sets'][int(k_)]['name']])
+        pa_status_var.set(f"Saved: {path} (+ .png, _periodogram.csv" + (", _residuals.csv)" if pa['fit'] else ")"))
+
+    pa_compute_btn.config(command=on_pa_compute)
+    pa_window_btn.config(command=on_pa_window)
+    pa_prew_btn = ttk.Button(row_f, text="Prewhiten: Add Highest Peak", command=on_pa_prewhiten)
+    pa_prew_btn.pack(side=tk.LEFT, padx=2)
+    for txt, cmd in (("Add Preview Frequency", on_pa_add_preview), ("Add Frequency...", on_pa_add_manual),
+                     ("Remove Selected/Last", on_pa_remove), ("Reset", on_pa_reset)):
+        ttk.Button(row_f, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
+    row_f2 = tk.Frame(lf_pa_fr, bg="white"); row_f2.pack(fill="x", padx=8, pady=(0, 4))
+    tk.Label(row_f2, text="Harmonics for a new frequency:", bg="white").pack(side=tk.LEFT)
+    ttk.Spinbox(row_f2, from_=1, to=10, textvariable=pa_newharm_var, width=3).pack(side=tk.LEFT, padx=(2, 6))
+    ttk.Button(row_f2, text="Apply to Selected", command=on_pa_set_harm).pack(side=tk.LEFT, padx=2)
+    ttk.Button(row_f2, text="Save Results...", command=on_pa_save).pack(side=tk.LEFT, padx=(14, 2))
+    ttk.Button(row_f2, text="Open Output Folder",
+               command=lambda: open_path(os.path.abspath(os.path.join("photometry_output", "period_analysis")))).pack(side=tk.LEFT, padx=2)
+    pa_tree.pack(fill="x", padx=8, pady=4)
+    tk.Label(lf_pa_fr, textvariable=pa_quality_var, bg="white", fg="#1a3a5f", font=("Segoe UI", 9),
+             wraplength=820, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+    tk.Label(lf_pa_fr, bg="white", fg="#666", font=("Segoe UI", 8), wraplength=820, justify="left",
+             text="Prewhitening: the highest peak of the residual periodogram is added and all frequencies are fitted "
+                  "together (frequencies, amplitudes, phases; non-linear least squares). Repeat until no peak reaches "
+                  "S/N = 4 (S/N = amplitude / mean residual amplitude within +/- 1 c/d). Notes mark harmonics (2f1), "
+                  "combinations (f1+f2) and possible 1 c/d or 1/yr aliases. Uncertainties after Montgomery & "
+                  "O'Donoghue (1999) assume white noise and are lower limits. Select a row to see its phase plot "
+                  "(harmonics 2f, 3f ... of the selected frequency stay in it). Light curves are rarely sinusoidal "
+                  "(delta Scuti / RR Lyrae: sawtooth): use 3-5 harmonics for such a frequency, or show the "
+                  "model-free 'Binned mean' curve.").pack(anchor="w", padx=8, pady=(0, 6))
+
+    # ---- 4. Times of maximum and O-C (v4.24) ---------------------------------
+    lf_pa_oc = tk.LabelFrame(pa_container, text="4. Times of maximum and O-C", bg="white", font=("Segoe UI", 10, "bold"), fg="#1a3a5f")
+    lf_pa_oc.pack(fill="x", pady=5)
+    row_o = tk.Frame(lf_pa_oc, bg="white"); row_o.pack(fill="x", padx=8, pady=(6, 2))
+    pa_tm_method_var = _pa_var("pa_tmax_method", "Template (fitted shape)")
+    pa_tm_minpts_var = _pa_var("pa_tmax_min_points", 8, int)
+    pa_tm_window_var = _pa_var("pa_tmax_window", "0.3")
+    pa_oc_quad_var = _pa_var("pa_oc_quadratic", False, bool)
+    pa_eph_mode_var = _pa_var("pa_ephemeris_mode", "fit")
+    pa_eph_t0_var = _pa_var("pa_ephemeris_t0", "")
+    pa_eph_p_var = _pa_var("pa_ephemeris_p", "")
+    tk.Label(row_o, text="Method:", bg="white").pack(side=tk.LEFT)
+    ttk.Combobox(row_o, textvariable=pa_tm_method_var, width=22, state="readonly",
+                 values=["Template (fitted shape)", "Parabola"]).pack(side=tk.LEFT, padx=(2, 8))
+    tk.Label(row_o, text="min. points per maximum:", bg="white").pack(side=tk.LEFT)
+    ttk.Spinbox(row_o, from_=4, to=100, textvariable=pa_tm_minpts_var, width=4).pack(side=tk.LEFT, padx=(2, 8))
+    tk.Label(row_o, text="window (+/- phase):", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_o, textvariable=pa_tm_window_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+    row_o2 = tk.Frame(lf_pa_oc, bg="white"); row_o2.pack(fill="x", padx=8, pady=2)
+    tk.Label(row_o2, text="Ephemeris (C):", bg="white").pack(side=tk.LEFT)
+    ttk.Radiobutton(row_o2, text="from the fit", variable=pa_eph_mode_var, value="fit").pack(side=tk.LEFT, padx=4)
+    ttk.Radiobutton(row_o2, text="given:  T0 (HJD of maximum)", variable=pa_eph_mode_var, value="manual").pack(side=tk.LEFT, padx=(4, 2))
+    ttk.Entry(row_o2, textvariable=pa_eph_t0_var, width=15).pack(side=tk.LEFT, padx=2)
+    tk.Label(row_o2, text="P (d)", bg="white").pack(side=tk.LEFT)
+    ttk.Entry(row_o2, textvariable=pa_eph_p_var, width=13).pack(side=tk.LEFT, padx=2)
+    ttk.Checkbutton(row_o2, text="fit a parabola (period change)", variable=pa_oc_quad_var).pack(side=tk.LEFT, padx=8)
+    row_o3 = tk.Frame(lf_pa_oc, bg="white"); row_o3.pack(fill="x", padx=8, pady=(2, 4))
+    pa_oc_text_var = tk.StringVar(value="")
+
+    def on_pa_tmax():
+        fit = pa['fit']
+        if not fit:
+            messagebox.showinfo("Times of maximum", "Fit at least the main frequency first (section 3)."); return
+        from photometry import period_analysis as pam
+        i = pa_selected_freq()
+        i = 0 if i is None else i
+        mag = 'mag' in pa['unit'].lower()
+        try:
+            window = float(pa_tm_window_var.get())
+            minpts = int(pa_tm_minpts_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Times of maximum", "Window and minimum number of points must be numbers."); return
+        method = 'poly' if pa_tm_method_var.get().startswith("Parabola") else 'template'
+        mx = pam.times_of_maximum(pa['t'], pa['y'], fit, i, pa['e'], magnitudes=mag, method=method,
+                                  window=window, min_points=minpts)
+        if not mx:
+            messagebox.showwarning("Times of maximum", "No maximum could be determined: no cycle has enough points "
+                                   "on both sides of the expected maximum (try a lower minimum number of points "
+                                   "or a wider window).")
+            return
+        if pa_eph_mode_var.get() == "manual":
+            try:
+                T0 = float(pa_eph_t0_var.get()); P = float(pa_eph_p_var.get())
+                if T0 < 2400000:
+                    T0 += 2400000.0 if T0 > 10000 else 0.0
+            except ValueError:
+                messagebox.showerror("Ephemeris", "Please give T0 (HJD) and P (days) as numbers."); return
+            for m in mx:          # renumber cycles for the given ephemeris
+                m['E'] = int(np.round((m['tmax'] - T0) / P))
+            src = "given ephemeris"
+        else:
+            T0, P, _ = pam.ephemeris(fit, i, mag)
+            src = "ephemeris from the fit"
+        oc = pam.oc_analysis(mx, T0, P, quadratic=bool(pa_oc_quad_var.get()))
+        oc['maxima'] = mx
+        oc['freq_index'] = i
+        lines = [f"{len(mx)} times of maximum of f{i + 1} ({'template fit' if method == 'template' else 'parabola'}), "
+                 f"median error {np.median([m['err'] for m in mx]) * 1440:.2f} min; O-C against the {src} "
+                 f"T0 = HJD {T0:.5f}, P = {P:.8f} d."]
+        if 'coef' in oc:
+            lines.append(f"O-C rms = {oc['rms'] * 1440:.2f} min, reduced chi2 = {oc['chi2_red']:.2f}.  Corrected ephemeris: "
+                         f"T0 = HJD {oc['T0_new']:.5f} +/- {oc['T0_new_err']:.5f}, P = {oc['P_new']:.8f} +/- {oc['P_new_err']:.8f} d")
+            if 'dP_dE' in oc:
+                yr = oc['dP_dt'] * 365.25
+                sig = abs(oc['dP_dE'] / oc['dP_dE_err']) if oc['dP_dE_err'] > 0 else np.nan
+                lines.append(f"Period change: dP/dE = {oc['dP_dE']:.3e} +/- {oc['dP_dE_err']:.1e} d/cycle  "
+                             f"(dP/dt = {yr:.3e} d/yr, (1/P) dP/dt = {yr / P:.2e} /yr; {sig:.1f} sigma)")
+        else:
+            lines.append("Too few maxima (or only one cycle number) for a line/parabola fit.")
+        oc['title'] = f"O-C of f{i + 1}: {len(mx)} maxima"
+        pa['oc'] = oc
+        pa_oc_text_var.set("\n".join(lines))
+        pa_bottom_var.set("O-C diagram")
+        pa_draw()
+
+    def on_pa_save_maxima():
+        oc = pa.get('oc')
+        if not oc or not oc.get('maxima'):
+            messagebox.showinfo("Times of maximum", "Compute the times of maximum first."); return
+        outdir = os.path.join("photometry_output", "period_analysis")
+        os.makedirs(outdir, exist_ok=True)
+        base = pa['sets'][0]['name'] if pa['sets'] else "light_curve"
+        path = _pa_fd.asksaveasfilename(title="Save times of maximum", initialdir=os.path.abspath(outdir),
+                                        initialfile=f"maxima_{base}.csv", defaultextension=".csv",
+                                        filetypes=(("CSV", "*.csv"),))
+        if not path:
+            return
+        with open(path, 'w', newline='') as fh:
+            fh.write(f"# times of maximum light (HJD) of f{oc['freq_index'] + 1}; ephemeris T0 = {oc['T0']:.6f}, P = {oc['P']:.9f}\n")
+            if 'coef' in oc:
+                fh.write(f"# corrected: T0 = {oc['T0_new']:.6f} +/- {oc['T0_new_err']:.6f}, P = {oc['P_new']:.9f} +/- {oc['P_new_err']:.9f}\n")
+            if 'dP_dE' in oc:
+                fh.write(f"# dP/dE = {oc['dP_dE']:.4e} +/- {oc['dP_dE_err']:.1e} d/cycle\n")
+            w_ = csv.writer(fh)
+            w_.writerow(['E', 'hjd_max', 'err_d', 'o_minus_c_d', 'n_points', 'method', 'rms_fit'])
+            for m, o in zip(oc['maxima'], oc['oc']):
+                w_.writerow([m['E'], f"{m['tmax']:.6f}", f"{m['err']:.6f}", f"{o:.6f}", m['n'], m['method'], f"{m['rms']:.5f}"])
+        pa_status_var.set(f"Times of maximum saved: {path}")
+
+    ttk.Button(row_o3, text="Times of Maximum / O-C", command=on_pa_tmax).pack(side=tk.LEFT, padx=2)
+    ttk.Button(row_o3, text="Save Maxima (CSV)...", command=on_pa_save_maxima).pack(side=tk.LEFT, padx=2)
+    tk.Label(lf_pa_oc, textvariable=pa_oc_text_var, bg="white", fg="#1a3a5f", font=("Segoe UI", 9),
+             wraplength=820, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+    tk.Label(lf_pa_oc, bg="white", fg="#666", font=("Segoe UI", 8), wraplength=820, justify="left",
+             text="For the selected frequency (default f1) one time of maximum light is determined per observed cycle "
+                  "(other, non-harmonic frequencies are subtracted first). 'Template' shifts the fitted light-curve "
+                  "shape (use enough harmonics) and works for any shape; 'Parabola' fits the points around the "
+                  "brightest point. O-C = observed - calculated time; a straight line gives a corrected period, "
+                  "a parabola a period change. For a given ephemeris (e.g. GCVS epoch and period) choose 'given'. "
+                  "See period_analysis_guide.md for details.").pack(anchor="w", padx=8, pady=(0, 6))
+
+    tk.Label(pa_container, textvariable=pa_status_var, fg="#d32f2f", bg="white", font=("Arial", 10, "bold"),
+             wraplength=820, justify="left").pack(anchor="w", pady=4)
+    pa_plot_frame.pack(fill="both", expand=True, pady=4)
+    pa_plotbar = tk.Frame(pa_plot_frame, bg="#e8eef5", bd=1, relief="groove")
+    pa_plotbar.pack(side=tk.TOP, fill="x")
+    tk.Label(pa_plotbar, text="Bottom plot:", bg="#e8eef5", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(6, 2))
+    for _txt in ("Phase plot", "Residuals vs time", "O-C diagram"):
+        tk.Radiobutton(pa_plotbar, text=_txt, variable=pa_bottom_var, value=_txt, bg="#e8eef5",
+                       activebackground="#e8eef5").pack(side=tk.LEFT, padx=4)
+    ttk.Button(pa_plotbar, text="Phase Plot Window (edit / save)...",
+               command=lambda: pa_open_phase_window()).pack(side=tk.RIGHT, padx=6, pady=2)
+    pa_toolbar = NavigationToolbar2Tk(pa_canvas, pa_plot_frame, pack_toolbar=False)
+    pa_toolbar.update()
+    pa_canvas.toolbar = pa_toolbar
+    pa_toolbar.pack(side=tk.TOP, fill="x")
+    pa_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def pa_open_files(paths):
+        """Used by other tabs: load these light curves and show the tab."""
+        if pa_load_paths(list(paths), replace=True):
+            switch_tab("period")
+    vars_dict['pa_open_files'] = pa_open_files
 
     # --- TAB 5: About ---
     tab_about_outer = ttk.Frame(content_container)
@@ -5402,18 +8830,64 @@ def run_config_gui(pipeline_callback=None):
     
     info_frame = tk.Frame(about_container, bg="white")
     info_frame.pack(fill="x", pady=10)
-    tk.Label(info_frame, text="Version: 4.1 \tLatest Update: 2026-05-22", font=("Arial", 10), bg="white").pack(fill="x")
+    tk.Label(info_frame, text=f"Version: {APP_VERSION} \tLatest Update: {APP_DATE}", font=("Arial", 10), bg="white").pack(fill="x")
     
     tk.Label(about_container, text="Description:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
     desc_text = (
-        "Calibra uses star detection, sub-pixel PSF fitting, aperture photometry, \n"
-        "zero-point calibration, and offers determination of color transformations between filters. \n"
-        "For the analysis, Calibra can use the online catalogues ATLAS-RefCat2, APASS DR9, \n"
-        "Landolt Standards Catalogue and Gaia DR3, or a user-provided catalogue.\n"
+        "Calibra uses star detection, sub-pixel PSF fitting, aperture photometry with a CCD/CMOS noise model\n"
+        "(including averaged stacks), zero-point calibration and the determination of colour transformations\n"
+        "between filters. For the analysis, Calibra can use the online catalogues ATLAS-RefCat2, APASS DR9,\n"
+        "Landolt Standards Catalogue and Gaia DR3, or a user-provided catalogue, and it marks known variables\n"
+        "from the AAVSO VSX.\n"
         "\n"
-        "Finally, Calibra can produce light curves for variable stars from a series of images and create AAVSO-formatted text files.\n"
+        "Calibra produces light curves of variable stars from a series of images (calibrated magnitudes with an\n"
+        "AAVSO-formatted report, relative flux, or raw ADU), computes standard B, V and B-V by differential\n"
+        "photometry with an ensemble of comparison stars, searches image sequences for unknown variables\n"
+        "(Data Mining) and measures light curves of many known variables in the field at once (Field Variables;\n"
+        "targets from a list or from AAVSO VSX / GCVS). Pre-processing covers bias/flat calibration, plate solving\n"
+        "with ASTAP and the splitting of one-shot-colour images; an interactive FITS viewer is included.\n"
     )
     tk.Label(about_container, text=desc_text, justify=tk.LEFT, font=("Arial", 10), bg="white").pack(fill="x")
+
+    tk.Label(about_container, text="Recent changes:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
+    recent_text = (
+        "v4.44  Light curves: faint-target mode - forced photometry at a fixed position, frames combined (groups / selected rows)\n"
+        "v4.43  Light curves: UT date (YYYY-MM-DD) of mid-exposure added next to the UT time\n"
+        "v4.42  Light curves: UT of mid-exposure (HH:MM:SS) instead of JD in table and CSV\n"
+        "v4.41  HJD correct for sexagesimal site coordinates in the header (MWT frames)\n"
+        "v4.40  Planner table: azimuth in degrees only\n"
+        "v4.39  Planner: azimuth in degrees, RA/Dec and meridian columns, constellation sort; horizontal scrolling\n"
+        "v4.38  Night plan for NINA: exposure times, durations, eclipses, NINA target set\n"
+        "v4.37  Observation Planner: targets for a night (GCVS list, priority list, open clusters)\n"
+        "v4.36  Instrument setups (telescope, camera, site, filters, settings) - switch in the sidebar\n"
+        "v4.35  AAVSO sequences stored per variable and reused without a new query\n"
+        "v4.34  FITS Viewer opens at once: catalogue data in the background, local copies, faster drawing\n"
+        "v4.33  Bias/flat/dark folders: frames with another type in the header are used (warning)\n"
+        "v4.32  APASS DR10 download from the AAVSO archive: button, or automatic for missing fields\n"
+        "v4.31  APASS DR10 CSV files from the AAVSO download page usable as local catalogue\n"
+        "v4.30  Star names looked up in the local GCVS list first (works offline), then SIMBAD / VSX\n"
+        "v4.29  Master frames from a bias folder and a flat folder (every FITS file in it, names do not matter)\n"
+        "v4.28  tools/catalog_overview.py: which catalogue files can be deleted (Dec / magnitude limits)\n"
+        "v4.27  Master bias/flat/dark from calibration folders; automatic masters; calibration on the fly\n"
+        "v4.26  Local catalogue copies (ATLAS, Gaia, APASS, VSX, GCVS list); online only when needed\n"
+        "v4.25  Period Analysis: plot selector above the plot; editable phase-plot window (save PNG/PDF/SVG, CSV)\n"
+        "v4.24  Period Analysis: fit quality, residuals vs time, times of maximum and O-C; guide period_analysis_guide.md\n"
+        "v4.23  L (luminance) light curves; SAAF/GCVS CSV target lists; phase-plot curve selectable (fit / binned / none)\n"
+        "v4.22  Plate solving: position guess (object name or RA/Dec), each solution guides the next image\n"
+        "v4.21  Period Analysis tab: Lomb-Scargle / PDM / BLS, spectral window, prewhitening, phase plots\n"
+        "v4.20  Several nights / pointings: field-of-view checks for all images, consistent comparison stars\n"
+        "v4.19  Field Variables tab: light curves of many variables (list file or VSX/GCVS query); .fts files\n"
+        "v4.18  Light Curves action bar, named setups, dated output files, automatic comparison stars from Data Mining\n"
+        "v4.17  Much faster Light Curves and Data Mining; Data Mining remembers its measurements\n"
+        "v4.16  Corrected noise model, weighted colour transformation, ensemble differential photometry with errors\n"
+        "v4.15  Bug-fix release (filter handling, FITS viewer, calibration, file manager, error messages)\n"
+        "v4.14  Light-curve modes: calibrated magnitudes, relative flux, raw ADU\n"
+        "Full history: CHANGELOG.md   |   Open ideas: TODO.md\n"
+    )
+    tk.Label(about_container, text=recent_text, justify=tk.LEFT, font=("Arial", 9), bg="white").pack(fill="x")
+
+    tk.Label(about_container, text="Developed by Stephan Pomp, Google DeepMind Antigravity and Claude (Anthropic)",
+             font=("Arial", 9, "italic"), fg="#555", bg="white").pack(fill="x", pady=(10, 0))
 
     # --- TAB 5: Help ---
     tab_help_outer = ttk.Frame(content_container)
@@ -5441,15 +8915,19 @@ def run_config_gui(pipeline_callback=None):
     help_info = (
         "\nQuick Tips:\n"
         "- Ensure your FITS headers have valid WCS (RA/Dec) for online calibration.\n"
-        "- Set the Aperture Radius to approximately 2x the FWHM of your stars.\n"
-        "- Use the 'Region Filtering' tab to focus on specific targets or avoid edges."
+        "- Set the Aperture Radius to approximately 1.5-2x the FWHM of your stars.\n"
+        "- Use Settings > Astro & Catalog > Region Selection to focus on specific targets or avoid edges.\n"
+        "- For stacked images, enter the 'Blank-sky noise check' factor from the pipeline log as Sky Noise Factor (Settings).\n"
+        "- Save one Light-Curve setup per variable star (Light Curves > Save Target Setup...).\n"
+        "- Several known variables in one field (e.g. long-period variables over many nights): Field Variables tab.\n"
+        "- Periods (also several, e.g. on top of a main period): Period Analysis tab - check the spectral window for aliases."
     )
     tk.Label(help_frame, text=help_info, justify=tk.LEFT, font=("Arial", 9, "italic")).pack(pady=10)
 
     # Developer Info
     dev_info = (
         "\nDevelopers & Contact:\n"
-        "Developed by Stephan Pomp & Google DeepMind Antigravity\n"
+        "Developed by Stephan Pomp, Google DeepMind Antigravity and Claude (Anthropic)\n"
         "Contact: stephan.pomp@gmail.com"
     )
     tk.Label(help_frame, text=dev_info, justify=tk.LEFT, font=("Arial", 9), fg="#555").pack(side=tk.BOTTOM, anchor="w")
@@ -5460,10 +8938,460 @@ def run_config_gui(pipeline_callback=None):
     create_sidebar_button(f"{get_icon('🔍', '')}  Analysis & Calib".strip(), "analysis")
     create_sidebar_button(f"{get_icon('📈', '')}  Light Curves".strip(), "ts")
     create_sidebar_button(f"{get_icon('🚀', '')}  Data Mining".strip(), "datamining")
+    create_sidebar_button(f"{get_icon('✨', '')}  Field Variables".strip(), "fieldvars")
+    create_sidebar_button(f"{get_icon('〰', '')}  Period Analysis".strip(), "period")
+    create_sidebar_button(f"{get_icon('🔭', '')}  Observation Planner".strip(), "planner")
     create_sidebar_button(f"{get_icon('🔧', '')}  Settings".strip(), "settings")
     create_sidebar_button(f"{get_icon('ℹ', '')}  About Calibra".strip(), "about")
     create_sidebar_button(f"{get_icon('❓', '')}  User Help".strip(), "help")
     
+    # --- v4.37: OBSERVATION PLANNER (photometry/planner_tab.py) ---
+    def _plan_to_lc(t):
+        from astropy.coordinates import SkyCoord as _SC
+        import astropy.units as _u
+        c_ = _SC(float(t['ra']) * _u.deg, float(t['dec']) * _u.deg)
+        ts_target_name_var.set(t.get('name', ''))
+        ts_target_ra_var.set(c_.ra.to_string(unit=_u.hourangle, sep=':', precision=1, pad=True))
+        ts_target_dec_var.set(c_.dec.to_string(unit=_u.deg, sep=':', precision=0, alwayssign=True, pad=True))
+        ts_target_mode_var.set("name")
+        switch_tab("ts")
+
+    def _plan_to_fv(targets):
+        from photometry.local_catalogs import name_key as _nk
+        have = {_nk(t.get('name', '')) for t in fv_targets}
+        n = 0
+        for t in targets:
+            if t.get('ra') is None or _nk(t.get('name', '')) in have:
+                continue
+            fv_targets.append({'name': t.get('name', ''), 'ra': float(t['ra']), 'dec': float(t['dec']),
+                               'type': t.get('type') or '', 'period': t.get('period'), 'max': t.get('max'),
+                               'min': t.get('min'), 'source': 'planner', 'use': True})
+            have.add(_nk(t.get('name', ''))); n += 1
+        fv_refresh_tree()
+        return n
+    try:
+        from photometry import planner_tab as _ptab
+        _ptab.build(tab_planner, root, vars_dict, {'to_light_curves': _plan_to_lc, 'to_field_variables': _plan_to_fv})
+    except Exception as _e:
+        import traceback; traceback.print_exc()
+        tk.Label(tab_planner, text=f"Observation planner could not be built: {_e}", fg="red").pack()
+
+    # --- v4.36: INSTRUMENT SETUPS (sidebar: choose / manage) ---
+    from photometry import instruments as _inst
+    active_inst_var = tk.StringVar(value="")
+    vars_dict["active_instrument"] = (active_inst_var, str)
+    inst_box = tk.Frame(sidebar_frame, bg="#132b47")
+    inst_box.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(4, 10))
+    tk.Label(inst_box, text="Instrument setup:", fg="#c9d6e6", bg="#132b47", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+    inst_combo = ttk.Combobox(inst_box, state="readonly", width=20)
+    inst_combo.pack(fill=tk.X, pady=2)
+    inst_info_var = tk.StringVar(value="")
+    tk.Label(inst_box, textvariable=inst_info_var, fg="#9fb3c8", bg="#132b47", font=("Segoe UI", 7),
+             wraplength=165, justify=tk.LEFT).pack(anchor="w")
+    inst_hint_btn = tk.Button(inst_box, text="", font=("Segoe UI", 7, "bold"), fg="#132b47", bg="#ffd27f",
+                              relief="flat", wraplength=160, justify=tk.LEFT)
+    inst_hint = {'name': None}
+
+    def inst_current_values():
+        out = {}
+        for k in _inst.SETTING_KEYS:
+            if k in vars_dict and isinstance(vars_dict[k], (tuple, list)) and hasattr(vars_dict[k][0], 'get'):
+                try:
+                    out[k] = vars_dict[k][0].get()
+                except tk.TclError:
+                    pass
+        return out
+
+    def inst_refresh(select=None):
+        names = _inst.list_names()
+        inst_combo['values'] = names
+        cur = select or active_inst_var.get()
+        if cur in names:
+            inst_combo.set(cur)
+        s = _inst.load(cur) if cur in names else None
+        inst_info_var.set(_inst.summary(s) if s else "")
+
+    def inst_autosave(*_):
+        """Store the current settings in the active setup (called on switching and on exit)."""
+        name = active_inst_var.get()
+        if not name:
+            return
+        s = _inst.load(name)
+        if s is None:
+            return
+        _inst.snapshot(s, inst_current_values())
+        _inst.save(s)
+    vars_dict['instrument_autosave'] = inst_autosave
+
+    def inst_apply(name):
+        s = _inst.load(name)
+        if s is None:
+            return 0
+        vals = _inst.values_to_apply(s)
+        n = 0
+        for k, v in vals.items():
+            if k in vars_dict and isinstance(vars_dict[k], (tuple, list)) and hasattr(vars_dict[k][0], 'set'):
+                try:
+                    vars_dict[k][0].set(v); n += 1
+                except tk.TclError:
+                    pass
+        try:
+            tidy_numbers()
+        except Exception:
+            pass
+        try:
+            vars_dict['cal_after_load']()
+        except Exception:
+            pass
+        return n
+
+    def inst_switch(name, quiet=False):
+        """Activate setup 'name': current settings -> old setup, settings of 'name' -> Calibra."""
+        old = active_inst_var.get()
+        if name == old:
+            inst_refresh(); return
+        inst_autosave()
+        s = _inst.load(name)
+        if s is None:
+            return
+        if not s.get('settings'):
+            # new setup without stored settings: it starts from the current settings,
+            # its own site and filter names (if given) are applied
+            _inst.snapshot(s, inst_current_values(), sync_descriptive=False); _inst.save(s)
+            n = 0
+        else:
+            n = inst_apply(name)
+        active_inst_var.set(name)
+        if n == 0:
+            inst_apply_descriptive(name)
+        inst_hint_btn.pack_forget(); inst_hint['name'] = None
+        inst_refresh(name)
+        print(f"Instrument setup '{name}' active" + (f" ({n} settings applied)." if n else "."))
+        try:
+            save_session()
+        except Exception:
+            pass
+
+    inst_combo.bind("<<ComboboxSelected>>", lambda e: inst_switch(inst_combo.get()))
+
+    def inst_check_files(paths):
+        """After loading frames: do they belong to another setup? (header: sensor, focal length...)"""
+        if not paths:
+            return
+        try:
+            from astropy.io import fits as _fits
+            h = _fits.getheader(paths[0])
+            if h.get('NAXIS', 0) < 2:
+                h = _fits.getheader(paths[0], 1)
+            best, sc = _inst.best_match(h)
+            act = active_inst_var.get()
+            act_sc = _inst.match_score(_inst.load(act), h) if act and _inst.load(act) else 0.0
+            if best and best != act and sc >= 2.0 and sc > act_sc + 1.0:
+                inst_hint['name'] = best
+                inst_hint_btn.config(text=f"These frames look like '{best}' - click to switch")
+                inst_hint_btn.pack(fill=tk.X, pady=(4, 0))
+                print(f"Note: the loaded frames match the instrument setup '{best}' better than the active "
+                      f"'{act}' (sensor size / focal length / camera). Switch in the sidebar if needed.")
+            else:
+                inst_hint_btn.pack_forget(); inst_hint['name'] = None
+        except Exception as e:
+            print(f"Instrument check: {e}")
+    inst_hint_btn.config(command=lambda: inst_switch(inst_hint['name']) if inst_hint['name'] else None)
+    vars_dict['instrument_check'] = inst_check_files
+
+    def inst_manage():
+        """Dialog: list of setups, instrument / site / filter / planning data, fill from FITS header."""
+        import re
+        import time
+        win = tk.Toplevel(root); win.title("Instrument Setups"); win.geometry("900x640")
+        left = tk.Frame(win); left.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        tk.Label(left, text="Setups", font=("Arial", 10, "bold")).pack(anchor="w")
+        lb = tk.Listbox(left, width=24, height=18, exportselection=False); lb.pack(fill=tk.Y, expand=True)
+        right = tk.Frame(win); right.pack(side=tk.LEFT, fill="both", expand=True, padx=8, pady=8)
+        cur = {'name': None}
+        fvars = {}
+
+        def row(parent, r, label, key, width=22, kind='str'):
+            tk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.W, padx=4, pady=1)
+            v = tk.BooleanVar() if kind == 'bool' else tk.StringVar()
+            if kind == 'bool':
+                ttk.Checkbutton(parent, variable=v).grid(row=r, column=1, sticky=tk.W)
+            else:
+                ttk.Entry(parent, textvariable=v, width=width).grid(row=r, column=1, sticky=tk.W, padx=4, pady=1)
+            fvars[key] = (v, kind)
+
+        g1 = tk.LabelFrame(right, text="Instrument"); g1.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        for r, (lab, key, kind) in enumerate((
+                ("Name:", "name", 'str'), ("Description:", "description", 'str'),
+                ("Telescope:", "instrument.telescope", 'str'), ("Aperture (mm):", "instrument.aperture_mm", 'num'),
+                ("Focal length (mm):", "instrument.focal_length_mm", 'num'), ("Reducer / corrector:", "instrument.reducer", 'str'),
+                ("Camera:", "instrument.camera", 'str'), ("Pixel size (um):", "instrument.pixel_um", 'num'),
+                ("Sensor width (px):", "instrument.sensor_x", 'num'), ("Sensor height (px):", "instrument.sensor_y", 'num'),
+                ("Binning:", "instrument.binning", 'num'), ("Colour camera (OSC):", "instrument.osc", 'bool'),
+                ("Capture gain:", "instrument.gain", 'num'), ("Capture offset:", "instrument.offset", 'num'))):
+            row(g1, r, lab, key, kind=kind)
+        g2 = tk.LabelFrame(right, text="Site"); g2.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+        for r, (lab, key, kind) in enumerate((
+                ("Site name:", "site.name", 'str'), ("Latitude (deg N):", "site.lat", 'num'),
+                ("Longitude (deg E):", "site.lon", 'num'), ("Elevation (m):", "site.elevation_m", 'num'),
+                ("Time zone (e.g. Europe/Stockholm):", "site.timezone", 'str'))):
+            row(g2, r, lab, key, kind=kind)
+        g4 = tk.LabelFrame(g2, text="Planning"); g4.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        row(g4, 0, "Exposure times (s):", "planning.exposures_s", kind='list')
+        row(g4, 1, "Brightest mag:", "planning.mag_bright", width=8, kind='num')
+        row(g4, 2, "Faintest mag:", "planning.mag_faint", width=8, kind='num')
+        row(g4, 3, "ZP V (e-/s at V=0, empty=estimate):", "planning.zp_v_e", width=8, kind='num')
+        row(g4, 4, "Sky brightness (mag/arcsec2):", "planning.sky_mag", width=8, kind='num')
+        row(g4, 5, "Typical seeing (arcsec):", "planning.seeing_arcsec", width=8, kind='num')
+        g3 = tk.LabelFrame(right, text="Filters (name in the FITS header / position in the filter wheel for NINA)")
+        g3.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+        for c, b in enumerate(_inst.BANDS):
+            tk.Label(g3, text=b, font=("Arial", 9, "bold")).grid(row=0, column=c * 2, columnspan=2)
+            v1, v2 = tk.StringVar(), tk.StringVar()
+            ttk.Entry(g3, textvariable=v1, width=9).grid(row=1, column=c * 2, padx=2)
+            ttk.Entry(g3, textvariable=v2, width=3).grid(row=1, column=c * 2 + 1, padx=(0, 6))
+            fvars[f"filters.{b}.fits_name"] = (v1, 'str'); fvars[f"filters.{b}.nina_position"] = (v2, 'num')
+        derived_var = tk.StringVar(value="")
+        tk.Label(right, textvariable=derived_var, fg="#1a3a5f", justify=tk.LEFT, wraplength=620).grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, padx=4)
+        tk.Label(right, text="The analysis settings of a setup (CCD gain, read noise, saturation, apertures, detection, "
+                             "zero points, colour/extinction coefficients, calibration folders, plate-solving field ...) "
+                             "are the normal Calibra settings: they are stored in the active setup automatically and "
+                             "restored when you switch to it.", fg="#555", font=("Arial", 8), wraplength=620,
+                 justify=tk.LEFT).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=4, pady=4)
+
+        def getp(d, key):
+            for part in key.split('.'):
+                d = (d or {}).get(part) if isinstance(d, dict) else None
+            return d
+
+        def setp(d, key, val):
+            parts = key.split('.')
+            for part in parts[:-1]:
+                d = d.setdefault(part, {})
+            d[parts[-1]] = val
+
+        def show(name):
+            s = _inst.load(name)
+            if s is None:
+                return
+            cur['name'] = name
+            for key, (v, kind) in fvars.items():
+                val = getp(s, key)
+                if kind == 'bool':
+                    v.set(bool(val))
+                elif kind == 'list':
+                    v.set(", ".join(f"{x:g}" if isinstance(x, (int, float)) else str(x) for x in (val or [])))
+                else:
+                    v.set("" if val is None else (f"{val:g}" if isinstance(val, float) else str(val)))
+            n_set = len(s.get('settings') or {})
+            derived_var.set(_inst.summary(s) + f"\n{n_set} analysis settings stored"
+                            + (f" (last {s['settings_saved']})" if s.get('settings_saved') else "")
+                            + ("   - ACTIVE setup" if name == active_inst_var.get() else ""))
+
+        def collect():
+            s = _inst.load(cur['name']) if cur['name'] else None
+            if s is None:
+                return None
+            for key, (v, kind) in fvars.items():
+                if key == 'name':
+                    continue
+                raw = v.get()
+                if kind == 'bool':
+                    val = bool(raw)
+                elif kind == 'num':
+                    raw = str(raw).strip().replace(',', '.')
+                    try:
+                        val = float(raw) if raw else None
+                        if val is not None and val.is_integer() and key.endswith(('sensor_x', 'sensor_y', 'binning', 'nina_position')):
+                            val = int(val)
+                    except ValueError:
+                        raise ValueError(f"'{raw}' is not a number ({key})")
+                elif kind == 'list':
+                    val = [float(x) for x in re.split(r'[,;\s]+', str(raw).strip()) if x]
+                else:
+                    val = str(raw).strip()
+                setp(s, key, val)
+            return s
+
+        def fill_list(select=None):
+            lb.delete(0, tk.END)
+            names = _inst.list_names()
+            for n in names:
+                lb.insert(tk.END, n + ("   (active)" if n == active_inst_var.get() else ""))
+            sel = select or cur['name'] or active_inst_var.get()
+            if sel in names:
+                i = names.index(sel); lb.selection_set(i); lb.see(i); show(sel)
+
+        def on_select(*_):
+            i = lb.curselection()
+            if i:
+                show(_inst.list_names()[i[0]])
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        def do_save(quiet=False):
+            try:
+                s = collect()
+            except ValueError as e:
+                messagebox.showerror("Instrument Setups", str(e), parent=win); return False
+            if s is None:
+                return False
+            new_name = fvars['name'][0].get().strip()
+            _inst.save(s)
+            if new_name and new_name != s['name']:
+                try:
+                    _inst.rename(s['name'], new_name)
+                except ValueError as e:
+                    messagebox.showerror("Instrument Setups", str(e), parent=win); return False
+                if active_inst_var.get() == s['name']:
+                    active_inst_var.set(new_name)
+                cur['name'] = new_name
+            if cur['name'] == active_inst_var.get():
+                # site coordinates and filter names of the active setup go to the settings at once
+                inst_apply_descriptive(cur['name'])
+            fill_list(cur['name']); inst_refresh()
+            return True
+
+        def do_new(copy_from=None):
+            from tkinter import simpledialog
+            nm = simpledialog.askstring("New setup", "Name of the new setup (e.g. 'Refractor 102 + ASI6200', 'MWT', "
+                                        "'Vespera 2'):", parent=win)
+            if not nm or not nm.strip():
+                return
+            if nm.strip() in _inst.list_names():
+                messagebox.showerror("Instrument Setups", f"'{nm}' exists already.", parent=win); return
+            if copy_from:
+                s = _inst.load(copy_from); s['name'] = nm.strip(); s['created'] = time.strftime('%Y-%m-%d')
+            else:
+                s = _inst.template(nm.strip())
+                _inst.snapshot(s, inst_current_values())       # starts from the current settings
+            _inst.save(s)
+            cur['name'] = nm.strip(); fill_list(cur['name']); inst_refresh()
+
+        def do_delete():
+            if not cur['name']:
+                return
+            if cur['name'] == active_inst_var.get():
+                messagebox.showinfo("Instrument Setups", "The active setup cannot be deleted - switch to another one first.",
+                                    parent=win); return
+            if messagebox.askyesno("Instrument Setups", f"Delete the setup '{cur['name']}'?", parent=win):
+                _inst.delete(cur['name']); cur['name'] = None; fill_list(); inst_refresh()
+
+        def do_fill():
+            if not cur['name']:
+                return
+            paths = [loaded_files[int(iid)]['path'] for iid in tree.get_children() if tree.item(iid, 'values')[0] == '[X]']
+            if not paths:
+                sel = tree.selection()
+                paths = [loaded_files[int(sel[0])]['path']] if sel else []
+            if not paths:
+                messagebox.showinfo("Instrument Setups", "Check (or select) a light frame of this instrument in the "
+                                    "File Manager first.", parent=win); return
+            from astropy.io import fits as _fits
+            h = _fits.getheader(paths[0])
+            if h.get('NAXIS', 0) < 2:
+                h = _fits.getheader(paths[0], 1)
+            if not do_save(quiet=True):
+                return
+            s = _inst.load(cur['name'])
+            filled = _inst.fill_from_header(s, h)
+            fh = _inst.from_header(h)['filter']
+            if fh:
+                from photometry.filters import classify_band
+                b = classify_band(fh, s['filters']['V']['fits_name'] or 'Vmag', s['filters']['B']['fits_name'] or 'Bmag',
+                                  s['filters']['L']['fits_name'] or 'L')
+                if b in s['filters'] and not s['filters'][b]['fits_name']:
+                    s['filters'][b]['fits_name'] = fh; filled.append(f"filters.{b}")
+            _inst.save(s); show(cur['name'])
+            messagebox.showinfo("Instrument Setups", (f"From {os.path.basename(paths[0])}:\n" + "\n".join(filled))
+                                if filled else "Nothing new found in the header (only empty fields are filled).",
+                                parent=win)
+
+        def do_nina_filters():
+            """Filter names and wheel positions from an existing NINA sequence (v4.38)."""
+            if not cur['name']:
+                return
+            from tkinter import filedialog
+            from photometry import nina_export as _ne
+            from photometry.filters import classify_band
+            p_ = filedialog.askopenfilename(title="NINA sequence or target set (XML)", parent=win,
+                                            initialdir=_ne.default_folder(os.path.dirname(os.path.abspath(__file__))),
+                                            filetypes=(("NINA XML", "*.xml"), ("all files", "*.*")))
+            if not p_:
+                return
+            try:
+                fm = _ne.filters_from_nina_file(p_)
+            except Exception as e:
+                messagebox.showerror("Instrument Setups", f"Could not read {p_}: {e}", parent=win); return
+            if not do_save(quiet=True):
+                return
+            s = _inst.load(cur['name'])
+            got = []
+            for fname, pos in fm.items():
+                b = classify_band(fname, 'Vmag', 'Bmag', 'L')
+                if not b:
+                    b = fname.strip().upper()[:1] if fname.strip().upper()[:1] in _inst.BANDS and len(fname.strip()) == 1 else None
+                if b in s['filters']:
+                    s['filters'][b]['fits_name'] = fname
+                    s['filters'][b]['nina_position'] = pos
+                    got.append(f"{b}: {fname} = position {pos}")
+            _inst.save(s); show(cur['name'])
+            messagebox.showinfo("Instrument Setups", ("Filters taken over:\n" + "\n".join(got)) if got else
+                                "No V/B/L/R/G/I filters recognised in this file.", parent=win)
+
+        btns = tk.Frame(left); btns.pack(fill=tk.X, pady=4)
+        for txt, cmd in (("New (current settings)", do_new), ("Duplicate", lambda: do_new(cur['name'])),
+                         ("Delete", do_delete)):
+            ttk.Button(btns, text=txt, command=cmd).pack(fill=tk.X, pady=1)
+        bot = tk.Frame(right); bot.grid(row=4, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Button(bot, text="Fill from FITS Header (checked frame)", command=do_fill).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bot, text="Filters from NINA File...", command=do_nina_filters).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bot, text="Save", command=do_save).pack(side=tk.LEFT, padx=2)
+        def do_activate():
+            if do_save():
+                inst_switch(cur['name'])
+                fill_list(cur['name'])
+        ttk.Button(bot, text="Save and Activate", command=do_activate).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bot, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=2)
+        fill_list()
+    vars_dict['instrument_manage'] = inst_manage
+
+    def inst_apply_descriptive(name):
+        """Site coordinates and filter names of the active setup -> Calibra settings."""
+        s = _inst.load(name)
+        if s is None:
+            return
+        vals = _inst.values_to_apply(dict(s, settings={}))
+        for k, v in vals.items():
+            if k in vars_dict:
+                try:
+                    vars_dict[k][0].set(v)
+                except tk.TclError:
+                    pass
+
+    tk.Button(inst_box, text="Manage Setups...", font=("Segoe UI", 8), fg="white", bg="#2e5b8a", relief="flat",
+              activebackground="#1f446e", activeforeground="white", command=inst_manage).pack(fill=tk.X, pady=(2, 0))
+
+    def instruments_after_load():
+        """At start: make sure there is a setup; the session's settings stay as they are."""
+        names = _inst.list_names()
+        if not names:
+            s = _inst.template("Standard")
+            s['description'] = "Created from the settings Calibra had before instrument setups existed (v4.36)."
+            _inst.snapshot(s, inst_current_values())
+            _inst.save(s)
+            names = ["Standard"]
+            print("Instrument setups: 'Standard' created from the current settings - rename it and add your "
+                  "other setups in the sidebar (Manage Setups...).")
+        if active_inst_var.get() not in names:
+            active_inst_var.set(names[0])
+        inst_refresh()
+        try:
+            inst_check_files([f['path'] for f in loaded_files][:1])
+        except Exception:
+            pass
+    vars_dict['instruments_after_load'] = instruments_after_load
+
     # Select first tab by default
     switch_tab("files")
 
@@ -5483,6 +9411,8 @@ def run_config_gui(pipeline_callback=None):
     # Redirect stdout and stderr
     sys.stdout = StdoutRedirector(console)
     sys.stderr = StdoutRedirector(console)
+    sys.stdout.start_polling(root)
+    sys.stderr.start_polling(root)
 
     # Ensure closing main window closes everything and saves session
     def on_closing():
@@ -5505,6 +9435,19 @@ def run_config_gui(pipeline_callback=None):
 
     # Auto-load previous session
     load_session()
+    try:
+        vars_dict['cal_after_load']()          # v4.27: calibration settings from the session
+    except Exception as _e:
+        print(f"Calibration settings: {_e}")
+    try:
+        vars_dict['localcat_after_load']()     # v4.26: local catalogue folder from the session
+    except Exception as _e:
+        print(f"Local catalogues: {_e}")
+    try:
+        vars_dict['instruments_after_load']()  # v4.36: instrument setups
+    except Exception as _e:
+        print(f"Instrument setups: {_e}")
+    tidy_numbers()
 
     # Run the UI loop
     root.mainloop()

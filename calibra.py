@@ -15,6 +15,7 @@ from photometry.aperture_phot import perform_aperture_photometry
 from photometry.calibration import match_and_calibrate
 from photometry.shift_analysis import generate_shift_report
 from photometry.image_calibration import calibrate_image
+from photometry.filters import classify_filter
 import csv
 import sys
 
@@ -86,16 +87,27 @@ def process_file(fits_filename, config):
         if cal_cfg.get('enable', False):
             bias_path = cal_cfg.get('bias_path')
             # Determine flat based on filter
-            filter_name = header.get('FILTER', 'V').upper()
-            if 'B' in filter_name:
+            filter_name = header.get('FILTER', 'V')
+            band = classify_filter(filter_name, config.get('filter_v_keyword', 'Vmag'), config.get('filter_b_keyword', 'Bmag'))
+            if band == 'B':
                 flat_path = cal_cfg.get('flat_b_path')
             else:
+                if band is None:
+                    print(f"Warning: filter '{filter_name}' not recognised as B or V; using the V flat.")
                 flat_path = cal_cfg.get('flat_v_path')
                 
             # Save calibrated files in a 'calibrated' subfolder of the input directory
             input_dir = os.path.dirname(fits_filename)
             out_dir = os.path.join(input_dir, 'calibrated')
-            image_data, header = calibrate_image(image_data, header, bias_path, flat_path, out_dir=out_dir)
+            image_data, header = calibrate_image(image_data, header, bias_path, flat_path, out_dir=out_dir,
+                                                 input_path=fits_filename,
+                                                 flat_is_bias_subtracted=config.get('flat_already_bias_subtracted', True))
+        else:
+            # v4.27: calibration on the fly with automatically selected master frames
+            from photometry.master_frames import apply_on_the_fly
+            image_data, _cal_done = apply_on_the_fly(image_data, header, fits_filename)
+            if _cal_done:
+                print("Frame calibrated on the fly (bias/flat masters from Pre-processing).")
 
     except FileNotFoundError:
         print(f"Error: {fits_filename} not found.")
@@ -113,7 +125,8 @@ def process_file(fits_filename, config):
     results = detect_stars(
         image_data, header, config['detect_sigma'],
         sharplo=config['dao_sharplo'], sharphi=config['dao_sharphi'], roundlo=config['dao_roundlo'], roundhi=config['dao_roundhi'],
-        filter_mode=config['filter_mode'], xy_bounds=config['xy_bounds'], radec_bounds=config['radec_bounds']
+        filter_mode=config['filter_mode'], xy_bounds=config['xy_bounds'], radec_bounds=config['radec_bounds'],
+        fwhm=config.get('detect_fwhm', 3.5)
     )
     if not results:
         return
@@ -127,6 +140,15 @@ def process_file(fits_filename, config):
         base_filename=base_name,
         print_psf_fitting=config['print_psf_fitting']
     )
+
+    # v4.16: hint if the detection kernel does not match the measured seeing
+    try:
+        dfw = float(config.get('detect_fwhm', 3.5))
+        if median_fwhm and np.isfinite(median_fwhm) and abs(median_fwhm - dfw) > 0.3 * dfw:
+            print(f"Note: measured median FWHM {median_fwhm:.2f} px differs from the detection FWHM {dfw:.2f} px "
+                  f"(Settings > Detection). Matching them improves star detection.")
+    except Exception:
+        pass
 
     # 3. Aperture Photometry
     # Determine radii: Fixed or Flexible
@@ -144,8 +166,23 @@ def process_file(fits_filename, config):
     perform_aperture_photometry(
         image_data, results, ap_radius, ann_inner, ann_outer,
         print_table=config['print_star_detection_table'],
-        gain=config['ccd_gain'], read_noise=config['ccd_read_noise'], dark_current=config['ccd_dark_current'], exptime=exptime
+        gain=config['ccd_gain'], read_noise=config['ccd_read_noise'], dark_current=config['ccd_dark_current'], exptime=exptime,
+        header=header, stack_mode=config.get('stack_mode', 'average'),
+        sky_noise_factor=config.get('sky_noise_factor', 1.0)
     )
+
+    # v4.16: empirical check of the noise model on empty sky (diagnostic only)
+    try:
+        from photometry.noise import blank_sky_noise_factor
+        star_xy = [(rs.get('refined_x', rs['x']) - 1, rs.get('refined_y', rs['y']) - 1) for rs in results]
+        bsf = blank_sky_noise_factor(image_data, star_xy, ap_radius, ann_inner, ann_outer)
+        if bsf:
+            fac, meas, pred, nn = bsf
+            print(f"Blank-sky noise check ({nn} empty apertures): measured {meas:.1f} ADU vs predicted {pred:.1f} ADU "
+                  f"-> factor {fac:.2f}. (Settings: 'Sky noise factor' = {config.get('sky_noise_factor', 1.0):.2f}; "
+                  f"a factor > ~1.2 means correlated noise, e.g. from registering/stacking.)")
+    except Exception as e:
+        print(f"(Blank-sky noise check skipped: {e})")
 
     # Filter out questionable detections (e.g. net_flux <= 0 or snr < 3.0)
     original_count = len(results)
@@ -155,19 +192,45 @@ def process_file(fits_filename, config):
 
     # 4. Zero Point Calibration
     filter_name = header.get('FILTER', 'V')
-    b_key = config.get('filter_b_keyword', 'BMAG').upper()
-    if b_key in filter_name.upper():
+    band = classify_filter(filter_name, config.get('filter_v_keyword', 'Vmag'), config.get('filter_b_keyword', 'Bmag'))
+    if band is None:
+        print(f"Warning: filter '{filter_name}' is not recognised as B or V (Settings > Filter mapping). "
+              f"Calibrating against catalogue V magnitudes.")
+        band = 'V'
+    if band == 'B':
         def_zp = config.get('default_zp_b', 24.0)
     else:
         def_zp = config.get('default_zp_v', 24.0)
 
     output_report = os.path.join('photometry_output', f'calibration_report_{base_name}.md')
+
+    # v4.16: catalogue search radius; 0 (or negative) = automatic from the WCS footprint
+    catalog_radius = float(config.get('catalog_search_radius', 15.0) or 0)
+    field_radius = None
+    try:
+        from astropy.wcs import WCS as _WCS
+        from astropy.wcs.utils import proj_plane_pixel_scales
+        _w = _WCS(header)
+        if _w.has_celestial:
+            scale_arcmin = float(np.mean(proj_plane_pixel_scales(_w.celestial))) * 60.0
+            ny_, nx_ = image_data.shape
+            field_radius = 0.5 * np.hypot(nx_, ny_) * scale_arcmin
+    except Exception:
+        field_radius = None
+    if catalog_radius <= 0:
+        catalog_radius = round(field_radius + 1.0, 1) if field_radius else 15.0
+        print(f"Catalogue search radius: automatic -> {catalog_radius:.1f}' (half-diagonal of the image)")
+    elif field_radius and catalog_radius < 0.9 * field_radius:
+        print(f"Note: catalogue search radius {catalog_radius:.1f}' covers only part of the image "
+              f"(half-diagonal {field_radius:.1f}'). Set it to 0 in Settings for automatic sizing.")
     res_zp = match_and_calibrate(results, config['reference_catalog'], filter_name, config['match_tolerance_arcsec'],
                         default_zp=def_zp, run_new_calibration=config['run_new_calibration'],
                         output_report=output_report, center_ra=center_ra, center_dec=center_dec,
                         snr_threshold=config['calib_snr_threshold'],
                         print_to_console=config['print_detailed_calibration'],
-                        header=header, radius_arcmin=config.get('catalog_search_radius', 15.0))
+                        header=header, radius_arcmin=catalog_radius,
+                        band=band, peak_limit=config.get('calib_peak_limit', None),
+                        exclude_blended=config.get('calib_exclude_blended', True))
     
     calc_zp = res_zp[0] if res_zp else def_zp
 
@@ -198,7 +261,8 @@ def process_file(fits_filename, config):
             'id', 'raw_x', 'raw_y', 'refined_x', 'refined_y', 
             'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
             'peak_adu', 'dao_flux', 'net_flux', 'flux_err', 'snr',
-            'mag_inst', 'mag_inst_err', 'mag_calibrated', 'mag_calibrated_err', 'airmass', 'is_variable'
+            'mag_inst', 'mag_inst_err', 'mag_calibrated', 'mag_calibrated_err', 'airmass', 'is_variable',
+            'peak_raw', 'saturated', 'blended', 'n_sky', 'bkg_median', 'bkg_std'
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -224,7 +288,13 @@ def process_file(fits_filename, config):
                 'mag_calibrated': f"{rs.get('mag_calibrated', 0):.3f}" if 'mag_calibrated' in rs and not np.isnan(rs['mag_calibrated']) else "",
                 'mag_calibrated_err': f"{rs.get('mag_calibrated_err', 0):.3f}" if 'mag_calibrated_err' in rs and not np.isnan(rs['mag_calibrated_err']) else "",
                 'airmass': f"{header.get('AIRMASS', 1.0):.4f}",
-                'is_variable': 'Yes' if rs.get('is_variable', False) else 'No'
+                'is_variable': 'Yes' if rs.get('is_variable', False) else 'No',
+                'peak_raw': f"{rs['peak_raw']:.1f}" if np.isfinite(rs.get('peak_raw', np.nan)) else "",
+                'saturated': 'Yes' if rs.get('saturated', False) else 'No',
+                'blended': 'Yes' if rs.get('blended', False) else 'No',
+                'n_sky': rs.get('n_sky', ''),
+                'bkg_median': f"{rs['bkg_median']:.2f}" if np.isfinite(rs.get('bkg_median', np.nan)) else "",
+                'bkg_std': f"{rs['bkg_std']:.3f}" if np.isfinite(rs.get('bkg_std', np.nan)) else ""
             })
 
     # 6. Shift Analysis
@@ -233,7 +303,8 @@ def process_file(fits_filename, config):
         output_md = os.path.join('photometry_output', f'shift_analysis_{base_name}.md')
         print(f"Generating shift analysis report at {output_md}...")
         shift_stats = generate_shift_report(results, config['reference_catalog'], header, config['match_tolerance_arcsec'], output_md,
-                                            center_ra=center_ra, center_dec=center_dec)
+                                            center_ra=center_ra, center_dec=center_dec,
+                                            radius_arcmin=catalog_radius)
         
         if shift_stats:
             print("\n--- Positional Shift Summary (Detected - Reference) ---")
@@ -262,10 +333,25 @@ def run_pipeline(cfg):
         print(f"No files found matching pattern: {input_pattern}")
     else:
         print(f"Found {len(files_to_process)} file(s) to process.")
+        n_failed = 0
         for f in files_to_process:
-            res = process_file(f, cfg)
+            # v4.15: one bad file no longer aborts the whole batch
+            try:
+                res = process_file(f, cfg)
+            except Exception as e:
+                import traceback
+                n_failed += 1
+                print(f"\nERROR while processing {f}: {e}")
+                traceback.print_exc()
+                print("Continuing with the next file...")
+                res = None
+            finally:
+                if hasattr(sys.stdout, 'set_log_file'):
+                    sys.stdout.set_log_file(None)
             if res:
                 processed_results.append(res)
+        if n_failed:
+            print(f"\n{n_failed} of {len(files_to_process)} file(s) failed - see the messages above.")
     return processed_results
 
 def main():

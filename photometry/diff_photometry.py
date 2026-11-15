@@ -33,19 +33,66 @@ def compute_zero_points(Tbv, Tb_bv, Tv_bv, kB, kV, B_ref, V_ref, b_ref, v_ref, X
     return Z_BV, Z_B, Z_V
 
 def compute_target_BV(b_t, v_t, XB_t, XV_t, Tbv, Tb_bv, Tv_bv, Z_BV, Z_B, Z_V, kB, kV):
-    """ Applies the zero points to calculate standard magnitudes. """
+    """ Applies the zero points to calculate standard magnitudes.
+
+    v4.16: B is computed as V + (B-V), so that the reported B, V and B-V are
+    always consistent (previously B came from the separate B equation and,
+    with mutually inconsistent coefficients, B - V differed from B-V by up to
+    0.2 mag). Z_B and Tb_bv are therefore no longer needed here (kept in the
+    signature for compatibility).
+    """
     b0_t = b_t - kB * XB_t
     v0_t = v_t - kV * XV_t
     bv0_t = b0_t - v0_t
     BV_t = Tbv * bv0_t + Z_BV
-    B_t = b0_t + Tb_bv * BV_t + Z_B
     V_t = v0_t + Tv_bv * BV_t + Z_V
+    B_t = V_t + BV_t
     return B_t, V_t, BV_t
 
-def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv, Tv_bv, radius_arcmin=15.0, manual_ref_coord=None, target_mode='all', manual_target_coord=None, axes=None):
+
+def target_errors(sig_b, sig_v, BV_t, bv0_t, Tbv, Tv_bv, sZ_BV, sZ_V, sTbv=0.0, sTv=0.0,
+                  BV_comp=0.0, bv0_comp=0.0):
     """
-    Reads two CSVs (B and V), matches the stars, selects a reference star,
-    and applies differential photometry to all common stars.
+    v4.16: 1-sigma uncertainties of (B, V, B-V) for one star.
+    Contributions: instrumental errors of b and v, zero-point errors (error of
+    the ensemble mean), and colour-coefficient errors, which act on the colour
+    difference to the comparison stars (coefficients are exact at the mean
+    comparison-star colour). Correlations between the zero points are ignored.
+      B-V = Tbv*(b0-v0) + Z_BV
+      V   = v0 + Tv*(B-V) + Z_V = (1 - Tv*Tbv) v0 + Tv*Tbv b0 + ...
+      B   = V + (B-V)       = (1 - a) v0 + a b0 + ...,  a = (1+Tv)*Tbv
+    """
+    d_bv0 = bv0_t - bv0_comp
+    d_BV = BV_t - BV_comp
+    s_bv = np.sqrt(Tbv**2 * (sig_b**2 + sig_v**2) + sZ_BV**2 + (d_bv0 * sTbv)**2)
+    c = Tv_bv * Tbv
+    s_v = np.sqrt((1 - c)**2 * sig_v**2 + c**2 * sig_b**2 + (Tv_bv * sZ_BV)**2 + sZ_V**2 + (d_BV * sTv)**2
+                  + (Tv_bv * d_bv0 * sTbv)**2)
+    a = (1 + Tv_bv) * Tbv
+    s_b = np.sqrt((1 - a)**2 * sig_v**2 + a**2 * sig_b**2 + ((1 + Tv_bv) * sZ_BV)**2 + sZ_V**2 + (d_BV * sTv)**2
+                  + ((1 + Tv_bv) * d_bv0 * sTbv)**2)
+    return s_b, s_v, s_bv
+
+
+def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv, Tv_bv, radius_arcmin=15.0, manual_ref_coord=None, target_mode='all', manual_target_coord=None, axes=None,
+                                comp_mode='ensemble', min_snr=30.0, peak_limit=30000.0, exclude_blended=True,
+                                Tbv_err=0.0, Tb_bv_err=0.0, Tv_bv_err=0.0, check_coord=None, bv_range=(-0.2, 1.6)):
+    """
+    Reads two CSVs (B and V), matches the stars, determines the zero points and
+    applies differential photometry to all common stars.
+
+    v4.16:
+      comp_mode='ensemble' (default): zero points Z_BV, Z_V (and Z_B) are the
+        sigma-clipped mean over ALL suitable comparison stars (catalogue match,
+        not a known variable, SNR >= min_snr in B and V, peak <= peak_limit,
+        no neighbour in the annulus, catalogue B-V within bv_range); their
+        uncertainty is the error of the mean.
+      comp_mode='single' or a manual/named reference star: one comparison star
+        (previous behaviour; automatic choice now = star closest in brightness
+        and colour to the median of the field instead of the BRIGHTEST one).
+      All results carry 1-sigma errors (B_err, V_err, B_V_err), and an optional
+      check star (check_coord = (ra, dec) in deg) is reported against the
+      catalogue.
     """
     # 1. Read CSVs
     # This is an inner function (a function defined inside another function). It acts as a local helper
@@ -158,82 +205,125 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
     idx_cat, d2d_cat, _ = coords_pairs.match_to_catalog_sky(coords_cat)
     mask_cat = d2d_cat < 2.0 * u.arcsec
     
-    # 4. Find the best reference star
+    # 4. Comparison stars and zero points
+    def _f(d, k, default=np.nan):
+        try:
+            v = d.get(k, default)
+            return float(v) if v not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    def _is_yes(v):
+        return str(v).strip().lower() in ('yes', 'true', '1')
+
+    def _pair_ok(pair):
+        for side in ('b', 'v'):
+            d = pair[side]
+            if _is_yes(d.get('saturated', 'No')):
+                return False
+            if exclude_blended and _is_yes(d.get('blended', 'No')):
+                return False
+            if _f(d, 'snr', 0.0) < min_snr:
+                return False
+            peak = _f(d, 'peak_raw')
+            if not np.isfinite(peak):
+                peak = _f(d, 'peak_adu')
+            if peak_limit and np.isfinite(peak) and peak > peak_limit:
+                return False
+        return True
+
+    def _zps_for(pair, cat_star):
+        B_r, V_r = cat_star['B_mag'], cat_star['V_mag']
+        b_r, v_r = float(pair['b']['mag_inst']), float(pair['v']['mag_inst'])
+        XB_r = float(pair['b'].get('airmass') or 1.0)
+        XV_r = float(pair['v'].get('airmass') or 1.0)
+        return compute_zero_points(Tbv, Tb_bv, Tv_bv, k_b, k_v, B_r, V_r, b_r, v_r, XB_r, XV_r)
+
+    comp_list = []   # list of (pair, cat_star)
     best_ref_pair = None
     best_ref_cat = None
-    
+
     if manual_ref_coord:
-        # Manual Mode
-        # The user provided a specific tuple of coordinates (RA, Dec). We turn this into a SkyCoord.
+        # Manual Mode (single named/coordinate comparison star)
         man_coord = SkyCoord(ra=manual_ref_coord[0]*u.deg, dec=manual_ref_coord[1]*u.deg)
-        
-        # 'separation' computes the angular distance from the manual coordinate to all our detected stars simultaneously.
         seps = coords_pairs.separation(man_coord)
-        
-        # 'np.argmin' is a numpy function that returns the index of the minimum value in an array.
-        # This tells us exactly which detected star is physically closest to the user's manual coordinates.
         best_idx = np.argmin(seps)
         min_sep = seps[best_idx].arcsec
-        
         if min_sep > 4.0:
             return f"Error: No star found within 4 arcsec of the manual coordinates (closest is {min_sep:.1f} arcsec away)."
-            
         if not mask_cat[best_idx]:
             return "Error: The selected manual star was not found in the reference catalog."
-            
         best_ref_pair = matched_pairs[best_idx]
         best_ref_cat = ref_stars[idx_cat[best_idx]]
-        
-        b_cat = best_ref_cat.get('B_mag', np.nan)
-        v_cat = best_ref_cat.get('V_mag', np.nan)
-        if np.isnan(b_cat) or np.isnan(v_cat):
+        if np.isnan(best_ref_cat.get('B_mag', np.nan)) or np.isnan(best_ref_cat.get('V_mag', np.nan)):
             return "Error: The selected manual star does not have valid B or V magnitudes in the reference catalog."
-            
+        comp_list = [(best_ref_pair, best_ref_cat)]
     else:
-        # Automatic Mode: Criteria: 0.4 <= (B-V) <= 0.8, not saturated, brightest
-        min_v_inst = float('inf')
-        
+        candidates = []
         for i, is_match in enumerate(mask_cat):
-            if is_match:
-                pair = matched_pairs[i]
-                cat_star = ref_stars[idx_cat[i]]
-                
-                # Skip variable stars
-                if pair.get('is_variable', False):
-                    continue
-                
-                # Check for saturation (peak > 55000 ADU)
-                peak_b = float(pair['b'].get('peak_adu', 0))
-                peak_v = float(pair['v'].get('peak_adu', 0))
-                if peak_b > 55000 or peak_v > 55000:
-                    continue
-                    
-                b_cat = cat_star.get('B_mag', np.nan)
-                v_cat = cat_star.get('V_mag', np.nan)
-                
-                if np.isnan(b_cat) or np.isnan(v_cat):
-                    continue
-                    
-                bv_cat = b_cat - v_cat
-                if 0.4 <= bv_cat <= 0.8:
-                    v_inst = float(pair['v']['mag_inst'])
-                    if v_inst < min_v_inst:
-                        min_v_inst = v_inst
-                        best_ref_pair = pair
-                        best_ref_cat = cat_star
-                        
-        if not best_ref_pair:
-            return "Error: No suitable reference star found (0.4 <= B-V <= 0.8, unsaturated)."
-        
-    # 5. Extract Reference Star Data
+            if not is_match:
+                continue
+            pair = matched_pairs[i]
+            cat_star = ref_stars[idx_cat[i]]
+            if pair.get('is_variable', False) or not _pair_ok(pair):
+                continue
+            b_cat = cat_star.get('B_mag', np.nan)
+            v_cat = cat_star.get('V_mag', np.nan)
+            if np.isnan(b_cat) or np.isnan(v_cat):
+                continue
+            if not (bv_range[0] <= b_cat - v_cat <= bv_range[1]):
+                continue
+            candidates.append((pair, cat_star))
+        if not candidates:
+            return (f"Error: No suitable comparison stars (catalogue match, not variable, SNR >= {min_snr:g}, "
+                    f"peak <= {peak_limit:g} ADU, {bv_range[0]} <= B-V <= {bv_range[1]}).")
+        if comp_mode == 'single':
+            # One star: closest to the median brightness and colour of the candidates
+            vs = np.array([c[1]['V_mag'] for c in candidates]); bvs = np.array([c[1]['B_mag'] - c[1]['V_mag'] for c in candidates])
+            dist = np.hypot((vs - np.median(vs)) / 1.0, (bvs - np.median(bvs)) / 0.3)
+            comp_list = [candidates[int(np.argmin(dist))]]
+        else:
+            comp_list = candidates
+        best_ref_pair, best_ref_cat = comp_list[0]
+
+    # Zero points per comparison star and their robust mean
+    from astropy.stats import sigma_clip
+    Z = np.array([_zps_for(p, c) for p, c in comp_list])   # columns Z_BV, Z_B, Z_V
+    if len(comp_list) >= 3:
+        clip = sigma_clip(Z, sigma=3.0, maxiters=5, axis=0, masked=True)
+        keep = ~np.any(np.ma.getmaskarray(clip), axis=1)
+        if keep.sum() < 3:
+            keep = np.ones(len(comp_list), bool)
+    else:
+        keep = np.ones(len(comp_list), bool)
+    Zk = Z[keep]
+    Z_BV, Z_B, Z_V = (float(np.mean(Zk[:, j])) for j in range(3))
+    n_comp = int(keep.sum())
+    if n_comp >= 2:
+        sZ = np.std(Zk, axis=0, ddof=1) / np.sqrt(n_comp)
+        scatter = np.std(Zk, axis=0, ddof=1)
+    else:
+        # single comparison star: instrumental errors + assumed catalogue error 0.02 mag
+        p0 = comp_list[0][0]
+        eb0 = _f(p0['b'], 'mag_inst_err', 0.01); ev0 = _f(p0['v'], 'mag_inst_err', 0.01)
+        eb0 = eb0 if np.isfinite(eb0) else 0.01; ev0 = ev0 if np.isfinite(ev0) else 0.01
+        sZ = np.array([np.hypot(Tbv * np.hypot(eb0, ev0), 0.028), np.hypot(eb0, 0.02), np.hypot(ev0, 0.02)])
+        scatter = np.array([np.nan, np.nan, np.nan])
+    sZ_BV, sZ_B, sZ_V = (float(x) for x in sZ)
+    used_comps = [comp_list[i] for i in range(len(comp_list)) if keep[i]]
+    comp_ids = set(id(p) for p, _ in used_comps)
+    # mean comparison colours (coefficient errors act on the colour difference to these)
+    bv0_comp = float(np.mean([(float(p['b']['mag_inst']) - k_b * float(p['b'].get('airmass') or 1.0))
+                              - (float(p['v']['mag_inst']) - k_v * float(p['v'].get('airmass') or 1.0)) for p, _ in used_comps]))
+    BV_comp = float(np.mean([c['B_mag'] - c['V_mag'] for _, c in used_comps]))
+
+    # 5. Extract Reference Star Data (first comparison star, for the report)
     B_ref = best_ref_cat['B_mag']
     V_ref = best_ref_cat['V_mag']
     b_ref = float(best_ref_pair['b']['mag_inst'])
     v_ref = float(best_ref_pair['v']['mag_inst'])
     XB_ref = float(best_ref_pair['b'].get('airmass') or 1.0)
     XV_ref = float(best_ref_pair['v'].get('airmass') or 1.0)
-    
-    Z_BV, Z_B, Z_V = compute_zero_points(Tbv, Tb_bv, Tv_bv, k_b, k_v, B_ref, V_ref, b_ref, v_ref, XB_ref, XV_ref)
     
     # 6. Apply to all matched targets
     output_rows = []
@@ -260,6 +350,12 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
         
         # We pass them into our helper function to compute the calibrated, true magnitudes
         B_t, V_t, BV_t = compute_target_BV(b_inst, v_inst, XB, XV, Tbv, Tb_bv, Tv_bv, Z_BV, Z_B, Z_V, k_b, k_v)
+        sb = _f(pair['b'], 'mag_inst_err', np.nan); sv = _f(pair['v'], 'mag_inst_err', np.nan)
+        bv0_t = (b_inst - k_b * XB) - (v_inst - k_v * XV)
+        if np.isfinite(sb) and np.isfinite(sv):
+            eB, eV, eBV = target_errors(sb, sv, BV_t, bv0_t, Tbv, Tv_bv, sZ_BV, sZ_V, Tbv_err, Tv_bv_err, BV_comp, bv0_comp)
+        else:
+            eB = eV = eBV = np.nan
         
         # We build a dictionary for this star and append it to our output list.
         # Notice the use of 'f-strings' (e.g. f"{B_t:.4f}"). This is Python's standard way of formatting strings.
@@ -274,6 +370,10 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
             'B_mag': f"{B_t:.4f}",
             'V_mag': f"{V_t:.4f}",
             'B_V': f"{BV_t:.4f}",
+            'B_err': f"{eB:.4f}" if np.isfinite(eB) else "",
+            'V_err': f"{eV:.4f}" if np.isfinite(eV) else "",
+            'B_V_err': f"{eBV:.4f}" if np.isfinite(eBV) else "",
+            'is_comp': 'Yes' if id(pair) in comp_ids else 'No',
             'v_inst': f"{v_inst:.4f}",
             'b_inst': f"{b_inst:.4f}",
             'airmass_v': f"{XV:.4f}",
@@ -314,7 +414,17 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
 
     with open(out_md_report, 'w') as f:
         f.write("# Differential Photometry Report\n\n")
-        f.write("## Reference Star\n")
+        f.write("## Comparison Stars\n")
+        if n_comp > 1:
+            f.write(f"- **Ensemble** of {n_comp} comparison stars ({len(comp_list) - n_comp} rejected by 3-sigma clipping); "
+                    f"selection: SNR >= {min_snr:g}, peak <= {peak_limit:g} ADU, {bv_range[0]} <= B-V <= {bv_range[1]}, not variable"
+                    f"{', no neighbour in the annulus' if exclude_blended else ''}.\n")
+            f.write(f"- Star-to-star scatter of the zero points: Z_BV {scatter[0]:.4f}, Z_B {scatter[1]:.4f}, Z_V {scatter[2]:.4f} mag\n")
+            f.write(f"- Mean comparison-star colour (B-V) = {BV_comp:.3f}\n\n")
+            f.write("## First comparison star (example)\n")
+        else:
+            f.write("- **Single comparison star** (catalogue error assumed 0.02 mag)\n\n")
+            f.write("## Reference Star\n")
         f.write(f"- Name/ID: {ref_name}\n")
         f.write(f"- RA/Dec: {best_ref_cat['ra_deg']:.5f}, {best_ref_cat['dec_deg']:.5f}\n")
         f.write(f"- Standard B: {B_ref:.4f}\n")
@@ -325,9 +435,39 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
         f.write(f"- Airmass B/V: {XB_ref:.3f} / {XV_ref:.3f}\n\n")
         
         f.write("## Calculated Zero Points\n")
-        f.write(f"- $Z_{{BV}}$: {Z_BV:.4f}\n")
-        f.write(f"- $Z_B$: {Z_B:.4f}\n")
-        f.write(f"- $Z_V$: {Z_V:.4f}\n\n")
+        f.write(f"- $Z_{{BV}}$: {Z_BV:.4f} ± {sZ_BV:.4f}\n")
+        f.write(f"- $Z_B$: {Z_B:.4f} ± {sZ_B:.4f} (not used: B = V + (B-V) since v4.16)\n")
+        f.write(f"- $Z_V$: {Z_V:.4f} ± {sZ_V:.4f}\n")
+        f.write(f"- Coefficients: Tbv = {Tbv:.4f} ± {Tbv_err:.4f}, Tv_bv = {Tv_bv:.4f} ± {Tv_bv_err:.4f} (Tb_bv = {Tb_bv:.4f} only enters Z_B)\n\n")
+        f.write("Uncertainties of B, V, B-V (columns B_err, V_err, B_V_err) include the instrumental errors, the zero-point errors "
+                "and the coefficient errors times the colour difference to the comparison stars.\n\n")
+
+        # Check star
+        if check_coord is not None:
+            chk = SkyCoord(ra=check_coord[0]*u.deg, dec=check_coord[1]*u.deg)
+            seps_c = coords_pairs.separation(chk)
+            ci = int(np.argmin(seps_c))
+            f.write("## Check Star\n")
+            if seps_c[ci].arcsec > 4.0:
+                f.write(f"No measured star within 4 arcsec of the check-star position (closest {seps_c[ci].arcsec:.1f}\").\n\n")
+            else:
+                pr = matched_pairs[ci]
+                bi, vi = float(pr['b']['mag_inst']), float(pr['v']['mag_inst'])
+                XBc, XVc = float(pr['b'].get('airmass') or 1.0), float(pr['v'].get('airmass') or 1.0)
+                Bc, Vc, BVc = compute_target_BV(bi, vi, XBc, XVc, Tbv, Tb_bv, Tv_bv, Z_BV, Z_B, Z_V, k_b, k_v)
+                sbc, svc = _f(pr['b'], 'mag_inst_err', 0.01), _f(pr['v'], 'mag_inst_err', 0.01)
+                eBc, eVc, eBVc = target_errors(sbc, svc, BVc, (bi - k_b*XBc) - (vi - k_v*XVc), Tbv, Tv_bv, sZ_BV, sZ_V,
+                                               Tbv_err, Tv_bv_err, BV_comp, bv0_comp)
+                f.write(f"- Measured: V = {Vc:.3f} ± {eVc:.3f}, B = {Bc:.3f} ± {eBc:.3f}, B-V = {BVc:.3f} ± {eBVc:.3f}\n")
+                if mask_cat[ci]:
+                    cc = ref_stars[idx_cat[ci]]
+                    if np.isfinite(cc.get('V_mag', np.nan)) and np.isfinite(cc.get('B_mag', np.nan)):
+                        f.write(f"- Catalogue: V = {cc['V_mag']:.3f}, B = {cc['B_mag']:.3f}, B-V = {cc['B_mag'] - cc['V_mag']:.3f}\n")
+                        f.write(f"- Difference (meas - cat): dV = {Vc - cc['V_mag']:+.3f}, dB = {Bc - cc['B_mag']:+.3f}, "
+                                f"d(B-V) = {BVc - (cc['B_mag'] - cc['V_mag']):+.3f}\n")
+                if id(pr) in comp_ids:
+                    f.write("- Note: this star is also in the comparison ensemble.\n")
+                f.write("\n")
         
         f.write(f"Detailed results saved to: `{out_csv}` and `{out_md_results}`\n\n")
         
@@ -342,8 +482,9 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
         for i, is_match in enumerate(mask_cat):
             if is_match:
                 cat_star = ref_stars[idx_cat[i]]
-                # We skip the reference star itself because its deviation will trivially be exactly 0.
-                if cat_star['id'] == best_ref_cat['id']:
+                # Single comparison star: skip it (its deviation is trivially 0).
+                # Ensemble: comparison stars are included (in-sample; noted in the report).
+                if n_comp == 1 and cat_star['id'] == best_ref_cat['id']:
                     continue
                     
                 # 'np.nan' represents "Not a Number". We use it to gracefully handle missing catalog data.
@@ -596,7 +737,11 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
             # Append to report
             with open(out_md_report, 'a') as f:
                 f.write("## Accuracy Evaluation\n")
-                f.write("Comparison of computed magnitudes against catalog values (excluding reference star).\n\n")
+                if n_comp == 1:
+                    f.write("Comparison of computed magnitudes against catalog values (excluding the reference star).\n\n")
+                else:
+                    f.write(f"Comparison of computed magnitudes against catalog values (all non-variable catalogue stars; "
+                            f"the {n_comp} ensemble comparison stars are included, i.e. partly in-sample).\n\n")
                 f.write(f"- **$\\Delta B$ (Calibrated - Catalog)**: $\\mu$ = {mu_B:.4f}, $\\sigma$ = {std_B:.4f}\n")
                 f.write(f"- **$\\Delta V$ (Calibrated - Catalog)**: $\\mu$ = {mu_V:.4f}, $\\sigma$ = {std_V:.4f}\n")
                 f.write(f"- **$\\Delta(B-V)$**: $\\mu$ = {mu_BV:.4f}, $\\sigma$ = {std_BV:.4f}\n\n")
@@ -624,4 +769,5 @@ def run_differential_photometry(csv_b, csv_v, ref_catalog, k_b, k_v, Tbv, Tb_bv,
             coord_hms = f"{ra_str} / {dec_str}"
             f.write(f"| {coord_hms} | {float(row['ra_deg']):.5f} | {float(row['dec_deg']):.5f} | {row['V_mag']} | {row['B_mag']} | {row['B_V']} | {row['is_variable']} |\n")
         
-    return f"Success! Used 1 reference star to calibrate {len(output_rows)} stars. Saved to {out_csv}."
+    return (f"Success! Used {'an ensemble of ' + str(n_comp) + ' comparison stars' if n_comp > 1 else '1 comparison star'} "
+            f"to calibrate {len(output_rows)} stars (Z_V = {Z_V:.3f} ± {sZ_V:.3f}). Saved to {out_csv}.")

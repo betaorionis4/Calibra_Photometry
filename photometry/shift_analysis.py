@@ -6,12 +6,13 @@ import astropy.units as u
 from photometry.calibration import read_reference_catalog, get_ref_stars
 
 def generate_shift_report(results, ref_catalog_file, header, tolerance_arcsec, output_md, 
-                          center_ra=None, center_dec=None):
+                          center_ra=None, center_dec=None, radius_arcmin=15.0):
     """
     Cross-matches detected stars with the reference catalog and generates a 
     markdown report detailing the systematic positional shifts (RA, Dec, X, Y).
     """
-    ref_stars = get_ref_stars(ref_catalog_file, center_ra, center_dec)
+    # v4.15: use the same search radius as the calibration step (was always 15')
+    ref_stars = get_ref_stars(ref_catalog_file, center_ra, center_dec, radius_arcmin=radius_arcmin)
     if not ref_stars:
         # Check if we should warn about missing local file
         if not ref_catalog_file.upper() in ["ATLAS", "APASS"]:

@@ -184,6 +184,15 @@ def split_osc_fits(fits_path, output_dir=None, pattern='RGGB', method='superpixe
             
     if data is None:
         raise ValueError(f"FITS file contains no data: {fits_path}")
+
+    # v4.16: compare the chosen pattern with the header (not changed automatically,
+    # because the meaning of BAYERPAT depends on ROWORDER / software conventions)
+    hdr_pat = str(header.get('BAYERPAT', '') or '').strip().upper()
+    if hdr_pat and hdr_pat != str(pattern).upper():
+        print(f"WARNING: Bayer pattern '{pattern}' was selected but the header says BAYERPAT='{hdr_pat}' "
+              f"(ROWORDER='{header.get('ROWORDER', 'n/a')}', XBAYROFF={header.get('XBAYROFF', 0)}, YBAYROFF={header.get('YBAYROFF', 0)}). "
+              f"Check the R and B outputs (a wrong pattern swaps R and B).")
+    input_is_float = np.issubdtype(np.asarray(data).dtype, np.floating)
         
     # Handle color/monochrome
     if data.ndim == 3:
@@ -209,14 +218,30 @@ def split_osc_fits(fits_path, output_dir=None, pattern='RGGB', method='superpixe
                 warnings.simplefilter('ignore', AstropyWarning)
                 wcs = WCS(header)
             if wcs.has_celestial:
+                had_sip = wcs.sip is not None
+                wcs = wcs.celestial if wcs.naxis > 2 else wcs
+                wcs.sip = None   # v4.16: SIP coefficients are not rescaled -> dropped
+                wcs.wcs.ctype = [str(c).replace('-SIP', '') for c in wcs.wcs.ctype]
                 wcs.wcs.crpix = (wcs.wcs.crpix - 0.5) / 2.0 + 0.5
-                if hasattr(wcs.wcs, 'cd') and wcs.wcs.cd is not None:
+                if wcs.wcs.has_cd():
                     wcs.wcs.cd = wcs.wcs.cd * 2.0
                 else:
                     wcs.wcs.cdelt = wcs.wcs.cdelt * 2.0
                 
-                # Write back scaled coordinates
+                # v4.16: remove ALL old WCS scale/distortion keywords before writing the
+                # scaled solution (previously old CDi_j stayed next to the new PC/CDELT,
+                # i.e. two conflicting pixel scales for e.g. ASTAP/Siril).
+                import re as _re
+                old_wcs = _re.compile(r'^(CD\d_\d|PC\d_\d|CDELT\d|CROTA\d|CRPIX\d|CTYPE\d|A_\d+_\d+|B_\d+_\d+|AP_\d+_\d+|BP_\d+_\d+|A_ORDER|B_ORDER|AP_ORDER|BP_ORDER|A_DMAX|B_DMAX)$')
+                for key in [k for k in list(wcs_header.keys()) if old_wcs.match(k)]:
+                    try:
+                        del wcs_header[key]
+                    except KeyError:
+                        pass
                 wcs_header.update(wcs.to_header(relax=True))
+                if had_sip:
+                    wcs_header['HISTORY'] = "Calibra superpixel split: SIP distortion dropped (re-solve for full accuracy)"
+                    print("Note: SIP distortion terms were dropped from the half-resolution WCS; plate-solve the split frames if you need them.")
         except Exception as e:
             # Non-blocking warning
             print(f"Warning: WCS scaling failed: {e}")
@@ -234,14 +259,23 @@ def split_osc_fits(fits_path, output_dir=None, pattern='RGGB', method='superpixe
         out_name = f"{base_name}{suffix}_{chan}.fits"
         out_path = os.path.join(output_dir, out_name)
         
-        # Cast to uint16 safely (keeping 16MB file size)
-        img_uint16 = np.clip(img, 0, 65535).astype(np.uint16)
+        # v4.16: keep float data as float32 (normalised 0..1 stacks were destroyed by the
+        # uint16 cast); integer input stays uint16 only where values are integers
+        # (the averaged G channel and bilinear output are written as float32).
+        img_arr = np.asarray(img)
+        if input_is_float or not np.allclose(img_arr, np.round(img_arr)):
+            out_data = img_arr.astype(np.float32)
+        else:
+            out_data = np.clip(np.round(img_arr), 0, 65535).astype(np.uint16)
         
         new_hdr = wcs_header.copy()
+        for k in ('BZERO', 'BSCALE', 'BLANK'):
+            if k in new_hdr:
+                del new_hdr[k]
         new_hdr['FILTER'] = chan
         new_hdr['COMMENT'] = f"Extracted {chan} channel from OSC via {method} ({pattern})"
         
-        hdu = fits.PrimaryHDU(data=img_uint16, header=new_hdr)
+        hdu = fits.PrimaryHDU(data=out_data, header=new_hdr)
         hdu.writeto(out_path, overwrite=True)
         extracted_paths.append(out_path)
         

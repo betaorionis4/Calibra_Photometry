@@ -1,3 +1,5 @@
+# NOTE (v4.15): this module is not used by Calibra (superseded by photometry/fits_viewer.py)
+# and is kept only for reference. It is known to be broken (fitter called without data).
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits

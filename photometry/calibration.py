@@ -4,7 +4,7 @@ import os
 import numpy as np
 from astropy.coordinates import SkyCoord
 import astropy.units as u
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats, sigma_clip
 from astroquery.vizier import Vizier
 from astropy.table import Table
 
@@ -14,7 +14,7 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
     Supports ATLAS (ATLAS-RefCat2) and APASS.
     """
     if verbose:
-        print(f"Fetching {catalog_name} catalog from VizieR for RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
+        print(f"Reference catalogue {catalog_name} for RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
     
     # Configure Vizier
     # ATLAS-RefCat2: J/ApJ/867/105
@@ -48,9 +48,42 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
     elif "APASS" in cat_upper: catalog_name = "APASS"
     elif "LANDOLT" in cat_upper: catalog_name = "LANDOLT"
 
-    # Increase timeout and configure Vizier
-    from astropy.utils.data import Conf
-    Conf.remote_timeout.set(60) # 60 seconds timeout
+    # v4.26: local copy first (Settings -> local catalogue folder); online only if the
+    # catalogue or this part of the sky is not available locally
+    try:
+        from photometry import local_catalogs as _lc
+        local_rows = _lc.query(catalog_name, ra_deg, dec_deg, radius_arcmin, verbose=verbose)
+    except Exception as e:
+        print(f"Local catalogue could not be read ({e}) - trying online.")
+        _lc, local_rows = None, None
+    if local_rows is not None:
+        ref_stars = stars_from_local_rows(local_rows, catalog_name)
+        return _finish_ref_stars(ref_stars, catalog_name, ra_deg, dec_deg, radius_arcmin, verbose, "local copy")
+    if _lc is not None and not _lc.online_allowed():
+        print(f"{catalog_name}: not available in the local catalogue folder for this field, and online "
+              "queries are switched off (Settings).")
+        return []
+    # v4.32: APASS - download DR10 for this field from the AAVSO archive (option, default off);
+    # afterwards the field is local. VizieR DR9 only if that fails.
+    if catalog_name == "APASS" and _lc is not None and _lc.apass_auto():
+        try:
+            from photometry import apass_dr10 as _ad
+            if _ad.auto_download(ra_deg, dec_deg, radius_arcmin, log=print):
+                local_rows = _lc.query(catalog_name, ra_deg, dec_deg, radius_arcmin, verbose=verbose)
+                if local_rows is not None:
+                    ref_stars = stars_from_local_rows(local_rows, catalog_name)
+                    return _finish_ref_stars(ref_stars, catalog_name, ra_deg, dec_deg, radius_arcmin, verbose,
+                                             "APASS DR10 download")
+        except Exception as e:
+            print(f"APASS DR10 automatic download: {e}")
+
+    # v4.34: shorter timeout; a server that did not answer is skipped for a while
+    from photometry import online as _online
+    if not _online.available('vizier'):
+        if verbose:
+            print(f"{catalog_name}: VizieR was not reachable a short while ago - skipped (local data only).")
+        return []
+    _online.set_timeout()
     
     v = Vizier(columns=['*', '_RAJ2000', '_DEJ2000'], row_limit=-1)
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
@@ -59,8 +92,10 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
         if verbose:
             print(f"Querying VizieR {catalog_id}...")
         result = v.query_region(coord, radius=radius_arcmin * u.arcmin, catalog=catalog_id)
+        _online.ok('vizier')
     except Exception as e:
         print(f"Error querying VizieR: {e}")
+        _online.failed('vizier', e)
         return []
 
     if not result or len(result) == 0:
@@ -98,14 +133,7 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
                     g = float(row['gmag']) if 'gmag' in cols else np.nan
                     r = float(row['rmag']) if 'rmag' in cols else np.nan
                     
-                    if not np.isnan(g) and not np.isnan(r):
-                        color = g - r
-                        # Alternative: Kostov et al. (2017) - Specific for Pan-STARRS1
-                        v_mag = g - 0.020 - 0.498 * color - 0.008 * (color**2)
-                        b_mag = g + 0.199 + 0.540 * color + 0.016 * (color**2)
-                    else:
-                        v_mag = g if not np.isnan(g) else np.nan
-                        b_mag = r if not np.isnan(r) else np.nan
+                    v_mag, b_mag = atlas_to_vb(g, r)
                     
                     if 'Vmag' in cols and not np.isnan(float(row['Vmag'])): v_mag = float(row['Vmag'])
                     if 'Bmag' in cols and not np.isnan(float(row['Bmag'])): b_mag = float(row['Bmag'])
@@ -118,13 +146,7 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
                     bp = get_val('BPmag')
                     rp = get_val('RPmag')
                 
-                    if not np.isnan(g) and not np.isnan(bp) and not np.isnan(rp):
-                        c = bp - rp
-                        v_mag = g + 0.02704 - 0.01424 * c + 0.2156 * (c**2) - 0.01426 * (c**3)
-                        b_mag = g - 0.01448 + 0.6874 * c + 0.3604 * (c**2) - 0.06718 * (c**3) + 0.006061 * (c**4)
-                    else:
-                        v_mag = np.nan
-                        b_mag = np.nan
+                    v_mag, b_mag = gaia_to_vb(g, bp, rp)
 
                 elif catalog_name == "LANDOLT":
                     ra = float(row['_RAJ2000']) if '_RAJ2000' in cols else float(row['RAJ2000'])
@@ -183,6 +205,75 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
             except:
                 continue
 
+    return _finish_ref_stars(ref_stars, catalog_name, ra_deg, dec_deg, radius_arcmin, verbose, "VizieR")
+
+
+def atlas_to_vb(g, r):
+    """Johnson V, B from Pan-STARRS g, r (Kostov et al. 2017). nan if g or r is missing
+    (v4.15: no B/V without both bands)."""
+    if g is None or r is None or np.isnan(g) or np.isnan(r):
+        return np.nan, np.nan
+    color = g - r
+    return (g - 0.020 - 0.498 * color - 0.008 * color ** 2,
+            g + 0.199 + 0.540 * color + 0.016 * color ** 2)
+
+
+def gaia_to_vb(G, bp, rp):
+    """Johnson V, B from Gaia G, BP, RP (Gaia DR3 documentation polynomials)."""
+    if any(x is None or np.isnan(x) for x in (G, bp, rp)):
+        return np.nan, np.nan
+    c = bp - rp
+    return (G + 0.02704 - 0.01424 * c + 0.2156 * c ** 2 - 0.01426 * c ** 3,
+            G - 0.01448 + 0.6874 * c + 0.3604 * c ** 2 - 0.06718 * c ** 3 + 0.006061 * c ** 4)
+
+
+def stars_from_local_rows(rows, catalog_name):
+    """v4.26: convert raw rows of a local catalogue copy (photometry.local_catalogs.query)
+    into Calibra's reference-star dicts - same conversions as for VizieR results."""
+    from photometry import local_catalogs as lc
+    cat = lc.normalize_name(catalog_name)
+    out = []
+    for row in rows:
+        ra, dec = row['_ra'], row['_dec']
+        g = r = G = bp = rp = np.nan
+        if cat == 'ATLAS':
+            g, r = lc.value(row, 'g_sdss'), lc.value(row, 'r_sdss')
+            v_mag, b_mag = atlas_to_vb(g, r)
+            V_, B_ = lc.value(row, 'V'), lc.value(row, 'B')      # explicit V/B columns, if present
+            if not np.isnan(V_): v_mag = V_
+            if not np.isnan(B_): b_mag = B_
+        elif cat == 'GAIA_DR3':
+            G, bp, rp = lc.value(row, 'G'), lc.value(row, 'BP'), lc.value(row, 'RP')
+            v_mag, b_mag = gaia_to_vb(G, bp, rp)
+        elif cat == 'LANDOLT':
+            v_mag = lc.value(row, 'V')
+            bv = lc.value(row, 'BV')
+            b_mag = v_mag + bv if not (np.isnan(v_mag) or np.isnan(bv)) else lc.value(row, 'B')
+        else:  # APASS
+            v_mag, b_mag = lc.value(row, 'V'), lc.value(row, 'B')
+        if np.isnan(v_mag) or v_mag >= 18.0:
+            continue
+        ident = lc.text(row, 'id')
+        prefix = {'GAIA_DR3': 'Gaia', 'ATLAS': 'ATLAS', 'APASS': 'APASS', 'LANDOLT': ''}.get(cat, '')
+        if ident:
+            cat_id = f"{prefix} {ident}".strip()
+        else:
+            try:
+                c_coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+                cat_id = (f"{prefix or 'J'} J" if prefix else "J") + \
+                    c_coord.ra.to_string(unit='hour', sep='', precision=2, pad=True) + \
+                    c_coord.dec.to_string(unit='degree', sep='', precision=1, pad=True, alwayssign=True)
+            except Exception:
+                cat_id = f"{prefix}_{len(out)}"
+        out.append({'id': f"online_{len(out)}", 'cat_id': cat_id, 'ra_deg': ra, 'dec_deg': dec,
+                    'V_mag': v_mag, 'B_mag': b_mag,
+                    'raw_g': g if cat == 'ATLAS' else np.nan, 'raw_r': r if cat == 'ATLAS' else np.nan,
+                    'raw_G': G if cat == 'GAIA_DR3' else np.nan, 'raw_BP': bp if cat == 'GAIA_DR3' else np.nan,
+                    'raw_RP': rp if cat == 'GAIA_DR3' else np.nan})
+    return out
+
+
+def _finish_ref_stars(ref_stars, catalog_name, ra_deg, dec_deg, radius_arcmin, verbose, source):
     if ref_stars:
         # Cross match with GAIA DR3 if not already GAIA_DR3
         if catalog_name != "GAIA_DR3":
@@ -190,12 +281,10 @@ def fetch_online_catalog(ra_deg, dec_deg, radius_arcmin=15, catalog_name="ATLAS"
         else:
             for s in ref_stars:
                 s['gaia_id'] = s.get('cat_id', '')
-                
         # Cross match with local AUIDs
         cross_match_with_local_auids(ref_stars, verbose=verbose)
-
     if verbose:
-        print(f"Successfully retrieved {len(ref_stars)} stars from {catalog_name}.")
+        print(f"Successfully retrieved {len(ref_stars)} stars from {catalog_name} ({source}).")
     return ref_stars
 
 def cross_match_with_gaia(ref_stars, ra_deg, dec_deg, radius_arcmin, verbose=True):
@@ -208,19 +297,38 @@ def cross_match_with_gaia(ref_stars, ra_deg, dec_deg, radius_arcmin, verbose=Tru
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         
-        if verbose:
-            print(f"Querying GAIA DR3 for cross-matching near RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
-        v = Vizier(columns=['Source', '_RAJ2000', '_DEJ2000'], row_limit=-1)
-        coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
-        result = v.query_region(coord, radius=(radius_arcmin * 1.1) * u.arcmin, catalog="I/355")
-        
-        if not result or len(result) == 0:
+        # v4.26: local Gaia copy first
+        from photometry import local_catalogs as _lc
+        rows = _lc.query("GAIA_DR3", ra_deg, dec_deg, radius_arcmin * 1.1, verbose=False)
+        if rows is not None:
+            if not rows:
+                return
+            gaia_table = {'Source': np.array([_lc.text(r, 'id') for r in rows], dtype=object)}
+            gaia_coords = SkyCoord(ra=[r['_ra'] for r in rows], dec=[r['_dec'] for r in rows], unit=u.deg)
+            gaia_table = [{'Source': x} for x in gaia_table['Source']]
+        else:
+            from photometry import online as _online
+            if not _lc.online_allowed() or not _online.available('vizier'):
+                return
             if verbose:
-                print("No Gaia stars found for cross-matching.")
-            return
-            
-        gaia_table = result[0]
-        gaia_coords = SkyCoord(ra=gaia_table['_RAJ2000'], dec=gaia_table['_DEJ2000'], unit=u.deg)
+                print(f"Querying GAIA DR3 for cross-matching near RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
+            _online.set_timeout()
+            v = Vizier(columns=['Source', '_RAJ2000', '_DEJ2000'], row_limit=-1)
+            coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
+            try:
+                result = v.query_region(coord, radius=(radius_arcmin * 1.1) * u.arcmin, catalog="I/355")
+                _online.ok('vizier')
+            except Exception as e:
+                _online.failed('vizier', e)
+                raise
+
+            if not result or len(result) == 0:
+                if verbose:
+                    print("No Gaia stars found for cross-matching.")
+                return
+
+            gaia_table = result[0]
+            gaia_coords = SkyCoord(ra=gaia_table['_RAJ2000'], dec=gaia_table['_DEJ2000'], unit=u.deg)
         star_coords = SkyCoord(ra=[s['ra_deg'] for s in ref_stars], dec=[s['dec_deg'] for s in ref_stars], unit=u.deg)
         
         idx, d2d, _ = star_coords.match_to_catalog_sky(gaia_coords)
@@ -398,16 +506,39 @@ def fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin=15, verbose=True):
     if verbose:
         print(f"Fetching VSX catalog from VizieR for RA={ra_deg:.4f}, Dec={dec_deg:.4f}...")
     
-    from astropy.utils.data import Conf
-    Conf.remote_timeout.set(60)
+    # v4.26: local VSX copy first
+    try:
+        from photometry import local_catalogs as _lc
+        rows = _lc.query("VSX", ra_deg, dec_deg, radius_arcmin, verbose=verbose)
+    except Exception:
+        _lc, rows = None, None
+    if rows is not None:
+        out = []
+        for r_ in rows:
+            mx, mn = _lc.value(r_, 'max'), _lc.value(r_, 'min')
+            if np.isfinite(mx) and np.isfinite(mn) and mn < mx:
+                mn = mx + mn           # amplitude given instead of minimum
+            out.append({'id': _lc.text(r_, 'id'), 'ra_deg': r_['_ra'], 'dec_deg': r_['_dec'],
+                        'Type': _lc.text(r_, 'type'), 'max': mx, 'min': mn, 'Period': _lc.value(r_, 'period')})
+        if verbose:
+            print(f"VSX (local copy): {len(out)} variable stars.")
+        return out
+    if _lc is not None and not _lc.online_allowed():
+        return []
+    from photometry import online as _online
+    if not _online.available('vizier'):
+        return []
+    _online.set_timeout()
     
     v = Vizier(catalog="B/vsx/vsx", columns=['OID', 'Name', '_RAJ2000', '_DEJ2000', 'Type', 'max', 'min', 'f_min', 'Period'], row_limit=-1)
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.deg, u.deg), frame='icrs')
     
     try:
         result = v.query_region(coord, radius=radius_arcmin * u.arcmin)
+        _online.ok('vizier')
     except Exception as e:
         print(f"Error querying VSX: {e}")
+        _online.failed('vizier', e)
         return []
         
     if not result or len(result) == 0:
@@ -468,7 +599,7 @@ def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refst
                             c_rad = float(parts[3])
                             
                             # Check if the center is within 0.05 degrees (3 arcmin)
-                            dist_deg = np.sqrt((c_ra - ra_deg)**2 + (c_dec - dec_deg)**2)
+                            dist_deg = np.sqrt(((c_ra - ra_deg) * np.cos(np.radians(dec_deg)))**2 + (c_dec - dec_deg)**2)
                             if dist_deg < 0.05:
                                 # Check if cached radius adjusted for the offset covers the requested radius (with a 2 arcmin tolerance)
                                 if (c_rad - dist_deg * 60.0) >= (radius_arcmin - 2.0):
@@ -497,7 +628,7 @@ def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir="photometry_refst
                     # Only keep stars within the requested radius of the requested center
                     star_ra = float(row['ra_deg'])
                     star_dec = float(row['dec_deg'])
-                    dist_arcmin = np.sqrt((star_ra - ra_deg)**2 + (star_dec - dec_deg)**2) * 60.0
+                    dist_arcmin = np.sqrt(((star_ra - ra_deg) * np.cos(np.radians(dec_deg)))**2 + (star_dec - dec_deg)**2) * 60.0
                     if dist_arcmin <= radius_arcmin:
                         max_val = float(row['max']) if row.get('max') and row['max'] != 'nan' else np.nan
                         min_val = float(row['min']) if row.get('min') and row['min'] != 'nan' else np.nan
@@ -578,7 +709,8 @@ def mark_variable_stars(star_list, center_ra, center_dec, radius_arcmin, verbose
 def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec=2.0, 
                         default_zp=23.399, run_new_calibration=True, output_report=None,
                         center_ra=None, center_dec=None, snr_threshold=10.0,
-                        print_to_console=True, header=None, radius_arcmin=15.0):
+                        print_to_console=True, header=None, radius_arcmin=15.0, band=None,
+                        peak_limit=None, exclude_blended=True):
     print("\n=================================================================")
     print("--- 4. Zero Point Calibration ---")
     print("=================================================================\n")
@@ -627,18 +759,25 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     if num_vars > 0:
         print(f"Excluded {num_vars} known variable stars from the reference calibration set.")
         
-    mag_key = 'B_mag' if 'B' in filter_name.upper() else 'V_mag'
+    # v4.15: band decided by the central filter classifier (was: 'B' in FILTER,
+    # which treated e.g. "Bessell V" as B).
+    if band not in ('B', 'V'):
+        from photometry.filters import filter_band
+        band = filter_band(filter_name)
+    mag_key = 'B_mag' if band == 'B' else 'V_mag'
     
     # Identify Source
     source_name = ref_catalog_file
-    if ref_catalog_file.upper() in ["ATLAS", "APASS", "GAIA_DR3", "LANDOLT STANDARD STAR CATALOGUE"]:
-        source_name = f"Online VizieR ({ref_catalog_file.upper()})"
-    else:
+    if os.path.isfile(str(ref_catalog_file)):
         source_name = f"Local File ({os.path.basename(ref_catalog_file)})"
+    else:
+        source_name = f"Online VizieR ({ref_catalog_file})"
     
     print(f"Reference Catalog: {source_name}")
     print(f"Using {mag_key} from reference catalog for calibration.")
     print(f"SNR Threshold for calibration stars: {snr_threshold}")
+    if peak_limit:
+        print(f"Peak limit for calibration stars: {peak_limit:.0f} ADU (raw pixel value; protects against non-linearity)")
     
     ref_ra = [s['ra_deg'] for s in valid_ref_stars]
     ref_dec = [s['dec_deg'] for s in valid_ref_stars]
@@ -651,7 +790,12 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     for rs in results:
         # NEW: Filter by SNR threshold AND saturation for calibration
         if 'ra_deg' in rs and 'dec_deg' in rs and rs['ra_deg'] != "" and not np.isnan(rs.get('mag_inst', np.nan)):
-            if rs.get('snr', 0) >= snr_threshold and not rs.get('saturated', False):
+            # v4.16: also reject stars near non-linearity (peak_limit), stars whose
+            # aperture is off the image and stars with a neighbour in the annulus
+            peak = rs.get('peak_raw', rs.get('peak_adu', 0))
+            too_bright = bool(peak_limit) and peak is not None and np.isfinite(peak) and peak > peak_limit
+            if (rs.get('snr', 0) >= snr_threshold and not rs.get('saturated', False) and not too_bright
+                    and not rs.get('edge', False) and not (exclude_blended and rs.get('blended', False))):
                 det_valid.append(rs)
                 det_ra.append(float(rs['ra_deg']))
                 det_dec.append(float(rs['dec_deg']))
@@ -693,8 +837,6 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
     report_lines.append(f"| Match ID | Catalog RA/Dec (HMS/DMS) | V mag | B mag | B-V | Inst Mag | Zero Point |")
     report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
     
-    report_lines.append(f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
-    
     zps = []
     matched_ref_stars = [valid_ref_stars[i] for i in idx[match_mask]]
     
@@ -722,12 +864,51 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
         
     zps = np.array(zps)
     mean_zp, median_zp, std_zp = sigma_clipped_stats(zps, sigma=3.0, maxiters=5)
+    # v4.16: uncertainty of the zero point itself = error of the (clipped) median,
+    # 1.2533*sigma/sqrt(N). Previously the star-to-star scatter (std) was used as
+    # the ZP error and added to every star (and was 0 for a single star).
+    clipped = sigma_clip(zps, sigma=3.0, maxiters=5, masked=True)
+    n_used = int(np.sum(~clipped.mask)) if np.ma.isMaskedArray(clipped) else len(zps)
+    if n_used >= 2:
+        zp_err = 1.2533 * std_zp / np.sqrt(n_used)
+    else:
+        zp_err = 0.05  # single calibration star: conservative floor
+        print("WARNING: only one calibration star - ZP uncertainty set to 0.05 mag.")
     
-    print(f"\nCalculated Zero Point: {median_zp:.3f} ± {std_zp:.3f} (Median)")
+    print(f"\nCalculated Zero Point: {median_zp:.3f} ± {zp_err:.4f} (median of {n_used} stars; star-to-star scatter {std_zp:.3f})")
+
+    # v4.16: colour dependence of the zero point (diagnostic; NOT applied).
+    colour_txt = None
+    try:
+        bvs = np.array([(rf.get('B_mag', np.nan) - rf.get('V_mag', np.nan)) for rf in matched_ref_stars], dtype=float)
+        ok = np.isfinite(bvs) & np.isfinite(zps) & (~clipped.mask if np.ma.isMaskedArray(clipped) else True)
+        if np.sum(ok) >= 10 and np.ptp(bvs[ok]) > 0.3:
+            from scipy.stats import linregress
+            x, y = bvs[ok], zps[ok]
+            keep = np.ones(len(x), bool)
+            for _ in range(5):
+                lr = linregress(x[keep], y[keep])
+                res = y - (lr.intercept + lr.slope * x)
+                mad = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep])))
+                new_keep = np.abs(res) < 3 * max(mad, 1e-4)
+                if np.array_equal(new_keep, keep): break
+                keep = new_keep
+            bv_med = float(np.median(x[keep]))
+            colour_txt = (f"ZP colour dependence: dZP/d(B-V) = {lr.slope:+.3f} ± {lr.stderr:.3f} mag/mag "
+                          f"({int(keep.sum())} stars, median comparison B-V = {bv_med:.2f}). "
+                          f"The pipeline magnitudes are NOT colour-transformed: for a star with colour (B-V)*, "
+                          f"the transformed value would differ by about {lr.slope:+.3f} x ((B-V)* - {bv_med:.2f}).")
+            print(colour_txt)
+    except Exception as e:
+        print(f"(Colour diagnostic skipped: {e})")
     
     report_lines.append(f"\n## Results")
-    report_lines.append(f"- **Calculated Median Zero Point**: {median_zp:.3f}")
-    report_lines.append(f"- **Standard Deviation**: ± {std_zp:.3f}\n")
+    report_lines.append(f"- **Calculated Median Zero Point**: {median_zp:.3f} ± {zp_err:.4f} (error of the median, {n_used} stars)")
+    report_lines.append(f"- **Star-to-star scatter (std)**: {std_zp:.3f}")
+    report_lines.append(f"- **Calibrated magnitudes are untransformed** (no colour term applied).")
+    if colour_txt:
+        report_lines.append(f"- {colour_txt}")
+    report_lines.append("")
     
     if output_report:
         with open(output_report, 'w', encoding='utf-8') as f:
@@ -738,14 +919,14 @@ def match_and_calibrate(results, ref_catalog_file, filter_name, tolerance_arcsec
             rs['mag_calibrated'] = rs['mag_inst'] + median_zp
             mag_inst_err = rs.get('mag_inst_err', np.nan)
             if not np.isnan(mag_inst_err):
-                rs['mag_calibrated_err'] = np.sqrt(mag_inst_err**2 + std_zp**2)
+                rs['mag_calibrated_err'] = np.sqrt(mag_inst_err**2 + zp_err**2)
             else:
                 rs['mag_calibrated_err'] = np.nan
         else:
             rs['mag_calibrated'] = np.nan
             rs['mag_calibrated_err'] = np.nan
             
-    return median_zp, std_zp
+    return median_zp, zp_err
 
 
 def resolve_auid(auid, target_hint=None, verbose=True):
@@ -763,8 +944,9 @@ def resolve_auid(auid, target_hint=None, verbose=True):
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         
+        from photometry import online as _online
         # 1. Try VSP Photometry Table if we have a target hint
-        if target_hint:
+        if target_hint and _online.available('aavso'):
             if verbose: print(f"  Using target star hint: {target_hint}")
             # Clean target name for URL
             safe_target = urllib.parse.quote(target_hint)
@@ -796,13 +978,21 @@ def resolve_auid(auid, target_hint=None, verbose=True):
                     return {'ra': ra_deg, 'dec': dec_deg, 'name': name}
             except Exception as e:
                 if verbose: print(f"  VSP Table lookup failed: {e}")
+                _online.failed('aavso', e)
 
         # 2. Fallback: Try VizieR VSX catalog directly by Name
         if verbose: print("  Falling back to VizieR VSX name search...")
         from astroquery.vizier import Vizier
         v = Vizier(columns=['OID', 'Name', '_RAJ2000', '_DEJ2000'], row_limit=1)
         try:
-            result = v.query_constraints(catalog='B/vsx/vsx', Name=auid)
+            if not _online.available('vizier'):
+                return None
+            _online.set_timeout()
+            try:
+                result = v.query_constraints(catalog='B/vsx/vsx', Name=auid)
+            except Exception as e_:
+                _online.failed('vizier', e_)
+                raise
             if result and len(result) > 0:
                 table = result[0]
                 if len(table) > 0:

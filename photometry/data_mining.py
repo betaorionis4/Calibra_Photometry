@@ -6,7 +6,6 @@ from astropy.stats import sigma_clipped_stats, mad_std
 from astropy.utils.exceptions import AstropyWarning
 from photutils.detection import DAOStarFinder
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
-from photutils.centroids import centroid_2dg
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 import os
@@ -21,15 +20,109 @@ import os
 # identifying candidate variable stars while rejecting artifacts and noise.
 # =============================================================================
 
+DM_CACHE_VERSION = 1
+DM_CACHE_DIR = os.path.join("photometry_output", "dm_cache")
+
+
+def _catalog_hash(master_catalog):
+    import hashlib
+    h = hashlib.sha1()
+    for st in master_catalog:
+        h.update(f"{st['id']}|{st['ra_deg']:.7f}|{st['dec_deg']:.7f};".encode())
+    return h.hexdigest()
+
+
+def _frame_cache_path(fits_path, cat_hash, settings, cache_dir):
+    """Cache file for one frame; the key changes when the file, the star list or any
+    measurement setting changes, so stale results are never reused."""
+    import hashlib, json
+    try:
+        st = os.stat(fits_path)
+        fid = f"{os.path.abspath(fits_path)}|{st.st_mtime_ns}|{st.st_size}"
+    except OSError:
+        return None
+    key = json.dumps({'v': DM_CACHE_VERSION, 'f': fid, 'c': cat_hash, 's': settings}, sort_keys=True)
+    return os.path.join(cache_dir, hashlib.sha1(key.encode()).hexdigest() + ".npz")
+
+
+def _measure_frame(data, x_arr, y_arr, n_stars, aperture_radius, annulus_inner, annulus_outer,
+                   saturation_limit, edge_buffer, centroid_tracking_shift, g_eff, sky_noise_factor, sigma_w):
+    """
+    v4.17: vectorised measurement of all stars in one frame.
+    Returns a dict of arrays (length n_stars): net_flux, mag_inst, mag_err, snr, bkg_std, x, y.
+    """
+    from photometry.fastphot import track_centroid, fast_sky_stats
+    from photometry.noise import flux_variance
+    out = {k: np.full(n_stars, np.nan) for k in ('net_flux', 'mag_inst', 'mag_err', 'snr', 'bkg_std', 'x', 'y')}
+    y_max, x_max = data.shape
+    half_box = max(5, int(np.ceil(3 * sigma_w)) + 1)
+    idx_ok, xs, ys = [], [], []
+    for idx in range(n_stars):
+        x_init, y_init = x_arr[idx], y_arr[idx]
+        if not (np.isfinite(x_init) and np.isfinite(y_init)):
+            continue
+        if (x_init < edge_buffer or x_init > (x_max - edge_buffer) or
+                y_init < edge_buffer or y_init > (y_max - edge_buffer)):
+            continue
+        # Centroid refinement (fast windowed centroid; falls back to the WCS position
+        # if it fails or moves further than the tracking limit)
+        xr, yr, _ = track_centroid(data, x_init, y_init, centroid_tracking_shift, sigma_w=sigma_w, half_box=half_box)
+        if (xr - aperture_radius < -0.5 or yr - aperture_radius < -0.5 or
+                xr + aperture_radius > x_max - 0.5 or yr + aperture_radius > y_max - 0.5):
+            continue
+        idx_ok.append(idx); xs.append(xr); ys.append(yr)
+    if not idx_ok:
+        return out
+    pos = np.column_stack([xs, ys])
+    apers = CircularAperture(pos, r=aperture_radius)
+    annuli = CircularAnnulus(pos, r_in=annulus_inner, r_out=annulus_outer)
+    sums = np.asarray(aperture_photometry(data, apers, method='exact')['aperture_sum'], dtype=float)
+    ap_masks = apers.to_mask(method='center')
+    an_masks = annuli.to_mask(method='center')
+    area = apers.area
+    for j, idx in enumerate(idx_ok):
+        ap_vals = ap_masks[j].get_values(data)
+        if ap_vals.size == 0 or np.nanmax(ap_vals) > saturation_limit:
+            continue                                   # saturated / non-linear
+        bkg_median, bkg_std, n_sky = fast_sky_stats(an_masks[j].get_values(data), sigma=3.0)
+        if n_sky == 0:
+            continue
+        net = sums[j] - bkg_median * area
+        if not np.isfinite(net) or net <= 0:
+            continue
+        err = np.sqrt(flux_variance(net, area, bkg_std, n_sky, g_eff, sky_noise_factor))
+        snr = net / err if err > 0 else 0.0
+        out['net_flux'][idx] = net
+        out['mag_inst'][idx] = -2.5 * np.log10(net)
+        out['mag_err'][idx] = 1.0857 / snr if snr > 0 else np.nan
+        out['snr'][idx] = snr
+        out['bkg_std'][idx] = bkg_std
+        out['x'][idx] = xs[j]
+        out['y'][idx] = ys[j]
+    return out
+
+
 def track_and_measure(fits_files, master_catalog, aperture_radius=5.0, 
                       annulus_inner=7.0, annulus_outer=13.0, 
                       saturation_limit=55000, edge_buffer=50, 
                       centroid_tracking_shift=4.0,
-                      cancel_event=None, progress_callback=None):
+                      cancel_event=None, progress_callback=None,
+                      gain=1.0, stack_mode='average', sky_noise_factor=1.0,
+                      fwhm=3.5, use_cache=True, cache_dir=None):
     """
     Tracks and measures all stars in the master_catalog across all FITS files.
     Returns a list of dicts, one per frame, containing the measurements for all stars.
+
+    v4.17 (speed): each frame is converted to float once and all stars are
+    measured with one vectorised aperture call and a fast windowed centroid
+    (was: whole-image conversion + 2-D Gaussian fit for every star, ~65 ms per
+    star and frame; now well below 1 ms). With use_cache=True the measurements of
+    every frame are stored in photometry_output/dm_cache/ and reused when the same
+    frame is analysed again with the same star list and settings, so re-running
+    the analysis (other thresholds, ensemble size, ...) does not re-read the FITS files.
     """
+    from photometry.fastphot import as_float_image
+    from photometry.noise import effective_gain
     results = []
     warnings_list = []
     
@@ -38,6 +131,23 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
         
     base_filter = None
     total_files = len(fits_files)
+    n_stars = len(master_catalog)
+    ids = [star['id'] for star in master_catalog]
+    cache_dir = cache_dir or DM_CACHE_DIR
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+    cat_hash = _catalog_hash(master_catalog)
+    settings = {'ap': round(float(aperture_radius), 3), 'ai': round(float(annulus_inner), 3), 'ao': round(float(annulus_outer), 3),
+                'sat': float(saturation_limit), 'edge': float(edge_buffer), 'shift': round(float(centroid_tracking_shift), 3),
+                'gain': round(float(gain), 5), 'stack': str(stack_mode), 'k': round(float(sky_noise_factor), 4),
+                'fwhm': round(float(fwhm), 3)}
+    try:                                   # v4.27: on-the-fly calibration state
+        from photometry.master_frames import state_tag as _cal_state_tag, apply_on_the_fly as _cal_apply
+        settings['cal'] = _cal_state_tag()
+    except Exception:
+        _cal_apply = None
+    sigma_w = max(float(fwhm) / 2.355, 1.0)
+    n_cached = 0
     
     # Pre-create SkyCoord array for all stars
     ra_list = [star['ra_deg'] for star in master_catalog]
@@ -50,168 +160,132 @@ def track_and_measure(fits_files, master_catalog, aperture_radius=5.0,
             
         frame_result = {
             'file': os.path.basename(fits_path),
-            'measurements': {} # star_id -> {net_flux, mag_inst, snr}
+            'measurements': {} # star_id -> {net_flux, mag_inst, mag_err, snr, bkg_std}
         }
         
         try:
-            with fits.open(fits_path) as hdul:
-                header = hdul[0].header
-                data = hdul[0].data
-                if data is None and len(hdul) > 1:
-                    data = hdul[1].data
-                    header = hdul[1].header
-                if data is None:
+            cpath = _frame_cache_path(fits_path, cat_hash, settings, cache_dir) if use_cache else None
+            arrays = None
+            if cpath and os.path.exists(cpath):
+                try:
+                    with np.load(cpath, allow_pickle=False) as z:
+                        arrays = {k: z[k] for k in z.files}
+                    curr_filter = str(arrays.pop('filter')) if 'filter' in arrays else 'UNKNOWN'
+                    frame_result['img_std'] = float(arrays.pop('img_std'))
+                    n_cached += 1
+                except Exception:
+                    arrays = None
+
+            if arrays is None:
+                with fits.open(fits_path) as hdul:
+                    header = hdul[0].header
+                    data = hdul[0].data
+                    if data is None and len(hdul) > 1:
+                        data = hdul[1].data
+                        header = hdul[1].header
+                    if data is None:
+                        continue
+                    if data.ndim == 3:
+                        data = data[0]
+                    data = as_float_image(data)   # ONE conversion per frame
+                    if _cal_apply is not None:
+                        data, _ = _cal_apply(data, header, fits_path)
+                curr_filter = header.get('FILTER', 'UNKNOWN')
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', AstropyWarning)
+                    wcs = WCS(header)
+                if not wcs.has_celestial:
                     continue
-                if data.ndim == 3:
-                    data = data[0]
-                    
+                g_eff, _ = effective_gain(gain, header, stack_mode)
+
+                # Global image background scatter (to flag stars with a disturbed local
+                # background). v4.17: from a 1/16 pixel subsample (full image: ~3 s/frame).
+                _, _, img_std = sigma_clipped_stats(data[::4, ::4], sigma=3.0, maxiters=3)
+                frame_result['img_std'] = float(img_std)
+
+                x_arr, y_arr = wcs.world_to_pixel(coords)
+                arrays = _measure_frame(data, np.atleast_1d(x_arr), np.atleast_1d(y_arr), n_stars,
+                                        aperture_radius, annulus_inner, annulus_outer,
+                                        saturation_limit, edge_buffer, centroid_tracking_shift,
+                                        g_eff, sky_noise_factor, sigma_w)
+                del data
+                if cpath:
+                    try:
+                        np.savez_compressed(cpath, filter=np.array(str(curr_filter)), img_std=np.array(img_std), **arrays)
+                    except Exception as e:
+                        print(f"Note: could not write Data Mining cache: {e}")
+
             # Check filter
-            curr_filter = header.get('FILTER', 'UNKNOWN')
             if base_filter is None:
                 base_filter = curr_filter
             elif curr_filter != base_filter:
                 msg = f"Warning: Mixed filters detected! {os.path.basename(fits_path)} uses {curr_filter}, expected {base_filter}."
                 if msg not in warnings_list:
                     warnings_list.append(msg)
-                    
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', AstropyWarning)
-                wcs = WCS(header)
-                
-            if not wcs.has_celestial:
-                continue
-                
-            # Calculate global image background std to compare against local annulus std
-            # This helps us identify if a star's local background is unusually noisy 
-            # (e.g. it sits on the diffraction spike of a very bright neighbor).
-            _, _, img_std = sigma_clipped_stats(data, sigma=3.0, maxiters=3)
-            frame_result['img_std'] = img_std
-                
-            y_max, x_max = data.shape
-            
-            # Fast bulk conversion: WCS world coordinates -> image pixel coordinates
-            x_arr, y_arr = wcs.world_to_pixel(coords)
-            
-            # Now loop over stars and measure flux using aperture photometry
-            for idx, star in enumerate(master_catalog):
-                star_id = star['id']
-                x_init = x_arr[idx]
-                y_init = y_arr[idx]
-                
-                # Check NaNs from WCS
-                if np.isnan(x_init) or np.isnan(y_init):
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
-                    
-                # Check Edge
-                if (x_init < edge_buffer or x_init > (x_max - edge_buffer) or
-                    y_init < edge_buffer or y_init > (y_max - edge_buffer)):
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
-                    
-                # ---------------------------------------------------------
-                # Centroid Refinement
-                # ---------------------------------------------------------
-                # Since telescope tracking drifts slightly and WCS solutions aren't perfect,
-                # we attempt to find the true center of the star within a 15x15 pixel box.
-                size = 15
-                x_int, y_int = int(np.round(x_init)), int(np.round(y_init))
-                
-                # Make sure the box is fully inside the image boundaries
-                if (x_int - size < 0 or x_int + size > x_max or
-                    y_int - size < 0 or y_int + size > y_max):
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
 
-                cutout = data[y_int-size:y_int+size, x_int-size:x_int+size]
-                
-                try:
-                    _, median_bg_cutout, _ = sigma_clipped_stats(cutout)
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", category=UserWarning)
-                        warnings.simplefilter("ignore", category=AstropyWarning)
-                        # centroid_2dg fits a 2D Gaussian to find the sub-pixel center
-                        x_rel, y_rel = centroid_2dg(cutout - median_bg_cutout)
-                    
-                    # If Gaussian fitting fails (star is too faint or a hot pixel), 
-                    # fallback to the original exact WCS coordinate to force measurement.
-                    if np.isnan(x_rel) or np.isnan(y_rel):
-                        x_ref, y_ref = x_init, y_init
-                    else:
-                        # Prevent snapping to a nearby bright star by limiting max shift
-                        dist_shift = np.sqrt((x_rel - size)**2 + (y_rel - size)**2)
-                        if dist_shift > centroid_tracking_shift:
-                            x_ref, y_ref = x_init, y_init
-                        else:
-                            x_ref = x_int - size + x_rel
-                            y_ref = y_int - size + y_rel
-                except Exception:
-                    x_ref, y_ref = x_init, y_init
-                    
-                # ---------------------------------------------------------
-                # Measurement: Saturation Check & Photometry
-                # ---------------------------------------------------------
-                # Check for saturation (non-linear detector response) within the aperture
-                aperture = CircularAperture((x_ref, y_ref), r=aperture_radius)
-                ap_mask = aperture.to_mask(method='center')
-                ap_data = ap_mask.get_values(data)
-                
-                if len(ap_data) == 0 or np.max(ap_data) > saturation_limit:
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
-                    
-                # Photometry
-                annulus = CircularAnnulus((x_ref, y_ref), r_in=annulus_inner, r_out=annulus_outer)
-                phot_table = aperture_photometry(data, aperture, method='exact')
-                raw_flux = phot_table['aperture_sum'][0]
-                
-                ann_mask = annulus.to_mask(method='center')
-                bkg_pixels = ann_mask.get_values(data)
-                bkg_pixels = bkg_pixels[~np.isnan(bkg_pixels)]
-                
-                if len(bkg_pixels) == 0:
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
-                    
-                _, bkg_median, bkg_std = sigma_clipped_stats(bkg_pixels, sigma=3.0)
-                
-                net_flux = raw_flux - (bkg_median * aperture.area)
-                
-                # Negative flux guard
-                if net_flux <= 0:
-                    frame_result['measurements'][star_id] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
-                    continue
-                    
-                mag_inst = -2.5 * np.log10(net_flux)
-                
-                # Basic SNR
-                variance = net_flux + aperture.area * (bkg_std**2) + (aperture.area**2 * bkg_std**2 / len(bkg_pixels))
-                flux_err = np.sqrt(variance)
-                snr = net_flux / flux_err if flux_err > 0 else 0
-                
-                frame_result['measurements'][star_id] = {
-                    'net_flux': net_flux,
-                    'mag_inst': mag_inst,
-                    'snr': snr,
-                    'bkg_std': bkg_std
-                }
+            meas = frame_result['measurements']
+            nf, mi, me, sn, bs = arrays['net_flux'], arrays['mag_inst'], arrays['mag_err'], arrays['snr'], arrays['bkg_std']
+            for k, sid in enumerate(ids):
+                if np.isfinite(mi[k]):
+                    meas[sid] = {'net_flux': float(nf[k]), 'mag_inst': float(mi[k]), 'mag_err': float(me[k]),
+                                 'snr': float(sn[k]), 'bkg_std': float(bs[k])}
+                else:
+                    meas[sid] = {'net_flux': np.nan, 'mag_inst': np.nan, 'snr': np.nan}
                 
         except Exception as e:
-            print(f"Error measuring frame {fits_path}: {e}")
+            print(f"Error measuring frame {fits_path}: {e} "
+                  f"(stars not measured in this frame are treated as missing)")
             
         results.append(frame_result)
         
         if progress_callback:
             progress_callback(((i + 1) / total_files) * 100)
+
+    if n_cached:
+        print(f"Data Mining: {n_cached} of {total_files} frame(s) taken from the measurement cache.")
             
     return results, warnings_list
 
 def detect_all_stars(fits_path, detect_sigma=5.0, saturation_limit=55000, edge_buffer=50,
-                     fwhm=3.5, sharplo=0.2, sharphi=1.0, roundlo=-1.0, roundhi=1.0):
+                     fwhm=3.5, sharplo=0.2, sharphi=1.0, roundlo=-1.0, roundhi=1.0, use_cache=True, cache_dir=None):
     """
     Detects all stars in a reference frame, rejecting saturated stars and stars near the edge.
     Returns a list of dictionaries containing star coordinates and initial fluxes.
+
+    v4.17: the result is cached (photometry_output/dm_cache/) per reference file and
+    detection settings, so repeated runs on the same sequence skip the detection.
     """
+    import json, hashlib
+    cpath = None
+    if use_cache:
+        try:
+            st = os.stat(fits_path)
+            key = json.dumps({'v': DM_CACHE_VERSION, 'f': f"{os.path.abspath(fits_path)}|{st.st_mtime_ns}|{st.st_size}",
+                              'p': [detect_sigma, saturation_limit, edge_buffer, fwhm, sharplo, sharphi, roundlo, roundhi]},
+                             sort_keys=True, default=str)
+            cdir = cache_dir or DM_CACHE_DIR
+            os.makedirs(cdir, exist_ok=True)
+            cpath = os.path.join(cdir, "detect_" + hashlib.sha1(key.encode()).hexdigest() + ".json")
+            if os.path.exists(cpath):
+                with open(cpath) as f:
+                    cached = json.load(f)
+                print(f"Data Mining: reference-frame detection taken from cache ({len(cached)} stars).")
+                return cached
+        except Exception:
+            cpath = None
+    stars = _detect_all_stars_uncached(fits_path, detect_sigma, saturation_limit, edge_buffer,
+                                       fwhm, sharplo, sharphi, roundlo, roundhi)
+    if cpath and stars:
+        try:
+            with open(cpath, 'w') as f:
+                json.dump([{k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in st_.items()} for st_ in stars], f)
+        except Exception as e:
+            print(f"Note: could not write detection cache: {e}")
+    return stars
+
+
+def _detect_all_stars_uncached(fits_path, detect_sigma, saturation_limit, edge_buffer,
+                               fwhm, sharplo, sharphi, roundlo, roundhi):
     try:
         with fits.open(fits_path) as hdul:
             header = hdul[0].header
@@ -322,15 +396,15 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
     num_frames = len(track_results)
     min_valid_frames = int(num_frames * min_valid_fraction)
     
-    # 1. Reorganize data: star_id -> list of mag_inst across frames
-    star_mags = {star['id']: [] for star in master_catalog}
-    for frame in track_results:
-        for star_id, m_dict in frame['measurements'].items():
-            star_mags[star_id].append(m_dict['mag_inst'])
-            
-    # Convert lists to numpy arrays
-    for star_id in star_mags:
-        star_mags[star_id] = np.array(star_mags[star_id])
+    # 1. Reorganize data: star_id -> array of mag_inst indexed by FRAME.
+    # v4.15: pre-filled with NaN and written by frame index. Previously values were
+    # appended, so a star missing in one frame (e.g. an exception part-way through a
+    # frame) shifted all its later points to the wrong frames / raised IndexError.
+    star_mags = {star['id']: np.full(num_frames, np.nan) for star in master_catalog}
+    for fi, frame in enumerate(track_results):
+        for star_id, m_dict in frame.get('measurements', {}).items():
+            if star_id in star_mags:
+                star_mags[star_id][fi] = m_dict.get('mag_inst', np.nan)
         
     # Filter stars with enough valid frames
     valid_stars = {}
@@ -441,8 +515,17 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
                 high_bg_var = True
 
         n_valid = np.sum(data['valid_mask'])
+
+        # v4.16: the star's OWN expected photometric noise (median formal error of
+        # its measurements) and the ratio RMS / expected noise (~1 for a constant star)
+        errs = np.array([m.get('mag_err', np.nan) for m in star_meas], dtype=float)
+        errs = errs[np.isfinite(errs)]
+        phot_err = float(np.median(errs)) if errs.size else np.nan
+        noise_ratio = final_rms / phot_err if (np.isfinite(phot_err) and phot_err > 0) else np.nan
         
         final_stats.append({
+            'phot_err': phot_err,
+            'noise_ratio': noise_ratio,
             'id': sid,
             'ra_deg': data['star_info']['ra_deg'],
             'dec_deg': data['star_info']['dec_deg'],
@@ -490,8 +573,10 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         expected_rms_func = lambda m: 10**(np.polyval(poly_coeffs, m))
     else:
         # Fallback to a flat median if there are too few stars to fit a curve
-        med_rms = np.median(rms_all)
-        expected_rms_func = lambda m: float(med_rms)
+        med_rms = float(np.median(rms_all))
+        # v4.16: return an array for array input (the plot passes a magnitude grid;
+        # a scalar here raised "x and y must have same first dimension")
+        expected_rms_func = lambda m: np.full(np.shape(m), med_rms) if np.ndim(m) else med_rms
         
     # =========================================================================
     # CALCULATE EXCESS RMS & CLASSIFY STARS (Suspect vs Noisy)
@@ -502,8 +587,9 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         exp_rms = expected_rms_func(s['mean_mag'])
         exp_rms = max(exp_rms, 0.001) # Prevent division by zero / negative noise
         
-        # Excess RMS is how much more scatter the star has compared to the noise floor
-        excess_rms = s['rms'] - exp_rms
+        # Excess RMS: scatter in excess of the noise floor, added in quadrature
+        # (v4.16; was a linear difference rms - expected)
+        excess_rms = float(np.sqrt(max(s['rms']**2 - exp_rms**2, 0.0))) if np.isfinite(s['rms']) else np.nan
         s['expected_rms'] = exp_rms
         s['excess_rms'] = excess_rms
         
@@ -512,6 +598,12 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         # 2. The absolute scatter must be > 0.03 mag to avoid flagging micro-variations 
         #    in ultra-bright stars where the theoretical noise floor approaches zero.
         is_suspect = s['rms'] > suspect_sigma * exp_rms and excess_rms > min_excess
+        # v4.16: additionally require that the scatter clearly exceeds the star's
+        # OWN photometric error (protects bright stars where the empirical noise
+        # floor is unreliable). Only applied when the error is known.
+        nr = s.get('noise_ratio', np.nan)
+        if is_suspect and np.isfinite(nr) and nr < 2.0:
+            is_suspect = False
         s['is_noisy'] = False
         
         if is_suspect:
@@ -544,7 +636,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
             s['is_suspect'] = False
             
     # Sort ALL results by excess RMS descending
-    final_stats.sort(key=lambda x: x['excess_rms'], reverse=True)
+    final_stats.sort(key=lambda x: x['excess_rms'] if np.isfinite(x['excess_rms']) else -1.0, reverse=True)
     
     # Initialize VSX name and type fields for all stars to prevent KeyError
     for s in final_stats:
@@ -573,7 +665,7 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
         try:
             with open(out_csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect', 'VSX Name', 'VSX Type', 'Catalog ID'])
+                writer.writerow(['ID', 'RA (deg)', 'Dec (deg)', 'Mean Mag', 'RMS', 'Expected RMS', 'Excess RMS', 'Valid Frames', 'Suspect', 'VSX Name', 'VSX Type', 'Catalog ID', 'Phot. Error (median)', 'RMS / Phot. Error'])
                 for s in final_stats:
                     writer.writerow([
                         s['id'], 
@@ -587,7 +679,9 @@ def calibrate_and_analyze(track_results, master_catalog, out_csv_path, min_valid
                         'SUSPECT' if s['is_suspect'] else ('NOISY' if s.get('is_noisy') else 'NO'),
                         s.get('vsx_name', ''),
                         s.get('vsx_type', ''),
-                        s.get('catalog_id', '')
+                        s.get('catalog_id', ''),
+                        f"{s['phot_err']:.5f}" if np.isfinite(s.get('phot_err', np.nan)) else '',
+                        f"{s['noise_ratio']:.2f}" if np.isfinite(s.get('noise_ratio', np.nan)) else ''
                     ])
         except Exception as e:
             print(f"Error writing CSV: {e}")
