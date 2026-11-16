@@ -904,7 +904,7 @@ def date_label(jds):
 
 def save_aavso_report(results, output_path, target_name, filter_name, obs_code, 
                       comp_name="ENSEMBLE", comp_mag="na", check_name="na", check_mag="na",
-                      trans="NO", software_version="4.44", comments="na", notes="na", chart="na"):
+                      trans="NO", software_version="4.45", comments="na", notes="na", chart="na"):
     """ Generates a report in AAVSO Extended Format. """
     try:
         def fmt_mag(val, precision=3):

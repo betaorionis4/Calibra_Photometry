@@ -1,13 +1,21 @@
 import glob
 import os
+import warnings
 import numpy as np
 from astropy.io import fits
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.logger import log
+from astropy.wcs import FITSFixedWarning
 
 # Suppress noisy astropy INFO messages (like WCS SIP distortion warnings)
 log.setLevel('WARNING')
+
+# Suppress expected FITS header warnings caused by older capture-software conventions:
+#   - RADECSYS (deprecated keyword, replaced by RADESYSa in the 2002 FITS WCS standard)
+#   - datfix: MJD-OBS auto-computed from DATE-OBS (purely informational)
+# These originate in the FITS files, not in Calibra itself.
+warnings.filterwarnings('ignore', category=FITSFixedWarning)
 
 from photometry.star_detection import detect_stars
 from photometry.psf_fitting import refine_coordinates_psf

@@ -1,0 +1,46 @@
+{
+  "root": "C:\\Astro\\Catalogues",
+  "catalogs": {
+    "GCVS": {
+      "path": "C:\\Astro\\Catalogues\\GCVS",
+      "layout": "list",
+      "n_files": 3,
+      "files": [
+        "C:\\Astro\\Catalogues\\GCVS\\GCVS_selected.csv",
+        "C:\\Astro\\Catalogues\\GCVS\\selected_variables.csv",
+        "C:\\Astro\\Catalogues\\GCVS\\selected_variables_reduced.csv"
+      ]
+    },
+    "APASS": {
+      "path": "C:\\Astro\\Catalogues\\APASS",
+      "layout": "table",
+      "n_files": 11
+    },
+    "ATLAS": {
+      "path": "C:\\Astro\\Catalogues\\ATLAS_refcat2",
+      "layout": "tiles",
+      "n_files": 194400,
+      "mag_dirs": [
+        "00_m_16",
+        "16_m_17",
+        "17_m_18"
+      ],
+      "tile_ext": [
+        ".rc2"
+      ]
+    },
+    "GAIA_DR3": {
+      "path": "C:\\Astro\\Catalogues\\Gaia DR3",
+      "layout": "table",
+      "n_files": 73271
+    },
+    "LANDOLT": {
+      "path": "C:\\Astro\\Catalogues\\Landolt",
+      "layout": "table",
+      "n_files": 17
+    }
+  },
+  "use_local": true,
+  "allow_online": true,
+  "apass_auto": true
+}

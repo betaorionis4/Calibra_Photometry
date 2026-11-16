@@ -1,0 +1,102 @@
+Session log initiated: photometry_output\logs\log_HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs_Lum_ATLAS refcat2.txt
+Calibration on the fly not applied to HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs.fts: already calibrated (CALSTAT).
+=================================================================
+--- 1. Automated Star Retrieval (DAOStarFinder) ---
+=================================================================
+
+Global Image Stats: Median Bkg = 1092.9 ADU | Noise Sigma = 5.3 ADU
+Found 646 stars before filtering.
+
+Keeping 646 stars after filtering.
+
+Fixed Aperture Applied -> Radius: 5.00 | Annulus: 7.00-13.00
+
+=================================================================
+--- 3. Aperture Photometry with Local Background Subtraction ---
+=================================================================
+
+Noise model: gain 1.27 e-/ADU; sky noise factor 1.00
+9 star(s) skipped: aperture not completely on the image (flag 'edge').
+28 star(s) have another detection within 13.0 px (flag 'blended'; excluded from calibration).
+Blank-sky noise check (1500 empty apertures): measured 60.7 ADU vs predicted 50.0 ADU -> factor 1.21. (Settings: 'Sky noise factor' = 1.00; a factor > ~1.2 means correlated noise, e.g. from registering/stacking.)
+Filtered out 73 questionable/faint detections (SNR < 3 or negative flux). Remaining: 573
+Warning: filter 'Lum' is not recognised as B or V (Settings > Filter mapping). Calibrating against catalogue V magnitudes.
+
+=================================================================
+--- 4. Zero Point Calibration ---
+=================================================================
+
+Skipping new calibration. Applying default Zero Point: 24.457
+
+--- Detection Limit (Faintest Star @ SNR=3.1) ---
+Instrumental Magnitude Limit: -5.57
+Calibrated Magnitude Limit: 18.89
+------------------------------------------------------------------
+
+Saving results to photometry_output\targets_auto_HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs.csv...
+Done!
+
+Session log initiated: photometry_output\logs\log_HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs_Lum_ATLAS refcat2.txt
+=================================================================
+--- 1. Automated Star Retrieval (DAOStarFinder) ---
+=================================================================
+
+Global Image Stats: Median Bkg = 1092.9 ADU | Noise Sigma = 5.3 ADU
+Found 646 stars before filtering.
+
+Keeping 646 stars after filtering.
+
+Fixed Aperture Applied -> Radius: 5.00 | Annulus: 7.00-13.00
+
+=================================================================
+--- 3. Aperture Photometry with Local Background Subtraction ---
+=================================================================
+
+Noise model: gain 1.27 e-/ADU; sky noise factor 1.00
+9 star(s) skipped: aperture not completely on the image (flag 'edge').
+28 star(s) have another detection within 13.0 px (flag 'blended'; excluded from calibration).
+Blank-sky noise check (1500 empty apertures): measured 60.7 ADU vs predicted 50.0 ADU -> factor 1.21. (Settings: 'Sky noise factor' = 1.00; a factor > ~1.2 means correlated noise, e.g. from registering/stacking.)
+Filtered out 73 questionable/faint detections (SNR < 3 or negative flux). Remaining: 573
+Warning: filter 'Lum' is not recognised as B or V (Settings > Filter mapping). Calibrating against catalogue V magnitudes.
+
+=================================================================
+--- 4. Zero Point Calibration ---
+=================================================================
+
+Skipping new calibration. Applying default Zero Point: 24.457
+
+--- Detection Limit (Faintest Star @ SNR=3.1) ---
+Instrumental Magnitude Limit: -5.57
+Calibrated Magnitude Limit: 18.89
+------------------------------------------------------------------
+
+Saving results to photometry_output\targets_auto_HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs.csv...
+Done!
+
+Session log initiated: photometry_output\logs\log_HU Aqr-1402-20261101@213259-030S-B4-Lum_wcs_Lum_ATLAS refcat2.txt
+=================================================================
+--- 1. Automated Star Retrieval (DAOStarFinder) ---
+=================================================================
+
+Global Image Stats: Median Bkg = 1092.9 ADU | Noise Sigma = 5.3 ADU
+Found 646 stars before filtering.
+
+Keeping 646 stars after filtering.
+
+Fixed Aperture Applied -> Radius: 5.00 | Annulus: 7.00-13.00
+
+=================================================================
+--- 3. Aperture Photometry with Local Background Subtraction ---
+=================================================================
+
+Noise model: gain 1.27 e-/ADU; sky noise factor 1.00
+9 star(s) skipped: aperture not completely on the image (flag 'edge').
+28 star(s) have another detection within 13.0 px (flag 'blended'; excluded from calibration).
+Blank-sky noise check (1500 empty apertures): measured 60.7 ADU vs predicted 50.0 ADU -> factor 1.21. (Settings: 'Sky noise factor' = 1.00; a factor > ~1.2 means correlated noise, e.g. from registering/stacking.)
+Filtered out 73 questionable/faint detections (SNR < 3 or negative flux). Remaining: 573
+Warning: filter 'Lum' is not recognised as B or V (Settings > Filter mapping). Calibrating against catalogue V magnitudes.
+
+=================================================================
+--- 4. Zero Point Calibration ---
+=================================================================
+

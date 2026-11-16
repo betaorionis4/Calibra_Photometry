@@ -271,8 +271,12 @@ def _file_layout(path):
     if not lines:
         return None, None, None
     delim = _delimiter(lines[0])
-    toks = _split(lines[0], delim)
-    header = None if all(_is_number(t) for t in toks if t != '') else [t.strip().lower() for t in toks]
+    toks = [t for t in _split(lines[0], delim) if t != '']
+    # v4.45: a line is a header only if most of its fields are not numbers. Real RefCat2
+    # tiles contain hexadecimal flag fields such as '2d' or '0d' (gcontrib, rcontrib ...);
+    # before, such a first data line was taken as the header and the whole file was lost.
+    n_num = sum(1 for t in toks if _is_number(t))
+    header = None if (not toks or n_num >= 0.5 * len(toks)) else [t.strip().lower() for t in _split(lines[0], delim)]
     name = os.path.basename(path)
     if _TILE_RE.match(name):
         return 'tiles', header, delim
@@ -409,6 +413,11 @@ def _rows_from_file(path, header, delim, ra, dec, radius_deg, fixed_cols=None):
     cosd = np.cos(np.radians(dec))
     skip_header = header is not None
     scale = None
+    # v4.45: RefCat2 tiles store RA/Dec in units of 1e-8 deg. The scale is taken from the
+    # tile name (RRR+DD) when there is one, so that a first star very close to RA 0 / Dec 0
+    # cannot select the wrong scale; otherwise from the first data line as before.
+    m_tile = _TILE_RE.match(os.path.basename(path))
+    tile_ra = float(m_tile.group(1)) if m_tile else None
     with _open_text(path) as f:
         for line in f:
             if not line.strip() or line.lstrip().startswith('#'):
@@ -422,7 +431,10 @@ def _rows_from_file(path, header, delim, ra, dec, radius_deg, fixed_cols=None):
             except (ValueError, IndexError):
                 continue
             if scale is None:
-                scale = 1e-8 if (abs(r_) > 360 or abs(d_) > 90) else 1.0
+                if tile_ra is not None and header is None:
+                    scale = 1e-8 if abs(r_ * 1e-8 - tile_ra - 0.5) < abs(r_ - tile_ra - 0.5) else 1.0
+                else:
+                    scale = 1e-8 if (abs(r_) > 360 or abs(d_) > 90) else 1.0
             r_ *= scale; d_ *= scale
             if abs(d_ - dec) > radius_deg:
                 continue
@@ -534,9 +546,17 @@ def query(catalog_name, ra, dec, radius_arcmin, verbose=False):
         if len(files) < len(want) * n_dirs and verbose:
             print(f"Local {cat}: {len(want) * n_dirs - len(files)} of {len(want) * n_dirs} tile files of this field "
                   "are not in the local copy (stars there are missing).")
+        unread = []
         for f in files:
             _, header, delim = _file_layout(f)
-            rows += _rows_from_file(f, header, delim, ra, dec, rdeg, fixed_cols=REFCAT2_COLS)
+            got = _rows_from_file(f, header, delim, ra, dec, rdeg, fixed_cols=REFCAT2_COLS)
+            if not got and os.path.getsize(f) > 0 and not _rows_from_file(f, header, delim, ra, dec, 180.0,
+                                                                           fixed_cols=REFCAT2_COLS)[:1]:
+                unread.append(os.path.relpath(f, info['path']))
+            rows += got
+        if unread:                     # v4.45: tile files that exist but give no stars at all
+            print(f"Local {cat}: {len(unread)} tile file(s) could not be read (format not recognised): "
+                  + ", ".join(unread[:5]) + (" ..." if len(unread) > 5 else ""))
     else:
         idx = _table_index(cat, info)
         cand = []

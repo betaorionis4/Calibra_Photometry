@@ -1,0 +1,126 @@
+{
+  "name": "Standard",
+  "description": "Created from the settings Calibra had before instrument setups existed (v4.36).",
+  "created": "2026-11-15",
+  "instrument": {
+    "telescope": "",
+    "aperture_mm": null,
+    "focal_length_mm": null,
+    "reducer": "",
+    "camera": "",
+    "pixel_um": null,
+    "sensor_x": null,
+    "sensor_y": null,
+    "binning": 1,
+    "osc": false,
+    "gain": null,
+    "offset": null
+  },
+  "site": {
+    "name": "",
+    "lat": 38.46,
+    "lon": -1.08,
+    "elevation_m": null,
+    "timezone": ""
+  },
+  "filters": {
+    "V": {
+      "fits_name": "V",
+      "nina_position": null
+    },
+    "B": {
+      "fits_name": "B",
+      "nina_position": null
+    },
+    "L": {
+      "fits_name": "L",
+      "nina_position": null
+    },
+    "R": {
+      "fits_name": "",
+      "nina_position": null
+    },
+    "G": {
+      "fits_name": "",
+      "nina_position": null
+    },
+    "I": {
+      "fits_name": "",
+      "nina_position": null
+    }
+  },
+  "planning": {
+    "exposures_s": [
+      30,
+      60,
+      120
+    ],
+    "mag_bright": null,
+    "mag_faint": null,
+    "zp_v_e": null,
+    "sky_mag": 20.0,
+    "seeing_arcsec": 3.0
+  },
+  "settings": {
+    "filter_v_keyword": "V",
+    "filter_b_keyword": "B",
+    "filter_l_keyword": "L",
+    "ccd_gain": 1.27,
+    "ccd_read_noise": 3.3,
+    "ccd_dark_current": 0.0007,
+    "saturation_limit": 63000,
+    "sky_noise_factor": 1.0,
+    "detect_sigma": 5.0,
+    "detect_fwhm": 3.5,
+    "dao_sharplo": 0.2,
+    "dao_sharphi": 1.0,
+    "dao_roundlo": -1.2,
+    "dao_roundhi": 1.2,
+    "centroid_initial_radius": 15.0,
+    "centroid_tracking_shift": 4.0,
+    "box_size": 15,
+    "use_flexible_aperture": false,
+    "aperture_fwhm_factor": 2.0,
+    "annulus_inner_gap": 2.0,
+    "annulus_width": 5.0,
+    "aperture_radius": 5.0,
+    "annulus_inner": 7.0,
+    "annulus_outer": 13.0,
+    "match_tolerance_arcsec": 8.0,
+    "default_zp_v": 24.457,
+    "default_zp_b": 24.117,
+    "calib_snr_threshold": 10.0,
+    "catalog_search_radius": 45.0,
+    "calib_peak_limit": 30000,
+    "extinction_kv": 0.2,
+    "extinction_kb": 0.35,
+    "ts_lat": 38.46,
+    "ts_lon": -1.08,
+    "ts_coeff": 0.018,
+    "diff_tbv": 0.9266,
+    "diff_tvbv": 0.0174,
+    "diff_tbbv": 0.1498,
+    "plate_radius": 5.0,
+    "plate_fov": 0.0,
+    "xy_x_min": 200,
+    "xy_x_max": 4200,
+    "xy_y_min": 200,
+    "xy_y_max": 2800,
+    "cal_bias_folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/Bias_April_2026/22_gain100",
+    "cal_flat_folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/2026-11-05/FLAT",
+    "cal_dark_folder": "",
+    "cal_frames_folder": "C:/Users/steph/OneDrive/Astronomy/MeleAstro/N.I.N.A/Bias_April_2026/22_gain100",
+    "cal_mode": "auto",
+    "cal_use_darks": false,
+    "cal_on_the_fly": true,
+    "cal_combine_method": "sigma-clipped mean",
+    "cal_min_frames": 3,
+    "flat_already_bias_subtracted": true,
+    "bias_path": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\Master_Bias_1x1_gain_0.fits",
+    "flat_v_path": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\FLAT_Vmag_1x1_gain_0.fits",
+    "flat_b_path": "C:\\Astro\\Photometry_Calibra\\bias_and_flats\\FLAT_Bmag_1x1_gain_0.fits",
+    "flat_l_path": "",
+    "dark_path": ""
+  },
+  "settings_saved": "2026-11-15 23:23:50"
+}

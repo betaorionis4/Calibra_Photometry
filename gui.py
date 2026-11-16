@@ -376,8 +376,8 @@ def run_config_gui(pipeline_callback=None):
     Launches a persistent Tkinter GUI for pipeline configuration.
     pipeline_callback: A function that takes (config) and runs the analysis.
     """
-    APP_VERSION = "4.44"
-    APP_DATE = "2026-11-14"          # update together with APP_VERSION (shown in the About tab)
+    APP_VERSION = "4.45"
+    APP_DATE = "2026-11-15"          # update together with APP_VERSION (shown in the About tab)
     root = tk.Tk()
     root.title(f"Calibra v{APP_VERSION} - Astro Analysis & Photometry Suite")
 
@@ -8851,6 +8851,7 @@ def run_config_gui(pipeline_callback=None):
 
     tk.Label(about_container, text="Recent changes:", font=("Arial", 11, "bold"), fg=primary_blue, bg="white").pack(fill="x", pady=(10, 5))
     recent_text = (
+        "v4.45  Local ATLAS-RefCat2 tiles read completely (first line with hex flags was taken as a header)\n"
         "v4.44  Light curves: faint-target mode - forced photometry at a fixed position, frames combined (groups / selected rows)\n"
         "v4.43  Light curves: UT date (YYYY-MM-DD) of mid-exposure added next to the UT time\n"
         "v4.42  Light curves: UT of mid-exposure (HH:MM:SS) instead of JD in table and CSV\n"

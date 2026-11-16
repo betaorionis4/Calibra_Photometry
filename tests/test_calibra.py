@@ -1245,3 +1245,37 @@ def test_faint_target_limits_and_groups(tmp_path):
     g = merge_groups(groups_single(fr), [1, 3, 4])
     assert g == [[0], [1, 3, 4], [2], [5], [6]]
     assert split_groups(g, [1]) == groups_single(fr)
+
+
+# ---------------------------------------------------------------- v4.45: real RefCat2 tile format
+_RC2_LINES = [   # first lines of the real tile 000+00.rc2 (MAST RefCat2, 00_m_16): hex flags '2d', '0d'
+    "192775,52528876,44,9,-71,21,-307,9,17091,1,17480,7,16528,4,0,0,2,78,256,999,999,17502,10,248,2d,17046,10,1041,2d,16880,10,415,0d,16838,10,21,0d,0,15891,65,15641,140,15267,148",
+    "253790,10177984,307,16,3256,25,-2070,14,17654,1,19171,23,16412,4,0,0,2,87,999,999,999,19913,106,2,01,18086,101,1,01,16968,100,0,01,16364,100,0,01,0,14693,31,14000,55,13829,54",
+    "1209324,91636405,295,13,-734,23,2782,10,17112,1,18220,12,16050,4,0,0,2,75,999,999,999,18611,10,97,0d,17356,10,55,0d,16460,10,158,0d,16036,9,72,0d,0,14719,34,14142,30,13907,46",
+]
+
+
+def test_refcat2_real_tile_format(tmp_path, monkeypatch):
+    """v4.45: a tile whose first line contains hexadecimal flag fields ('2d') was taken as
+    a header line and the whole file was lost (79 instead of ~1000 stars in a MWT frame)."""
+    monkeypatch.chdir(tmp_path)
+    from photometry import local_catalogs as lc
+    from photometry import calibration as cal
+    monkeypatch.setattr(lc, "_STATE", {'root': None, 'catalogs': {}, 'use_local': True, 'allow_online': True, 'loaded': True})
+    d = tmp_path / "cats" / "ATLAS_refcat2" / "00_m_16"
+    d.mkdir(parents=True)
+    (d / "000+00.rc2").write_text("\n".join(_RC2_LINES) + "\n")
+    found = lc.set_root(str(tmp_path / "cats"))
+    assert found['ATLAS']['layout'] == 'tiles' and found['ATLAS']['tile_ext'] == ['.rc2']
+    assert lc._file_layout(str(d / "000+00.rc2"))[1] is None          # data line, not a header
+    rows = lc.query("ATLAS refcat2", 0.5, 0.5, 40)
+    assert len(rows) == 3
+    assert rows[0]['_ra'] == pytest.approx(0.00192775) and rows[0]['_dec'] == pytest.approx(0.52528876)
+    st = cal.stars_from_local_rows(rows, "ATLAS refcat2")
+    v, b = cal.atlas_to_vb(17.502, 17.046)
+    assert st[0]['V_mag'] == pytest.approx(v) and st[0]['B_mag'] == pytest.approx(b)
+    assert st[0]['cat_id'].startswith('ATLAS J0000')
+    # a header line of a table catalogue is still recognised as a header
+    t = tmp_path / "t.csv"
+    t.write_text("RA,Dec,Vmag,Bmag\n10.0,20.0,12.0,12.5\n")
+    assert lc._file_layout(str(t))[1] == ['ra', 'dec', 'vmag', 'bmag']
