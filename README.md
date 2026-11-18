@@ -1,6 +1,6 @@
 # Calibra: Photometry of Variable Stars from FITS Images
 
-**Version:** 4.46 — 2026-11-17 (repository being reorganised towards 5.0)  
+**Version:** 5.0 — 2026-11-18 (repository being reorganised towards 5.0)  
 **Developed by:** Stephan Pomp, Google DeepMind Antigravity and Claude (Anthropic)  
 **Licence:** GNU General Public License v3 (see [LICENSE](LICENSE))
 
