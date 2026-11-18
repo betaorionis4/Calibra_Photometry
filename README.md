@@ -1,6 +1,6 @@
 # Calibra: Photometry of Variable Stars from FITS Images
 
-**Version:** 5.0 — 2026-11-18 (repository being reorganised towards 5.0)  
+**Version:** 5.0 — 2026-11-18  
 **Developed by:** Stephan Pomp, Google DeepMind Antigravity and Claude (Anthropic)  
 **Licence:** GNU General Public License v3 (see [LICENSE](LICENSE))
 
@@ -23,9 +23,12 @@ The code was created with lots of help from Google Antigravity (various agents) 
 - **Local catalogue copies** first, online services (VizieR, SIMBAD, AAVSO) only when needed.
 - **Observation planner** and **night plan for N.I.N.A.** (simple sequencer).
 
-## What's new in v4.46 (2026-11-17)
+## What's new in v5.0 (2026-11-18)
 
-Offline catalogues come first: local copy of the chosen catalogue → cache of earlier online queries → (APASS DR10 download, if switched on) → local ATLAS-RefCat2 copy in place of a catalogue that is not available locally → VizieR. Full history: [CHANGELOG.md](CHANGELOG.md).
+- New repository layout: program modules in `python/`, manuals in `docs/`, example data in `examples/`; GNU GPL v3 licence.
+- Settings, caches and results are kept in a user folder (`~/Calibra`) instead of the program folder; settings and results of v4.x can be imported at the first start.
+- Version number in one place (`python/version.py`), `pyproject.toml`, `requirements.txt`.
+- Photometric methods and results are the same as in v4.46 (offline catalogues first). Full history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

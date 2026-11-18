@@ -4,7 +4,9 @@ All notable code changes are listed here, newest first. Earlier history (v3.0–
 
 ---
 
-## [Unreleased] — towards 5.0 — repository layout for GitHub
+## [5.0] — 2026-11-18 — Repository for GitHub, user folder
+
+First version published in the reorganised repository on GitHub (the earlier repository history was replaced). Same photometric methods and results as v4.46; what changed is where things are and how Calibra is presented and installed.
 
 - New repository layout: manuals in `docs/` (`photometry_user_manual.md` → `docs/user_manual.md`, `docs/period_analysis_guide.md`), example data in `examples/` (simulated HADS light curve; three raw MWT frames of HU Aqr, 2026-11-01).
 - Program modules folder renamed `photometry/` → `python/` (all imports changed: `from python.<module> import …`); folders named `photometry_*` hold data and results only.
@@ -17,11 +19,12 @@ All notable code changes are listed here, newest first. Earlier history (v3.0–
 - A user reference-star list is recognised by the file existing (before: by the catalogue name not containing ATLAS/APASS/GAIA/LANDOLT).
 - NINA plans: default folder `NINA` next to the program folder, otherwise `output/nina` (before: `nina_sequences` in the program folder). Catalogue overview report written to `output/`.
 - Example reference-star list moved to `examples/reference_stars.csv` (copied to `config/` at the first start).
-- Tests: every test uses its own temporary user folder; new tests for the paths, the translation of old paths and the import (68 tests).
+- Tests: every test uses its own temporary user folder; new tests for the paths, the translation of old paths and the import.
 - `pyproject.toml`: project name `calibra-photometry`, description, licence `GPL-3.0-or-later`, author, Python ≥ 3.10, dependencies (same as `requirements.txt`, checked by a test), pytest settings. Calibra is still run from its folder (`python calibra.py`) and not installed as a package.
 - **Version in one place**: `python/version.py` (`__version__`, `VERSION_DATE`), used by the window title, About tab, AAVSO reports (`#SOFTWARE`), saved plot metadata and `pyproject.toml`; before, the version was also hard-coded in `gui.py` and `time_series.save_aavso_report`.
 - `python/FITSInspector.py` removed (unused since v4.15, replaced by the FITS Viewer).
-- Tests: version in one place, AAVSO report header, requirements = pyproject dependencies (71 tests).
+- Tests: version in one place, AAVSO report header, requirements = pyproject dependencies (71 tests in total).
+- Repository address in README (`git clone`, issue tracker) and `pyproject.toml`.
 - No change of photometric methods or results.
 
 ## [4.46] — 2026-11-17 — Offline catalogues first
