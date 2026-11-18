@@ -1,0 +1,54 @@
+# Calibra is run from its folder (python calibra.py); it is not installed as a package.
+# This file holds the project description, the dependencies and the test settings.
+# Install the dependencies with:   pip install -r requirements.txt
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calibra-photometry"
+dynamic = ["version"]                # from python/version.py
+description = "Photometry of variable stars from FITS images: zero points, colour transformation, light curves with AAVSO reports, period analysis, observation planning"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Stephan Pomp" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "Pillow",
+    "astropy",
+    "photutils",
+    "astroquery",
+]
+keywords = ["astronomy", "photometry", "variable stars", "AAVSO", "light curves", "FITS"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+]
+
+[project.urls]
+Homepage = "https://github.com/betaorionis4/Calibra_Photometry"
+Documentation = "https://github.com/betaorionis4/Calibra_Photometry/blob/main/docs/user_manual.md"
+Changelog = "https://github.com/betaorionis4/Calibra_Photometry/blob/main/CHANGELOG.md"
+Issues = "https://github.com/betaorionis4/Calibra_Photometry/issues"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = []                        # nothing to install - Calibra runs from its folder
+py-modules = []
+
+[tool.setuptools.dynamic]
+version = { attr = "python.version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Personal settings and state written by Calibra (never commit)
+calibra_home.txt
+calibra_session.json
+calibration_config.json
+instruments/
+setups/
+
+# Results and caches written by Calibra
+photometry_output/
+photometry_plots/
+photometry_refstars/
+
+# Image data (except the example frames in examples/)
+*.fits
+*.fit
+*.fts
+!examples/**/*.fts
+!examples/**/*.fits
+
+# Private development material
+Calibra_logbook.html
+calibra_development_status.md
+Calibra_code_review_*.md
+TODO.md
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
