@@ -4,6 +4,40 @@ All notable code changes are listed here, newest first. Earlier history (v3.0–
 
 ---
 
+## [5.0.1] — 2026-11-18 — Local catalogues really first, Landolt CDS tables, Windows fixes, no FITSFixedWarning
+
+Changed files: `python/__init__.py`, `python/calibration.py`, `python/local_catalogs.py`, `python/field_variables.py`, `python/version.py`, `tests/test_calibra.py`, `docs/user_manual.md`, `README.md`.
+
+### Background (check requested by Stephan)
+Online catalogue services other than the APASS DR10 download do not work from Stephan's computer (VizieR answers `404 Not Found`), so any look-up that asks them before the local data only fails or waits. Check with Stephan's real catalogue folder (`C:\Astro\Catalogues`) at HU Aqr, online access replaced by counters: ATLAS-RefCat2, APASS, Gaia DR3 and Landolt were already answered locally (v4.46 order works), but
+- the local **Gaia DR3** folder is the binary Cartes du Ciel catalogue (73 271 `.dat` files, `gaia.hdr` = `CDCSTAR1`), which Calibra cannot read. Every reference-star list (Gaia cross-match for labels) and every Gaia look-up checked all 73 271 files again and found nothing: **~30 s extra per reference-star list**;
+- the local **Landolt** folder holds the original CDS tables (fixed-width `table2.dat` + `ReadMe`, VizieR downloads `*.dat.txt`) - not readable either (same fallback to RefCat2 as before; now read, see Added);
+- **VSX** (known variables) asked VizieR first and used the local GCVS list only after VizieR had failed;
+- loading the local **GCVS lists** (70 129 rows) took ~27 s at the first use in a session (one astropy `SkyCoord` per row).
+The five look-ups took more than 5 minutes; now 0.5–2 s each, no online request.
+
+### Changed
+- **Known variables (VSX)**: with *Prefer local catalogues* on, the local GCVS list is used **before** VizieR (order: local VSX copy → cache → local GCVS list → VizieR → GCVS list if VizieR fails). The GCVS list holds fewer variables than VSX; without a GCVS list VizieR is asked as before; option off → VizieR first as before.
+- **Local catalogue copies that cannot be read** (no star from any of their files) are marked `unreadable` in `config/local_catalogs.json`, reported once in the console and shown as *FORMAT NOT READABLE, not used* in the Settings list; they are skipped from then on (`has_local` false, local RefCat2 used in their place). Choosing/rescanning the catalogue folder clears the mark.
+- **Sexagesimal coordinates** (`21 07 58.2` / `-05 17 40`) of GCVS and target lists are converted without astropy (identical values for all 70 129 rows of Stephan's lists, sign of `-00 ..` kept; other forms still via astropy): first GCVS look-up of a session ~1 s instead of ~27 s.
+
+### Added
+- **Landolt standard stars from the original CDS tables** (`local_catalogs.landolt_stars`): raw fixed-width tables read with astropy's `cds` reader and the `ReadMe` of the same folder, VizieR/CDS downloads (`#Table:` + `|` columns, multi-row headers, `<Vmag>`) parsed directly; only tables with V and B−V. A star in several publications is used once, newest first (Stephan's folder: 1992 526 + 2009 595 + 2013 335 rows, raw and download copies → **946 stars**); 1992 positions are up to ~30″ off and some stars were renamed (`92 311` → `92 312`): same star = same name without `BD`/`HD` within 60″, V within 0.03 mag within 30″, or any two within 2″. A field without Landolt stars counts as not covered (local RefCat2 substitute). Settings list: "946 standard stars from the CDS tables"; an `unreadable` mark from the first 5.0.1 build is cleared. Real data, SA 92: 27 standards in 0.6 s from the local copy.
+
+### Fixed
+- Frames with old-style WCS headers (e.g. MaxIm DL: `RADECSYS` instead of `RADESYS`, `DATE-OBS` without `MJD-OBS`) printed astropy warnings such as `FITSFixedWarning: RADECSYS= 'FK5' the RADECSYS keyword is deprecated, use RADESYSa` and `'datfix' made the change 'Set MJD-OBS to … from DATE-OBS'`. They were silenced only in some modules (Data Mining, Field Variables, light curves, star detection), not in the main pipeline, FITS Viewer, plate solving, shift analysis, instrument setups and parts of `gui.py`. The warning only reports keywords astropy repaired while reading the header; WCS and times were always correct. It is now silenced once for the whole program in `python/__init__.py` (only this warning type; other astropy warnings are still shown).
+
+- Windows (first test run on Windows): `field_variables` left a FITS file open when checking for an extension (now closed at once - Windows does not allow overwriting open files).
+
+### Tests
+- `test_fits_fixed_warning_silenced`: header with `RADECSYS` and `DATE-OBS` only; no warning after `import python` (checked in a separate Python process). Without the change both warnings appear.
+- `test_unreadable_local_catalogue_and_vsx_gcvs_first`: binary Gaia folder marked once, saved, shown in Settings, skipped without checking files, RefCat2 used instead, mark cleared by a rescan; VSX from the local GCVS list without VizieR (online allowed), VizieR first with the option off. Fails on v5.0.
+- `test_parse_coordinates_fast_path`: values identical to astropy, `-00` declinations, other forms.
+- `test_landolt_cds_tables`: raw table + ReadMe and `|` download, 1992/2009 duplicate and renamed star kept once (2009 values), position-only table ignored, B = V + (B−V), field without standards → not covered, old mark cleared.
+- Three tests failed on Windows (passed on Linux): `test_build_masters_and_reuse`, `test_master_frames_from_type_folders` (the test kept the master memory-mapped while it was rebuilt - `WinError 32`; now read with `memmap=False`) and `test_catalog_overview_tool` (replaced a double instead of a single backslash). 75 tests pass on Windows.
+
+---
+
 ## [5.0] — 2026-11-18 — Repository for GitHub, user folder
 
 First version published in the reorganised repository on GitHub (the earlier repository history was replaced). Same photometric methods and results as v4.46; what changed is where things are and how Calibra is presented and installed.

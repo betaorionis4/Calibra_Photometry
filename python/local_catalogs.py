@@ -177,7 +177,8 @@ def has_local(catalog_name):
     """True if a local copy of this catalogue is configured (field coverage not checked)."""
     _load_config()
     info = _STATE['catalogs'].get(normalize_name(catalog_name) or '')
-    return bool(_STATE['use_local'] and info and os.path.isdir(info.get('path', '')))
+    return bool(_STATE['use_local'] and info and not info.get('unreadable')
+                and os.path.isdir(info.get('path', '')))
 
 
 def query_best(catalog_name, ra, dec, radius_arcmin, verbose=False, substitute=True):
@@ -420,6 +421,15 @@ def summary_lines():
                 extra = (f"{info['n_files']} tile files" + (f" in {len(info.get('mag_dirs', []))} magnitude folders"
                                                              if len(info.get('mag_dirs', [])) > 1 else "")
                          if info['layout'] == 'tiles' else f"{info['n_files']} table file(s)")
+            if cat == 'LANDOLT' and info['layout'] == 'table':     # v5.0.1: CDS tables
+                try:
+                    n_l = len(landolt_stars(info['path']))
+                except Exception:
+                    n_l = 0
+                if n_l:
+                    extra = f"{n_l} standard stars from the CDS tables"
+            if info.get('unreadable') and not (cat == 'LANDOLT' and 'standard stars' in extra):     # v5.0.1
+                extra += " - FORMAT NOT READABLE, not used"
             out.append(f"{names[cat]}: {rel}  ({extra})")
         else:
             out.append(f"{names[cat]}: not found locally" + (" - online" if _STATE['allow_online'] else ""))
@@ -544,12 +554,190 @@ def _table_index(cat, info, progress=None):
     return idx
 
 
+def _mark_unreadable(cat, info, idx):
+    """v5.0.1: a table catalogue whose files give no stars at all (e.g. the binary Cartes du
+    Ciel Gaia catalogue, 'CDCSTAR1' .dat files) is marked 'unreadable' in the configuration
+    and skipped from then on - before, every look-up checked all its files again (~30 s for
+    73000 files) for nothing. Choosing/rescanning the catalogue folder clears the mark.
+    Returns True if the catalogue is unreadable."""
+    if not idx or any(e.get('n', 0) > 0 for e in idx.values()):
+        return False
+    info['unreadable'] = True
+    print(f"Local {cat} copy in {info.get('path')}: none of its {len(idx)} files could be read "
+          "(format not recognised, e.g. a binary catalogue of another program) - not used. "
+          "Other local catalogues are used instead.")
+    _save_config()
+    return True
+
+
 def build_indexes(progress=None):
     """Index all table-type catalogues (run once after choosing the folder)."""
     _load_config()
     for cat, info in _STATE['catalogs'].items():
         if info.get('layout') == 'table':
-            _table_index(cat, info, progress=(lambda k, n, p, c=cat: progress(c, k, n, p)) if progress else None)
+            idx = _table_index(cat, info, progress=(lambda k, n, p, c=cat: progress(c, k, n, p)) if progress else None)
+            _mark_unreadable(cat, info, idx)
+
+
+# ------------------------------------------------------------------ Landolt (CDS tables)
+_LANDOLT_CACHE = {}
+
+
+def _readme_year(folder):
+    """Publication year from the first line of a CDS ReadMe in folder ('... (Landolt, 2009)'), else 0."""
+    for f in glob.glob(os.path.join(folder, 'ReadMe*')):
+        try:
+            with open(f, encoding='latin-1') as fh:
+                m = re.search(r'\(\D*(\d{4})\)\s*$', fh.readline().rstrip())
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+    m = re.search(r'(19|20)\d{2}', os.path.basename(folder))
+    return int(m.group(0)) if m else 0
+
+
+def _cds_pipe_table(path):
+    """Stars of a CDS/VizieR download ('#Table: ...', columns separated by '|', header
+    rows above a '---|---' line). [(name, ra, dec, V, B-V)] or None if not this format or
+    without V and B-V columns."""
+    from python.field_variables import parse_coordinates
+    try:
+        with open(path, encoding='latin-1') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    if not lines or not lines[0].startswith('#Table:'):
+        return None
+    sep = next((k for k, l in enumerate(lines) if '|' in l and set(l.strip()) <= set('-|')), None)
+    if sep is None:
+        return None
+    head = [l for l in lines[1:sep] if '|' in l]
+    ncol = len(lines[sep].split('|'))
+    names = [' '.join(h.split('|')[c].strip() for h in head if len(h.split('|')) > c).strip() for c in range(ncol)]
+    def col(test):
+        return next((c for c, n in enumerate(names) if test(n.replace(' ', '').lower())), None)
+    c_pos = col(lambda n: 'ah' in n and ('ed' in n or 'de' in n))
+    c_v = col(lambda n: n.replace('<', '').replace('>', '') == 'vmag')
+    c_bv = col(lambda n: n.replace('<', '').replace('>', '') == 'b-v')
+    if c_pos is None or c_v is None or c_bv is None:
+        return None
+    out = []
+    for l in lines[sep + 1:]:
+        t = l.split('|')
+        if len(t) < ncol or l.startswith('#'):
+            continue
+        p = t[c_pos].split()
+        try:
+            ra, dec = parse_coordinates(' '.join(p[:3]), ' '.join(p[3:]))
+            v, bv = float(t[c_v]), float(t[c_bv])
+        except (ValueError, IndexError):
+            continue
+        out.append((t[0].strip(), ra, dec, v, bv))
+    return out
+
+
+def _cds_raw_table(path):
+    """Stars of a raw CDS table (fixed width, e.g. table2.dat) described in a ReadMe in the
+    same folder (astropy 'cds' reader). [(name, ra, dec, V, B-V)] or None."""
+    readme = next(iter(glob.glob(os.path.join(os.path.dirname(path), 'ReadMe*'))), None)
+    if readme is None:
+        return None
+    try:
+        from astropy.io import ascii as _ascii
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            tab = _ascii.read(path, format='cds', readme=readme)
+    except Exception:
+        return None
+    cols = {c.lower().replace('<', '').replace('>', ''): c for c in tab.colnames}
+    need = ('rah', 'ram', 'ras', 'ded', 'dem', 'des', 'vmag', 'b-v')
+    if not all(k in cols for k in need):
+        return None
+    name_c = tab.colnames[0]
+    sign_c = cols.get('de-')
+    out = []
+    for row in tab:
+        try:
+            ra = 15.0 * (float(row[cols['rah']]) + float(row[cols['ram']]) / 60 + float(row[cols['ras']]) / 3600)
+            dec = float(row[cols['ded']]) + float(row[cols['dem']]) / 60 + float(row[cols['des']]) / 3600
+            if sign_c is not None and str(row[sign_c]).strip() == '-':
+                dec = -dec
+            v, bv = float(row[cols['vmag']]), float(row[cols['b-v']])
+        except (ValueError, TypeError):
+            continue
+        if np.isfinite(v) and np.isfinite(bv):
+            out.append((str(row[name_c]).strip(), ra, dec, v, bv))
+    return out
+
+
+def landolt_stars(folder):
+    """
+    v5.0.1: Landolt standard stars from the original CDS tables in folder (and subfolders):
+    VizieR/CDS downloads ('#Table:' + '|' columns) and raw tables with their ReadMe
+    (e.g. 1992/table2.dat, 2009/table2.dat, 2013/...table2.dat.txt). Only tables with V and
+    B-V; positions J2000. The same star in several tables (1992 / 2009 / 2013, raw + download)
+    is kept once, from the newest publication. 1992 positions can be up to ~30" off (rounded,
+    proper motion) and some stars were renamed (92 311 -> 92 312): same star = same name
+    (without 'BD'/'HD') within 60", or V within 0.03 mag within 30", or any two within 2".
+    Returns a list of dicts (name, ra, dec, V, BV, year, file); [] if nothing readable.
+    """
+    files = sorted(p for p in glob.glob(os.path.join(folder, '**', '*'), recursive=True)
+                   if os.path.isfile(p) and not os.path.basename(p).lower().startswith('readme')
+                   and not p.lower().endswith('.pdf'))
+    key = (folder, tuple((p, os.path.getmtime(p)) for p in files))
+    if _LANDOLT_CACHE.get('key') == key:
+        return _LANDOLT_CACHE['stars']
+    found = []
+    for p in files:
+        got = _cds_pipe_table(p)
+        if got is None:
+            got = _cds_raw_table(p)
+        if got:
+            yr = _readme_year(os.path.dirname(p))
+            found += [{'name': n, 'ra': r, 'dec': d, 'V': v, 'BV': bv, 'year': yr, 'file': p}
+                      for n, r, d, v, bv in got]
+    found.sort(key=lambda s: -s['year'])
+    kept = []
+    if found:
+        def nkey(n):                   # 'BD -12 2918' = '-12 2918', 'HD 121968' = '121968', case
+            return re.sub(r'^(bd|hd)', '', re.sub(r'\s+', '', n).lower())
+        for s in found:
+            dup = False
+            cosd = np.cos(np.radians(s['dec']))
+            for k in kept:
+                if abs(k['dec'] - s['dec']) > 0.02:
+                    continue
+                sep = np.hypot((k['ra'] - s['ra']) * cosd, k['dec'] - s['dec']) * 3600.0
+                if (sep < 2.0 or (sep < 60.0 and nkey(k['name']) == nkey(s['name']))
+                        or (sep < 30.0 and abs(k['V'] - s['V']) < 0.03)):
+                    dup = True
+                    break
+            if not dup:
+                kept.append(s)
+    _LANDOLT_CACHE.update(key=key, stars=kept)
+    return kept
+
+
+def _landolt_query(info, ra, dec, rdeg):
+    """Rows in the format of query() from the Landolt CDS tables, None if the folder holds
+    no such table or no Landolt star lies in the field (-> substitute / online)."""
+    stars = landolt_stars(info['path'])
+    if not stars:
+        return None
+    if info.get('unreadable'):         # marked by an earlier version that could not read CDS tables
+        info.pop('unreadable', None)
+        _save_config()
+    d1 = np.radians(dec)
+    rows = []
+    for s in stars:
+        d2 = np.radians(s['dec'])
+        cosang = np.sin(d1) * np.sin(d2) + np.cos(d1) * np.cos(d2) * np.cos(np.radians(s['ra'] - ra))
+        if np.degrees(np.arccos(np.clip(cosang, -1, 1))) <= rdeg:
+            rows.append({'name': s['name'], 'vmag': f"{s['V']:.3f}", 'b-v': f"{s['BV']:.3f}",
+                         'ref': f"Landolt {s['year']}" if s['year'] else 'Landolt', '_ra': s['ra'], '_dec': s['dec']})
+    return rows or None
 
 
 def query(catalog_name, ra, dec, radius_arcmin, verbose=False):
@@ -602,7 +790,18 @@ def query(catalog_name, ra, dec, radius_arcmin, verbose=False):
             print(f"Local {cat}: {len(unread)} tile file(s) could not be read (format not recognised): "
                   + ", ".join(unread[:5]) + (" ..." if len(unread) > 5 else ""))
     else:
+        if cat == 'LANDOLT':               # v5.0.1: original CDS tables (fixed width / '|' downloads)
+            if landolt_stars(info['path']):
+                rows = _landolt_query(info, ra, dec, rdeg)
+                if verbose:
+                    print(f"Local {cat}: {len(rows or [])} standard stars within {radius_arcmin:.1f}' "
+                          f"({time.time() - t0:.2f} s)")
+                return rows
+        if info.get('unreadable'):         # v5.0.1: format not recognised (see _mark_unreadable)
+            return None
         idx = _table_index(cat, info)
+        if _mark_unreadable(cat, info, idx):
+            return None
         cand = []
         covered = False
         for p, e in idx.items():

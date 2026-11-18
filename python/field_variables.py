@@ -68,16 +68,37 @@ def _to_float(x):
         return None
 
 
+_SEXA_RE = re.compile(r'^\s*([+-]?)\s*(\d{1,3})[\s:]+(\d{1,2})(?:[\s:]+(\d{1,2}(?:\.\d*)?))?\s*$')
+
+
+def _sexa(txt):
+    """v5.0.1: fast path for 'h m s' / 'h:m:s' / '+d m s' text -> (sign, value) or None."""
+    m = _SEXA_RE.match(str(txt))
+    if not m:
+        return None
+    a, b, c = float(m.group(2)), float(m.group(3)), float(m.group(4) or 0.0)
+    if b >= 60 or c >= 60:
+        return None
+    return (-1.0 if m.group(1) == '-' else 1.0), a + b / 60.0 + c / 3600.0
+
+
 def parse_coordinates(ra_txt, dec_txt):
     """RA/Dec from decimal degrees or sexagesimal text ('09:36:53.2' / '9 36 53.2' /
     '9h36m53.2s'; Dec '+44:04:00'). Decimal RA is taken as degrees. Returns (ra, dec) in deg."""
-    from astropy.coordinates import SkyCoord
-    import astropy.units as u
     ra_f, dec_f = _to_float(ra_txt), _to_float(dec_txt)
     if ra_f is not None and dec_f is not None:
         if not (0 <= ra_f < 360 and -90 <= dec_f <= 90):
             raise ValueError(f"coordinates out of range: {ra_txt} {dec_txt}")
         return ra_f, dec_f
+    # v5.0.1: plain 'h m s' / '+d m s' without astropy (one SkyCoord per star took ~1 ms -
+    # ~27 s for the 70000 rows of the local GCVS lists)
+    r_, d_ = _sexa(ra_txt), _sexa(dec_txt)
+    if r_ is not None and d_ is not None and r_[0] > 0:
+        ra_d, dec_d = 15.0 * r_[1], d_[0] * d_[1]
+        if 0 <= ra_d < 360 and -90 <= dec_d <= 90:
+            return ra_d, dec_d
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
     c = SkyCoord(str(ra_txt).strip(), str(dec_txt).strip(), unit=(u.hourangle, u.deg))
     return float(c.ra.deg), float(c.dec.deg)
 
@@ -288,8 +309,10 @@ def image_footprints(fits_files):
         w, shape = None, None
         try:
             h = fits.getheader(p)
-            if h.get('NAXIS', 0) < 2 and len(fits.open(p)) > 1:
-                h = fits.getheader(p, 1)
+            if h.get('NAXIS', 0) < 2:
+                with fits.open(p) as _hl:     # v5.0.1: file closed again (Windows file locks)
+                    if len(_hl) > 1:
+                        h = _hl[1].header.copy()
             shape = (int(h.get('NAXIS2', 0)), int(h.get('NAXIS1', 0)))
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', AstropyWarning)

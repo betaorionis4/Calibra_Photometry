@@ -1,6 +1,6 @@
 # Calibra: Photometry of Variable Stars from FITS Images
 
-**Version:** 5.0 — 2026-11-18  
+**Version:** 5.0.1 — 2026-11-18  
 **Developed by:** Stephan Pomp, Google DeepMind Antigravity and Claude (Anthropic)  
 **Licence:** GNU General Public License v3 (see [LICENSE](LICENSE))
 
@@ -22,6 +22,13 @@ The code was created with lots of help from Google Antigravity (various agents) 
 - **Data Mining**: search for unknown variables from excess scatter.
 - **Local catalogue copies** first, online services (VizieR, SIMBAD, AAVSO) only when needed.
 - **Observation planner** and **night plan for N.I.N.A.** (simple sequencer).
+
+## What's new in v5.0.1 (2026-11-18)
+
+- Local catalogues really first: known variables come from the local GCVS list before VizieR (option *Prefer local catalogues*); local catalogue copies Calibra cannot read (e.g. the binary Cartes du Ciel Gaia catalogue) are skipped instead of costing ~30 s per reference-star list; GCVS lists load in ~1 s.
+- Landolt standard stars read from the original CDS tables (as downloaded from VizieR/CDS) in the local catalogue folder.
+- No more `FITSFixedWarning` messages (`RADECSYS` deprecated, `MJD-OBS` set from `DATE-OBS`) for frames with old-style headers; results unchanged.
+- Tests pass on Windows.
 
 ## What's new in v5.0 (2026-11-18)
 

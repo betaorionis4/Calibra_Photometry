@@ -664,8 +664,9 @@ def _vsx_from_local_gcvs(ra_deg, dec_deg, radius_arcmin, verbose=False):
 
 
 def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir=None, verbose=True):
-    """Known variables of a field. v4.46 order: local VSX copy -> cache of earlier online
-    queries -> VizieR -> local GCVS list (if VizieR is off or not reachable)."""
+    """Known variables of a field. Order: local VSX copy -> cache of earlier online queries ->
+    local GCVS list if 'prefer local catalogues' is on (v5.0.1) -> VizieR -> local GCVS list
+    (if VizieR is off or not reachable)."""
     cache_dir = cache_dir or paths.CATALOG_CACHE_DIR
     local = _vsx_local(ra_deg, dec_deg, radius_arcmin, verbose)
     if local is not None:
@@ -741,6 +742,22 @@ def get_vsx_stars(ra_deg, dec_deg, radius_arcmin=15, cache_dir=None, verbose=Tru
             if verbose: print(f"Error reading VSX cache: {e}")
             vsx_stars = []
         
+    # v5.0.1: 'prefer local catalogues' -> local GCVS list BEFORE VizieR (before: only after
+    # VizieR had failed, i.e. one failed online request and a 10 min VizieR pause first).
+    # The GCVS list holds fewer variables than VSX; a local VSX copy would be complete.
+    try:
+        from python import local_catalogs as _lc
+        _pref = _lc.prefer_offline()
+    except Exception:
+        _pref = False
+    if _pref:
+        g = _vsx_from_local_gcvs(ra_deg, dec_deg, radius_arcmin, verbose=False)
+        if g is not None:
+            if verbose:
+                print(f"VSX: no local VSX copy - {len(g)} variables from the local GCVS list "
+                      "(offline first; VizieR not asked).")
+            return g
+
     vsx_stars = fetch_vsx_catalog(ra_deg, dec_deg, radius_arcmin, verbose)
     if not vsx_stars:
         # v4.46: VizieR switched off or not reachable -> local GCVS list (not cached as VSX)

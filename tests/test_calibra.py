@@ -676,9 +676,10 @@ def test_build_masters_and_reuse(tmp_path, monkeypatch):
                      'master_flat_V_80x64_bin1_g100_o50.fits']
     assert all(r['status'] == 'built' for r in res)
     from astropy.io import fits
-    mb = fits.getdata(os.path.join(folder, 'Bias', names[0]))
+    # memmap=False: a memory-mapped master cannot be overwritten on Windows (WinError 32)
+    mb = fits.getdata(os.path.join(folder, 'Bias', names[0]), memmap=False)
     assert np.abs(mb - bias).max() < 12                                   # 5 frames, noise 5
-    mfl = fits.getdata(os.path.join(folder, 'Flats_L', names[1]))
+    mfl = fits.getdata(os.path.join(folder, 'Flats_L', names[1]), memmap=False)
     ref = flat_true['L'] / np.median(flat_true['L'])
     assert np.abs(mfl - ref).max() < 0.01 and fits.getheader(os.path.join(folder, 'Flats_L', names[1]))['NCOMBINE'] == 5
     res2 = mf.build_masters(folder, log=lambda *a: None)
@@ -735,7 +736,8 @@ def test_catalog_overview_tool(tmp_path, monkeypatch):
     (root / "ATLAS_refcat2" / "00_m_16" / "010-45.rc2").write_text("1000000000,-4450000000" + ",0" * 19 + ",12000,0,0,0,11500\n")
     (root / "gaia" / "south.csv").write_text("source_id,ra,dec,phot_g_mean_mag\n1,10,-50,12\n")
     assert co.main([str(root), '--report', 'ov.csv', '--reduce', str(tmp_path / 'red')]) == 0
-    rows = {r['file'].replace('\\\\', '/'): r['verdict'] for r in csv.DictReader(open('ov.csv'))}
+    # Windows: the report has native paths ('\'); one backslash, not two (v5.0.1)
+    rows = {r['file'].replace('\\', '/'): r['verdict'] for r in csv.DictReader(open('ov.csv'))}
     assert rows['ATLAS_refcat2/00_m_16/010-45.rc2'].startswith('DELETE: all Dec')
     assert rows['ATLAS_refcat2/18_m_19/144+44.rc2'].startswith('DELETE: all fainter')
     assert rows['ATLAS_refcat2/00_m_16/144+44.rc2'] == 'keep'
@@ -777,9 +779,10 @@ def test_master_frames_from_type_folders(tmp_path, monkeypatch):
                      'master_flat_V_60x48_bin1_gx_ox.fits']
     assert any('IMG_9999' in m and 'WARNING' in m and 'used as bias' in m for m in logs)
     assert (tmp_path / "B1" / names[0]).exists() and (tmp_path / "F1" / names[2]).exists()
-    mb = fits.getdata(tmp_path / "B1" / names[0])
+    # memmap=False: a memory-mapped master cannot be overwritten on Windows (WinError 32)
+    mb = fits.getdata(tmp_path / "B1" / names[0], memmap=False)
     assert np.abs(mb - bias).max() < 10 and fits.getheader(tmp_path / "B1" / names[0])['NCOMBINE'] == 6
-    fv = fits.getdata(tmp_path / "F1" / names[2])
+    fv = fits.getdata(tmp_path / "F1" / names[2], memmap=False)
     assert np.abs(fv - flat_true / np.median(flat_true)).max() < 0.01  # bias removed before normalising
     assert fits.getheader(tmp_path / "F1" / names[2])['FLATCORR'].startswith('master_bias')
     # light: bias subtracted once, divided by the normalised flat -> flat sky
@@ -1018,6 +1021,56 @@ def test_offline_first_catalogues(tmp_path, monkeypatch):
     assert p1 == online.PAUSE and p2 == 2 * online.PAUSE and online.pause('vizier') == online.PAUSE_MAX
     online.ok('vizier')
     assert online.available('vizier') and online.pause('vizier') == online.PAUSE
+
+
+def test_unreadable_local_catalogue_and_vsx_gcvs_first(tmp_path, monkeypatch):
+    """v5.0.1: a local table catalogue that cannot be read (Cartes du Ciel binary Gaia,
+    'CDCSTAR1' .dat files) is marked once and then skipped (before: every look-up re-checked
+    all files, ~30 s); with 'prefer local catalogues' VSX comes from the local GCVS list
+    without asking VizieR, even when online queries are allowed."""
+    import shutil, json
+    monkeypatch.chdir(tmp_path)
+    from python import local_catalogs as lc, calibration as cal, online
+    import astroquery.vizier as aqv
+    monkeypatch.setattr(lc, "_STATE", {'root': None, 'catalogs': {}, 'use_local': True, 'allow_online': True,
+                                       'apass_auto': False, 'loaded': True})
+    monkeypatch.setattr(online, "_DOWN", {}); monkeypatch.setattr(online, "_FAILS", {})
+    root, ra, dec, g, r = _make_local_root(tmp_path)
+    shutil.rmtree(root / "gaia")
+    gd = root / "Gaia DR3" / "gaia" / "gaia1"; (gd / "n0000").mkdir(parents=True)
+    (gd / "gaia.hdr").write_bytes(bytes(2) + b"CDCSTAR1GaiaGaia DR3" + bytes(200))
+    for k in range(3):
+        (gd / "n0000" / f"gaia00{k}.dat").write_bytes(bytes(range(256)) * 4)
+    found = lc.set_root(str(root))
+    assert 'GAIA_DR3' in found and lc.has_local("GAIA_DR3")
+    n = {'viz': 0}
+    class CountViz:
+        def __init__(self, *a, **k): pass
+        def query_region(self, *a, **k):
+            n['viz'] += 1
+            raise ConnectionError("VizieR down")
+    monkeypatch.setattr(cal, "Vizier", CountViz); monkeypatch.setattr(aqv, "Vizier", CountViz)
+    assert lc.query("GAIA_DR3", 144.5, 44.5, 20) is None              # not readable -> not local
+    assert lc.get_config()['catalogs']['GAIA_DR3'].get('unreadable') and not lc.has_local("GAIA_DR3")
+    saved = json.load(open(paths.LOCAL_CATALOGS_FILE, encoding='utf-8'))
+    assert saved['catalogs']['GAIA_DR3']['unreadable'] is True        # remembered for the next start
+    assert any("NOT READABLE" in line for line in lc.summary_lines())
+    called = []
+    monkeypatch.setattr(lc, "_table_index", lambda *a, **k: called.append(1) or {})
+    assert lc.query("GAIA_DR3", 144.5, 44.5, 20) is None and not called   # skipped without checking files
+    st = cal.fetch_online_catalog(144.5, 44.5, 30, "GAIA_DR3", verbose=False)
+    assert st and st[0]['cat_source'].startswith("local ATLAS copy instead of") and n['viz'] == 0
+    lc.set_root(str(root))                                            # rescan clears the mark
+    assert not lc.get_config()['catalogs']['GAIA_DR3'].get('unreadable')
+    # VSX: online allowed and VizieR "available", but the local GCVS list comes first
+    assert lc.online_allowed() and online.available('vizier')
+    fetched = []
+    monkeypatch.setattr(cal, "fetch_vsx_catalog", lambda *a, **k: fetched.append(1) or [])
+    vs = cal.get_vsx_stars(144.3, 44.3, 60, verbose=False)
+    assert [v['id'] for v in vs] == ['AA Tst'] and not fetched
+    lc.set_options(prefer_offline=False)                              # option off: VizieR (VSX) first
+    cal.get_vsx_stars(144.3, 44.3, 60, verbose=False)
+    assert fetched
 
 
 def test_aavso_sequences_store(tmp_path, monkeypatch):
@@ -1496,3 +1549,119 @@ def test_requirements_match_pyproject():
     block = re.search(r"dependencies = \[(.*?)\]", toml, re.S).group(1)
     deps = sorted(d.lower() for d in re.findall(r'"([^"]+)"', block))
     assert req == deps
+
+
+def test_fits_fixed_warning_silenced():
+    """v5.0.1: old-style headers (RADECSYS, DATE-OBS without MJD-OBS) give no
+    FITSFixedWarning anywhere in Calibra (filter set in python/__init__.py)."""
+    import subprocess
+    code = (
+        "import warnings\n"
+        "import python\n"
+        "from astropy.io import fits\n"
+        "from astropy.wcs import WCS\n"
+        "h = fits.Header()\n"
+        "h['NAXIS'] = 2; h['NAXIS1'] = 100; h['NAXIS2'] = 100\n"
+        "h['CTYPE1'] = 'RA---TAN'; h['CTYPE2'] = 'DEC--TAN'\n"
+        "h['CRVAL1'] = 10.0; h['CRVAL2'] = 20.0; h['CRPIX1'] = 50; h['CRPIX2'] = 50\n"
+        "h['CDELT1'] = -0.0003; h['CDELT2'] = 0.0003\n"
+        "h['RADECSYS'] = 'FK5'; h['EQUINOX'] = 2000.0\n"
+        "h['DATE-OBS'] = '2026-11-13T21:58:12'\n"
+        "with warnings.catch_warnings(record=True) as rec:\n"
+        "    w = WCS(h)\n"
+        "print(sum('FITSFixed' in type(r.message).__name__ for r in rec))\n"
+    )
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    out = subprocess.run([sys.executable, "-c", code], cwd=root,
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "0", out.stdout + out.stderr
+    assert "FITSFixedWarning" not in out.stderr
+
+
+def test_parse_coordinates_fast_path():
+    """v5.0.1: sexagesimal text converted without astropy (GCVS lists ~25x faster); same
+    values as SkyCoord, sign of '-00 ..' declinations kept, other forms still accepted."""
+    from python.field_variables import parse_coordinates
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    for ra_t, dec_t in (("21 07 58.19", "-05 17 40.5"), ("23 59 46.49", "-00 16 48.4"), ("00 00 00.0", "+89 59 59"),
+                        ("09:36:53.2", "+44:04:00"), ("5 3", "-0 30"), ("12 30 00", "+00 00 01.5")):
+        c = SkyCoord(ra_t, dec_t, unit=(u.hourangle, u.deg))
+        ra, dec = parse_coordinates(ra_t, dec_t)
+        assert abs(ra - c.ra.deg) < 1e-9 and abs(dec - c.dec.deg) < 1e-9, (ra_t, dec_t)
+    assert parse_coordinates("23 59 46.49", "-00 16 48.4")[1] < 0
+    assert parse_coordinates("9h36m53.2s", "+44d04m00s") == pytest.approx((144.2216667, 44.0666667))
+    assert parse_coordinates("144.2", "44.1") == (144.2, 44.1)
+    with pytest.raises(Exception):
+        parse_coordinates("25 61 00", "+95 00 00")
+
+
+def test_landolt_cds_tables(tmp_path, monkeypatch):
+    """v5.0.1: original Landolt CDS tables (raw fixed-width + ReadMe, '|' downloads) read;
+    the same star in 1992 and 2009 kept once (newest), renamed stars (92 311 -> 92 312)
+    recognised, tables without V/B-V ignored; a field without Landolt stars -> None
+    (local RefCat2 substitute); an old 'unreadable' mark is cleared."""
+    monkeypatch.chdir(tmp_path)
+    from python import local_catalogs as lc, calibration as cal
+    root = tmp_path / "cat"
+    d92 = root / "Landolt" / "1992"; d92.mkdir(parents=True)
+    readme = "\n".join([
+        "II/183A          UBVRI Photometric Standards              (Landolt  1992)",
+        "================================================================================",
+        "Byte-by-byte Description of file: table2.dat",
+        "--------------------------------------------------------------------------------",
+        "   Bytes Format Units   Label   Explanations",
+        "--------------------------------------------------------------------------------",
+        "   1- 11  A11   ---     Star    Star Designation",
+        "  13- 14  I2    h       RAh     Right Ascension J2000 (hours)",
+        "  16- 17  I2    min     RAm     Right Ascension J2000 (minutes)",
+        "  19- 20  I2    s       RAs     Right Ascension J2000 (seconds)",
+        "      22  A1    ---     DE-     Declination J2000 (sign)",
+        "  23- 24  I2    deg     DEd     Declination J2000 (degrees)",
+        "  26- 27  I2    arcmin  DEm     Declination J2000 (minutes)",
+        "  29- 30  I2    arcsec  DEs     Declination J2000 (seconds)",
+        "  33- 38  F6.3  mag     Vmag    V magnitude",
+        "  40- 45  F6.3  mag     B-V     B-V color",
+        "--------------------------------------------------------------------------------", ""])
+    (d92 / "ReadMe.txt").write_text(readme)
+    (d92 / "table2.dat").write_text(
+        "TPHE A      00 30 09 -46 31 22  14.651  0.793\n"
+        "92 311      00 53 16 +00 48 29  10.595  1.638\n"
+        "WOLF 918    21 09 21 -13 18 09  10.868  1.491\n")
+    (d92 / "filters.dat").write_text(" 2750   0.00\n 2760   1.12\n")
+    d09 = root / "Landolt" / "2009"; d09.mkdir()
+    (d09 / "ReadMe.txt").write_text("J/AJ/137/4186    UBVRI standards around celestial equator  (Landolt, 2009)\n")
+    head = ("#Table: J/AJ/137/4186/table2.dat (http://cdsarc.cds.unistra.fr)\n"
+            "-------------------------------------------------\n"
+            "           | R  R          D  D      |      |      \n"
+            "Name       |Ah Am    RAs  Ed Em   DEs|  Vmag|   B-V\n"
+            "-----------|-------------------------|------|------\n")
+    (d09 / "J_AJ_137_4186_table2.dat.txt").write_text(head +
+        "TPhe A     |00 30 09.594 -46 31 28.91|14.651|+0.793\n"
+        "92 312     |00 53 16.533 +00 48 28.90|10.598|+1.636\n"
+        "92 309     |00 53 14.047 +00 46 02.14|13.842|+0.513\n")
+    (d09 / "J_AJ_137_4186_table5.dat.txt").write_text(
+        "#Table: J/AJ/137/4186/table5.dat (http://cdsarc.cds.unistra.fr)\n----------\n"
+        "Name       |Ah Am    RAs  Ed Em   DEs|UCAC2   \n-----------|-------------------------|--------\n"
+        "TPhe A     |00 30 09.594 -46 31 28.91|11679110\n")
+    stars = lc.landolt_stars(str(root / "Landolt"))
+    names = sorted(s['name'] for s in stars)
+    assert names == ['92 309', '92 312', 'TPhe A', 'WOLF 918'], names
+    tp = next(s for s in stars if s['name'] == 'TPhe A')
+    assert tp['year'] == 2009 and abs(tp['dec'] - (-46 - 31 / 60 - 28.91 / 3600)) < 1e-9
+    wolf = next(s for s in stars if s['name'] == 'WOLF 918')
+    assert wolf['year'] == 1992 and wolf['dec'] < 0 and abs(wolf['ra'] - 15 * (21 + 9 / 60 + 21 / 3600)) < 1e-9
+    monkeypatch.setattr(lc, "_STATE", {'root': None, 'catalogs': {}, 'use_local': True, 'allow_online': False,
+                                       'apass_auto': False, 'loaded': True})
+    lc.set_root(str(root))
+    lc._STATE['catalogs']['LANDOLT']['unreadable'] = True            # mark of the first v5.0.1 version
+    rows = lc.query("LANDOLT", 13.33, 0.80, 10)
+    assert sorted(r['name'] for r in rows) == ['92 309', '92 312']
+    assert not lc._STATE['catalogs']['LANDOLT'].get('unreadable')
+    st = cal.fetch_online_catalog(13.33, 0.80, 10, "Landolt Standard Star Catalogue", verbose=False)
+    s312 = next(s for s in st if s['cat_id'] == '92 312')
+    assert st[0]['cat_source'] == 'local copy' and abs(s312['V_mag'] - 10.598) < 1e-6
+    assert abs(s312['B_mag'] - (10.598 + 1.636)) < 1e-6
+    assert lc.query("LANDOLT", 200.0, 30.0, 10) is None                # no Landolt star -> not covered
+    assert any('4 standard stars' in l for l in lc.summary_lines())
